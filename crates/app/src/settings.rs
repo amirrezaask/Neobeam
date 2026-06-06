@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use editor_surface::AnimationConfig;
+use editor_surface::{parse_vfx_modes, AnimationConfig, VfxMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +12,19 @@ pub struct Settings {
     pub line_height: f32,
     pub animations_enabled: bool,
     pub power_mode: bool,
+
+    pub animation_length: f32,
+    pub short_animation_length: f32,
+    pub trail_size: f32,
+    pub animate_in_insert_mode: bool,
+    pub smooth_blink: bool,
+    pub position_animation_length: f32,
+    pub scroll_animation_length: f32,
+    pub scroll_animation_far_lines: u32,
+    pub enable_cursor_glow: bool,
+    pub enable_flashes: bool,
+    pub enable_float_animation: bool,
+    pub vfx_modes: String,
 }
 
 impl Default for Settings {
@@ -22,6 +35,18 @@ impl Default for Settings {
             line_height: 1.3,
             animations_enabled: true,
             power_mode: false,
+            animation_length: 0.150,
+            short_animation_length: 0.04,
+            trail_size: 1.0,
+            animate_in_insert_mode: true,
+            smooth_blink: false,
+            position_animation_length: 0.15,
+            scroll_animation_length: 0.3,
+            scroll_animation_far_lines: 1,
+            enable_cursor_glow: true,
+            enable_flashes: true,
+            enable_float_animation: true,
+            vfx_modes: String::new(),
         }
     }
 }
@@ -29,17 +54,28 @@ impl Default for Settings {
 impl Settings {
     pub fn animation_config(&self) -> AnimationConfig {
         let mut cfg = AnimationConfig::default();
+        cfg.animation_length = self.animation_length;
+        cfg.short_animation_length = self.short_animation_length;
+        cfg.trail_size = self.trail_size;
+        cfg.animate_in_insert_mode = self.animate_in_insert_mode;
+        cfg.smooth_blink = self.smooth_blink;
+        cfg.position_animation_length = self.position_animation_length;
+        cfg.scroll_animation_length = self.scroll_animation_length;
+        cfg.scroll_animation_far_lines = self.scroll_animation_far_lines;
+        cfg.enable_cursor_glow = self.enable_cursor_glow;
+        cfg.enable_flashes = self.enable_flashes;
+        cfg.enable_float_animation = self.enable_float_animation;
+        cfg.vfx_modes = parse_vfx_modes(&self.vfx_modes);
+        cfg.enable_power_mode = self.power_mode;
+
         if !self.animations_enabled {
             cfg.enable_cursor_animation = false;
-            cfg.enable_cursor_trail = false;
             cfg.enable_cursor_glow = false;
-            cfg.enable_cursor_squash_stretch = false;
             cfg.enable_smooth_scroll = false;
             cfg.enable_flashes = false;
             cfg.enable_float_animation = false;
             cfg.enable_power_mode = false;
-        } else {
-            cfg.enable_power_mode = self.power_mode;
+            cfg.vfx_modes = Vec::<VfxMode>::new();
         }
         cfg
     }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
-use nvim_core::grid::{Grid, GridStateStore, WindowMeta};
+use nvim_core::grid::{Cell, Grid, GridStateStore, WindowMeta};
 use nvim_core::protocol::CursorShape;
 
 use crate::animation::AnimationState;
@@ -21,6 +21,13 @@ pub struct RectInstance {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub struct QuadInstance {
+    pub corners: [[f32; 2]; 4],
+    pub color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GlyphInstance {
     pub pos: [f32; 2],
     pub size: [f32; 2],
@@ -29,10 +36,27 @@ pub struct GlyphInstance {
     pub color: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScissorRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DrawBatch {
+    Rects { start: u32, count: u32, scissor: Option<ScissorRect> },
+    Glyphs { start: u32, count: u32, scissor: Option<ScissorRect> },
+    Quads { start: u32, count: u32, scissor: Option<ScissorRect> },
+}
+
 #[derive(Default)]
 pub struct DrawLists {
     pub rects: Vec<RectInstance>,
     pub glyphs: Vec<GlyphInstance>,
+    pub quads: Vec<QuadInstance>,
+    pub batches: Vec<DrawBatch>,
     pub clear: [f32; 4],
 }
 
@@ -45,7 +69,6 @@ pub struct FloatCacheEntry {
 
 pub type FloatCache = HashMap<i64, FloatCacheEntry>;
 
-/// Refresh cached float grid snapshots for active floating windows.
 pub fn sync_float_cache(store: &GridStateStore, cache: &mut FloatCache) {
     for (&id, win) in &store.windows {
         if !win.is_float {
@@ -87,7 +110,7 @@ impl FrameBuilder {
         let thickness = (atlas.size_px / 12.0).max(1.0);
 
         let block_cursor = matches!(store.cursor_shape(), CursorShape::Block);
-        let cursor_visible = anim.cursor_visible(store) && !store.busy;
+        let cursor_visible = anim.cursor_visible() && !store.busy;
         let skip_cell = if block_cursor && cursor_visible {
             Some((store.cursor.grid, store.cursor.row, store.cursor.col))
         } else {
@@ -167,9 +190,41 @@ impl FrameBuilder {
             );
         }
 
-        build_cursor_effects(&mut lists, store, anim, cursor_visible);
-        build_particles(&mut lists, anim);
+        build_cursor_effects(&mut lists, store, anim, cursor_visible, cell_w, cell_h);
         lists
+    }
+}
+
+fn push_rect_batch(lists: &mut DrawLists, scissor: Option<ScissorRect>, prev_len: usize) {
+    let count = lists.rects.len() - prev_len;
+    if count > 0 {
+        lists.batches.push(DrawBatch::Rects {
+            start: prev_len as u32,
+            count: count as u32,
+            scissor,
+        });
+    }
+}
+
+fn push_glyph_batch(lists: &mut DrawLists, scissor: Option<ScissorRect>, prev_len: usize) {
+    let count = lists.glyphs.len() - prev_len;
+    if count > 0 {
+        lists.batches.push(DrawBatch::Glyphs {
+            start: prev_len as u32,
+            count: count as u32,
+            scissor,
+        });
+    }
+}
+
+fn push_quad_batch(lists: &mut DrawLists, scissor: Option<ScissorRect>, prev_len: usize) {
+    let count = lists.quads.len() - prev_len;
+    if count > 0 {
+        lists.batches.push(DrawBatch::Quads {
+            start: prev_len as u32,
+            count: count as u32,
+            scissor,
+        });
     }
 }
 
@@ -189,110 +244,263 @@ fn draw_grid(
     thickness: f32,
     skip_cell: Option<(i64, u32, u32)>,
 ) {
-    let win_col = win.map(|w| w.col).unwrap_or(0) as f32;
-    let win_row = win.map(|w| w.row).unwrap_or(0) as f32;
+    let win_state = anim.windows.get(grid_id);
+    let (win_row, win_col) = if let Some(w) = win_state {
+        (w.grid_current.row, w.grid_current.col)
+    } else {
+        (
+            win.map(|w| w.row).unwrap_or(0) as f32,
+            win.map(|w| w.col).unwrap_or(0) as f32,
+        )
+    };
+
     let grid_x = win_col * cell_w;
     let grid_y = win_row * cell_h;
     let grid_w = grid.width as f32 * cell_w;
     let grid_h = grid.height as f32 * cell_h;
+
     let scroll_off = if opts.scroll {
-        anim.scroll_offset(grid_id)
+        win_state
+            .map(|w| w.scroll_offset_pixels(cell_h))
+            .unwrap_or(0.0)
     } else {
         0.0
     };
 
-    // Opaque background for the grid viewport.
+    let scissor = if opts.clip {
+        Some(ScissorRect {
+            x: grid_x.max(0.0) as u32,
+            y: grid_y.max(0.0) as u32,
+            w: grid_w.max(0.0) as u32,
+            h: grid_h.max(0.0) as u32,
+        })
+    } else {
+        None
+    };
+
+    let rect_start = lists.rects.len();
+    let glyph_start = lists.glyphs.len();
+    let cursor_glyph = anim.glyph_color;
+
     lists.rects.push(RectInstance {
         pos: [grid_x, grid_y],
         size: [grid_w, grid_h],
         color: scale_alpha(rgb_to_rgba(store.default_colors.bg), opacity),
     });
 
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let cell = match grid.cell(row, col) {
-                Some(c) => c,
-                None => continue,
-            };
-            if cell.double_width_continuation {
-                continue;
-            }
-            let width_mult = if cell.double_width { 2.0 } else { 1.0 };
-            let x = grid_x + col as f32 * cell_w;
-            let y = grid_y + row as f32 * cell_h + scroll_off;
-            let cw = cell_w * width_mult;
+    let use_scrollback = opts.scroll
+        && anim.cfg.enable_smooth_scroll
+        && win_state.is_some();
 
-            if opts.clip {
-                if !rect_intersects(x, y, cw, cell_h, grid_x, grid_y, grid_w, grid_h) {
+    if use_scrollback {
+        if let Some(w) = win_state {
+            let inner_h = grid.height as isize;
+            for inner_row in 0..inner_h + 1 {
+                let Some(line) = w.line_at(inner_row) else { continue };
+                let y = grid_y + scroll_off + inner_row as f32 * cell_h;
+                if opts.clip && (y + cell_h <= grid_y || y >= grid_y + grid_h) {
                     continue;
                 }
+                draw_line(
+                    lists,
+                    store,
+                    grid_id,
+                    line,
+                    grid_x,
+                    y,
+                    cell_w,
+                    cell_h,
+                    thickness,
+                    opacity,
+                    skip_cell,
+                    inner_row as u32,
+                    cursor_glyph,
+                    atlas,
+                    queue,
+                );
             }
+        }
+    } else {
+        for row in 0..grid.height {
+            for col in 0..grid.width {
+                let cell = match grid.cell(row, col) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                draw_cell(
+                    lists,
+                    store,
+                    grid_id,
+                    row,
+                    col,
+                    cell,
+                    grid_x,
+                    grid_y + row as f32 * cell_h + scroll_off,
+                    cell_w,
+                    cell_h,
+                    thickness,
+                    opacity,
+                    opts.clip,
+                    grid_x,
+                    grid_y,
+                    grid_w,
+                    grid_h,
+                    skip_cell,
+                    cursor_glyph,
+                    atlas,
+                    queue,
+                );
+            }
+        }
+    }
 
-            let colors = resolve_cell(store, cell.hl_id);
-            if !colors.bg_is_default {
-                lists.rects.push(RectInstance {
-                    pos: [x, y],
-                    size: [cw, cell_h],
-                    color: scale_alpha(colors.bg, opacity),
+    push_rect_batch(lists, scissor, rect_start);
+    push_glyph_batch(lists, scissor, glyph_start);
+}
+
+fn draw_line(
+    lists: &mut DrawLists,
+    store: &GridStateStore,
+    grid_id: i64,
+    line: &[Cell],
+    grid_x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    thickness: f32,
+    opacity: f32,
+    skip_cell: Option<(i64, u32, u32)>,
+    row: u32,
+    cursor_glyph: Rgba,
+    atlas: &mut GlyphAtlas,
+    queue: &wgpu::Queue,
+) {
+    for (col, cell) in line.iter().enumerate() {
+        draw_cell(
+            lists,
+            store,
+            grid_id,
+            row,
+            col as u32,
+            cell,
+            grid_x,
+            y,
+            cell_w,
+            cell_h,
+            thickness,
+            opacity,
+            false,
+            0.0,
+            0.0,
+            f32::MAX,
+            f32::MAX,
+            skip_cell,
+            cursor_glyph,
+            atlas,
+            queue,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_cell(
+    lists: &mut DrawLists,
+    store: &GridStateStore,
+    grid_id: i64,
+    row: u32,
+    col: u32,
+    cell: &Cell,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    thickness: f32,
+    opacity: f32,
+    clip: bool,
+    grid_x: f32,
+    grid_y: f32,
+    grid_w: f32,
+    grid_h: f32,
+    skip_cell: Option<(i64, u32, u32)>,
+    cursor_glyph: Rgba,
+    atlas: &mut GlyphAtlas,
+    queue: &wgpu::Queue,
+) {
+    if cell.double_width_continuation {
+        return;
+    }
+    // `x` is passed as the grid's left edge; offset by the column here.
+    let x = x + col as f32 * cell_w;
+    let width_mult = if cell.double_width { 2.0 } else { 1.0 };
+    let cw = cell_w * width_mult;
+
+    if clip {
+        if !rect_intersects(x, y, cw, cell_h, grid_x, grid_y, grid_w, grid_h) {
+            return;
+        }
+    }
+
+    let colors = resolve_cell(store, cell.hl_id);
+    if !colors.bg_is_default {
+        lists.rects.push(RectInstance {
+            pos: [x, y],
+            size: [cw, cell_h],
+            color: scale_alpha(colors.bg, opacity),
+        });
+    }
+
+    let is_cursor_cell = skip_cell == Some((grid_id, row, col));
+    let glyph_color = if is_cursor_cell {
+        scale_alpha(cursor_glyph, opacity)
+    } else {
+        scale_alpha(colors.fg, opacity)
+    };
+
+    if let Some(ch) = cell.text.chars().next() {
+        if ch != ' ' && ch != '\0' {
+            if box_glyphs::is_box_glyph(ch) {
+                for (rx, ry, rw, rh) in box_glyphs::box_rects(ch, x, y, cw, cell_h, thickness) {
+                    lists.rects.push(RectInstance {
+                        pos: [rx, ry],
+                        size: [rw, rh],
+                        color: glyph_color,
+                    });
+                }
+            } else if let Some(info) = atlas.glyph(queue, ch) {
+                lists.glyphs.push(GlyphInstance {
+                    pos: [x + info.left, y + info.top],
+                    size: [info.width, info.height],
+                    uv_min: info.uv_min,
+                    uv_max: info.uv_max,
+                    color: glyph_color,
                 });
             }
+        }
+    }
 
-            let is_cursor_cell = skip_cell == Some((grid_id, row, col));
-            let glyph_color = if is_cursor_cell {
-                scale_alpha(anim.glyph_color, opacity)
-            } else {
-                scale_alpha(colors.fg, opacity)
-            };
-
-            if let Some(ch) = cell.text.chars().next() {
-                if ch != ' ' && ch != '\0' {
-                    if box_glyphs::is_box_glyph(ch) {
-                        for (rx, ry, rw, rh) in
-                            box_glyphs::box_rects(ch, x, y, cw, cell_h, thickness)
-                        {
-                            lists.rects.push(RectInstance {
-                                pos: [rx, ry],
-                                size: [rw, rh],
-                                color: glyph_color,
-                            });
-                        }
-                    } else if let Some(info) = atlas.glyph(queue, ch) {
-                        lists.glyphs.push(GlyphInstance {
-                            pos: [x + info.left, y + info.top],
-                            size: [info.width, info.height],
-                            uv_min: info.uv_min,
-                            uv_max: info.uv_max,
-                            color: glyph_color,
-                        });
-                    }
-                }
+    if let Some(attr) = store.highlight(cell.hl_id) {
+        let dec_color = scale_alpha(colors.sp, opacity);
+        let lw = (thickness * 0.8).max(1.0);
+        if attr.underline || attr.undercurl || attr.underdouble {
+            lists.rects.push(RectInstance {
+                pos: [x, y + cell_h - lw],
+                size: [cw, lw],
+                color: dec_color,
+            });
+            if attr.underdouble {
+                lists.rects.push(RectInstance {
+                    pos: [x, y + cell_h - lw * 3.0],
+                    size: [cw, lw],
+                    color: dec_color,
+                });
             }
-
-            if let Some(attr) = store.highlight(cell.hl_id) {
-                let dec_color = scale_alpha(colors.sp, opacity);
-                let lw = (thickness * 0.8).max(1.0);
-                if attr.underline || attr.undercurl || attr.underdouble {
-                    lists.rects.push(RectInstance {
-                        pos: [x, y + cell_h - lw],
-                        size: [cw, lw],
-                        color: dec_color,
-                    });
-                    if attr.underdouble {
-                        lists.rects.push(RectInstance {
-                            pos: [x, y + cell_h - lw * 3.0],
-                            size: [cw, lw],
-                            color: dec_color,
-                        });
-                    }
-                }
-                if attr.strikethrough {
-                    lists.rects.push(RectInstance {
-                        pos: [x, y + cell_h * 0.5],
-                        size: [cw, lw],
-                        color: dec_color,
-                    });
-                }
-            }
+        }
+        if attr.strikethrough {
+            lists.rects.push(RectInstance {
+                pos: [x, y + cell_h * 0.5],
+                size: [cw, lw],
+                color: dec_color,
+            });
         }
     }
 }
@@ -302,9 +510,17 @@ fn build_cursor_effects(
     store: &GridStateStore,
     anim: &AnimationState,
     cursor_visible: bool,
+    cell_w: f32,
+    cell_h: f32,
 ) {
-    let scroll_off = anim.scroll_offset(store.cursor.grid);
+    let scroll_off = anim
+        .windows
+        .get(store.cursor.grid)
+        .map(|w| w.scroll_offset_pixels(cell_h))
+        .unwrap_or(0.0);
     let fd = anim.cfg.flash_duration;
+
+    let rect_start = lists.rects.len();
     for f in &anim.flashes {
         let a = (1.0 - f.age / fd) * 0.35;
         if a <= 0.0 {
@@ -316,58 +532,52 @@ fn build_cursor_effects(
             color: with_alpha(anim.fill_color, a),
         });
     }
-
-    for s in &anim.trail {
-        let a = (1.0 - s.age / 0.35) * 0.35;
-        if a <= 0.0 {
-            continue;
-        }
-        lists.rects.push(RectInstance {
-            pos: [s.rect.x, s.rect.y + scroll_off],
-            size: [s.rect.w, s.rect.h],
-            color: with_alpha(anim.fill_color, a),
-        });
-    }
+    anim.emit_vfx_rects(&mut lists.rects);
+    push_rect_batch(lists, None, rect_start);
 
     if !cursor_visible {
         return;
     }
-    let cur = anim.render_cursor();
+
+    let mut quad = anim.cursor_quad();
+    for c in &mut quad.corners {
+        c[1] += scroll_off;
+    }
 
     if anim.cfg.enable_cursor_glow {
+        let rect_start = lists.rects.len();
         let layers = anim.cfg.cursor_glow_layers.max(0);
+        let cx = (quad.corners[0][0] + quad.corners[2][0]) * 0.5;
+        let cy = (quad.corners[0][1] + quad.corners[2][1]) * 0.5;
+        let qw = (quad.corners[1][0] - quad.corners[0][0]).abs();
+        let qh = (quad.corners[3][1] - quad.corners[0][1]).abs();
         for layer in 0..layers {
             let f = layer as f32 / layers.max(1) as f32;
             let expand = anim.cfg.cursor_glow_radius * f;
             let a = anim.cfg.cursor_glow_alpha * (1.0 - f);
             lists.rects.push(RectInstance {
-                pos: [cur.x - expand, cur.y - expand + scroll_off],
-                size: [cur.w + expand * 2.0, cur.h + expand * 2.0],
+                pos: [cx - qw * 0.5 - expand, cy - qh * 0.5 - expand],
+                size: [qw + expand * 2.0, qh + expand * 2.0],
                 color: with_alpha(anim.fill_color, a),
             });
         }
+        push_rect_batch(lists, None, rect_start);
     }
 
-    lists.rects.push(RectInstance {
-        pos: [cur.x, cur.y + scroll_off],
-        size: [cur.w, cur.h],
-        color: anim.fill_color,
-    });
-}
-
-fn build_particles(lists: &mut DrawLists, anim: &AnimationState) {
-    let plife = anim.cfg.particle_lifetime;
-    for p in &anim.particles {
-        let a = 1.0 - p.age / plife;
-        if a <= 0.0 {
-            continue;
+    let quad_start = lists.quads.len();
+    if anim.use_outline_cursor(store) {
+        let outline = anim.cfg.unfocused_outline_width * cell_w;
+        for mut q in anim.cursor_outline_quads(outline) {
+            for c in &mut q.corners {
+                c[1] += scroll_off;
+            }
+            lists.quads.push(q);
         }
-        lists.rects.push(RectInstance {
-            pos: [p.x - 1.5, p.y - 1.5],
-            size: [3.0, 3.0],
-            color: with_alpha(p.color, a),
-        });
+    } else {
+        lists.quads.push(quad);
     }
+    anim.emit_vfx_quads(&mut lists.quads);
+    push_quad_batch(lists, None, quad_start);
 }
 
 #[inline]

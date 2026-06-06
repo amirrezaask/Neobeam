@@ -200,7 +200,7 @@ impl State {
         }
     }
 
-    fn render(&mut self, settings_ui: &mut SettingsUi) {
+    fn render(&mut self, settings_ui: &mut SettingsUi) -> bool {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -234,12 +234,13 @@ impl State {
             tracing::error!("render error: {e}");
         }
         self.frame_count += 1;
-        if settings_ui.open
-            || self.anim.is_animating()
+        let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
-        {
+            || self.anim.render_deadline().is_some();
+        if settings_ui.open || needs_anim {
             self.window.request_redraw();
         }
+        needs_anim
     }
 }
 
@@ -310,11 +311,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let events = parse_redraw(&args);
                 let flushed = state.store.apply_batch(events);
                 if flushed {
-                    let (_, ch) = state.renderer.cell_size();
-                    for (grid, delta) in state.store.take_pending_scroll() {
-                        let visible = state.store.grid(grid).map(|g| g.height).unwrap_or(40);
-                        state.anim.seed_scroll(grid, delta, ch, visible);
-                    }
+                    let scroll = state.store.take_pending_scroll();
+                    state.anim.on_flush(&state.store, &scroll);
                     state.anim.sync_floats(&state.store.active_floats());
                     state.window.request_redraw();
                 }
@@ -355,6 +353,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 state.session.set_focus(focused);
+                state.anim.set_focus(focused);
             }
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
@@ -525,19 +524,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                state.render(&mut self.settings_ui);
+                let needs_anim = state.render(&mut self.settings_ui);
+                if needs_anim {
+                    if let Some(deadline) = state.anim.render_deadline() {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::Poll);
+                    }
+                } else if self.settings_ui.open {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
             }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
         if self.settings_ui.open
             || state.anim.is_animating()
             || state.anim.is_blinking(&state.store)
         {
             state.window.request_redraw();
+            if let Some(deadline) = state.anim.render_deadline() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
         }
     }
 }

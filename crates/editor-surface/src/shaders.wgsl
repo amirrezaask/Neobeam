@@ -1,6 +1,7 @@
-// Pixel-space instanced quad shaders. Two pipelines share Globals:
-//  - rect:  solid colored quads (backgrounds, cursor, glow, trail, decorations)
-//  - glyph: textured quads sampling the atlas alpha (coverage) channel
+// Pixel-space instanced quad shaders. Three pipelines share Globals:
+//  - rect:  axis-aligned colored quads
+//  - quad: arbitrary 4-corner colored quads (cursor blob)
+//  - glyph: textured quads sampling the atlas alpha channel
 
 struct Globals {
     resolution: vec2<f32>,
@@ -55,6 +56,41 @@ fn rect_vs(@builtin(vertex_index) vi: u32, in: RectIn) -> RectOut {
 
 @fragment
 fn rect_fs(in: RectOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+}
+
+// ---------- quad pipeline (4 arbitrary corners) ----------
+
+struct QuadIn {
+    @location(0) c0: vec2<f32>,
+    @location(1) c1: vec2<f32>,
+    @location(2) c2: vec2<f32>,
+    @location(3) c3: vec2<f32>,
+    @location(4) color: vec4<f32>,
+};
+
+struct QuadOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+fn quad_tri_corner(vi: u32) -> u32 {
+    var idx = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    return idx[vi];
+}
+
+@vertex
+fn quad_vs(@builtin(vertex_index) vi: u32, in: QuadIn) -> QuadOut {
+    let corners = array<vec2<f32>, 4>(in.c0, in.c1, in.c2, in.c3);
+    let ci = quad_tri_corner(vi);
+    var out: QuadOut;
+    out.clip = to_clip(corners[ci]);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn quad_fs(in: QuadOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
 }
 

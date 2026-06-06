@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 520.0;
+const PANEL_H: f32 = 580.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -42,6 +42,8 @@ enum Hit {
     FontSizeSlider,
     LineHeightSlider,
     AnimToggle,
+    SmoothBlinkToggle,
+    AnimLengthSlider,
     PowerToggle,
     Cancel,
     Apply,
@@ -51,6 +53,7 @@ enum Hit {
 enum Drag {
     FontSize,
     LineHeight,
+    AnimLength,
 }
 
 pub struct SettingsUi {
@@ -80,6 +83,9 @@ struct Layout {
     preview: [f32; 4],
     anim_section_y: f32,
     anim_toggle: [f32; 4],
+    smooth_blink_toggle: [f32; 4],
+    anim_length_label_y: f32,
+    anim_length_slider: [f32; 4],
     power_toggle: [f32; 4],
     cancel_btn: [f32; 4],
     apply_btn: [f32; 4],
@@ -180,6 +186,15 @@ impl SettingsUi {
                 if !self.draft.animations_enabled {
                     self.draft.power_mode = false;
                 }
+                SettingsAction::Preview
+            }
+            Some(Hit::SmoothBlinkToggle) if self.draft.animations_enabled => {
+                self.draft.smooth_blink = !self.draft.smooth_blink;
+                SettingsAction::Preview
+            }
+            Some(Hit::AnimLengthSlider) if self.draft.animations_enabled => {
+                self.drag = Some(Drag::AnimLength);
+                self.set_slider(Drag::AnimLength, x, &layout);
                 SettingsAction::Preview
             }
             Some(Hit::PowerToggle) if self.draft.animations_enabled => {
@@ -316,6 +331,28 @@ impl SettingsUi {
             self.draft.power_mode,
             self.hover == Some(Hit::PowerToggle),
             self.draft.animations_enabled,
+        );
+        self.draw_toggle(
+            &mut p,
+            layout.smooth_blink_toggle,
+            "Smooth cursor blink",
+            self.draft.smooth_blink,
+            self.hover == Some(Hit::SmoothBlinkToggle),
+            self.draft.animations_enabled,
+        );
+        p.label(
+            PAD + layout.ox,
+            layout.anim_length_label_y,
+            &format!("Cursor animation length: {:.2}s", self.draft.animation_length),
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.anim_length_slider,
+            0.04,
+            0.35,
+            self.draft.animation_length,
+            self.hover == Some(Hit::AnimLengthSlider) || self.drag == Some(Drag::AnimLength),
         );
 
         let cancel_hover = self.hover == Some(Hit::Cancel);
@@ -466,6 +503,12 @@ impl SettingsUi {
         if in_rect(x, y, layout.anim_toggle) {
             return Some(Hit::AnimToggle);
         }
+        if in_rect(x, y, layout.smooth_blink_toggle) && self.draft.animations_enabled {
+            return Some(Hit::SmoothBlinkToggle);
+        }
+        if in_rect(x, y, layout.anim_length_slider) && self.draft.animations_enabled {
+            return Some(Hit::AnimLengthSlider);
+        }
         if in_rect(x, y, layout.power_toggle) && self.draft.animations_enabled {
             return Some(Hit::PowerToggle);
         }
@@ -494,12 +537,16 @@ impl SettingsUi {
         let (track, min, max, round) = match drag {
             Drag::FontSize => (layout.size_slider, 10.0_f32, 32.0, true),
             Drag::LineHeight => (layout.lh_slider, 1.0, 2.0, false),
+            Drag::AnimLength => (layout.anim_length_slider, 0.04, 0.35, false),
         };
         let t = ((x - track[0]) / track[2]).clamp(0.0, 1.0);
         let v = min + t * (max - min);
         match drag {
             Drag::FontSize => self.draft.font_size = if round { v.round() } else { v },
             Drag::LineHeight => self.draft.line_height = (v * 100.0).round() / 100.0,
+            Drag::AnimLength => {
+                self.draft.animation_length = (v * 100.0).round() / 100.0;
+            }
         }
     }
 }
@@ -545,6 +592,12 @@ fn layout(lw: f32, lh: f32) -> Layout {
     let anim_toggle = [ox + PAD, y, content_w, ROW];
     y += ROW + 4.0;
     let power_toggle = [ox + PAD, y, content_w, ROW];
+    y += ROW + 4.0;
+    let smooth_blink_toggle = [ox + PAD, y, content_w, ROW];
+    y += ROW + 8.0;
+    let anim_length_label_y = y;
+    y += 18.0;
+    let anim_length_slider = [ox + PAD, y, content_w, SLIDER_H];
     let footer_y = oy + PANEL_H - PAD - 34.0;
 
     Layout {
@@ -561,6 +614,9 @@ fn layout(lw: f32, lh: f32) -> Layout {
         preview,
         anim_section_y,
         anim_toggle,
+        smooth_blink_toggle,
+        anim_length_label_y,
+        anim_length_slider,
         power_toggle,
         cancel_btn: [ox + PAD, footer_y, 100.0, 34.0],
         apply_btn: [ox + PANEL_W - PAD - 100.0, footer_y, 100.0, 34.0],

@@ -12,7 +12,10 @@ use winit::window::Window;
 
 use crate::animation::AnimationState;
 use crate::atlas::GlyphAtlas;
-use crate::frame::{DrawLists, FloatCache, FrameBuilder, GlyphInstance, RectInstance, sync_float_cache};
+use crate::frame::{
+    DrawBatch, DrawLists, FloatCache, FrameBuilder, GlyphInstance, QuadInstance, RectInstance,
+    ScissorRect, sync_float_cache,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -60,11 +63,13 @@ pub struct Renderer {
     globals_bind_group: wgpu::BindGroup,
 
     rect_pipeline: wgpu::RenderPipeline,
+    quad_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     atlas_bind_group: wgpu::BindGroup,
 
     rect_buf: InstanceBuffer,
+    quad_buf: InstanceBuffer,
     glyph_buf: InstanceBuffer,
 
     float_cache: FloatCache,
@@ -221,6 +226,19 @@ impl Renderer {
             attributes: &glyph_attrs,
         };
 
+        let quad_attrs = wgpu::vertex_attr_array![
+            0 => Float32x2,
+            1 => Float32x2,
+            2 => Float32x2,
+            3 => Float32x2,
+            4 => Float32x4
+        ];
+        let quad_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &quad_attrs,
+        };
+
         let rect_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rect-pl"),
             bind_group_layouts: &[Some(&globals_layout)],
@@ -253,6 +271,27 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("quad-pipeline"),
+            layout: Some(&rect_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("quad_vs"),
+                compilation_options: Default::default(),
+                buffers: &[quad_layout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("quad_fs"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("glyph-pipeline"),
             layout: Some(&glyph_pl_layout),
@@ -276,6 +315,7 @@ impl Renderer {
         });
 
         let rect_buf = InstanceBuffer::new(&device, "rect-instances", 1 << 16);
+        let quad_buf = InstanceBuffer::new(&device, "quad-instances", 1 << 14);
         let glyph_buf = InstanceBuffer::new(&device, "glyph-instances", 1 << 16);
 
         Ok(Renderer {
@@ -287,10 +327,12 @@ impl Renderer {
             globals_buf,
             globals_bind_group,
             rect_pipeline,
+            quad_pipeline,
             glyph_pipeline,
             atlas_bind_group_layout,
             atlas_bind_group,
             rect_buf,
+            quad_buf,
             glyph_buf,
             float_cache: FloatCache::new(),
             atlas,
@@ -389,6 +431,7 @@ impl Renderer {
         // change (handled elsewhere); the bind group stays valid here.
 
         self.rect_buf.upload(&self.device, &self.queue, "rect-instances", &lists.rects);
+        self.quad_buf.upload(&self.device, &self.queue, "quad-instances", &lists.quads);
         self.glyph_buf.upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
 
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -433,18 +476,13 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            if !lists.rects.is_empty() {
-                pass.set_pipeline(&self.rect_pipeline);
-                pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.rect_buf.buffer.slice(..));
-                pass.draw(0..6, 0..lists.rects.len() as u32);
-            }
-            if !lists.glyphs.is_empty() {
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.glyph_buf.buffer.slice(..));
-                pass.draw(0..6, 0..lists.glyphs.len() as u32);
+            let target_w = self.config.width;
+            let target_h = self.config.height;
+            if lists.batches.is_empty() {
+                draw_all_instances(&mut pass, self, &lists, target_w, target_h);
+            } else {
+                draw_batched(&mut pass, self, &lists, target_w, target_h);
+                draw_unbatched_tail(&mut pass, self, &lists, target_w, target_h);
             }
         }
 
@@ -487,6 +525,157 @@ impl Renderer {
             }
             x += adv;
         }
+    }
+}
+
+fn scissor_physical(s: ScissorRect, scale: f32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
+    let x = (s.x as f32 * scale).round() as u32;
+    let y = (s.y as f32 * scale).round() as u32;
+    let w = (s.w as f32 * scale).round() as u32;
+    let h = (s.h as f32 * scale).round() as u32;
+    clamp_scissor(x, y, w.max(1), h.max(1), target_w, target_h)
+}
+
+fn clamp_scissor(x: u32, y: u32, w: u32, h: u32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
+    let x = x.min(target_w.saturating_sub(1));
+    let y = y.min(target_h.saturating_sub(1));
+    let w = w.min(target_w.saturating_sub(x)).max(1);
+    let h = h.min(target_h.saturating_sub(y)).max(1);
+    (x, y, w, h)
+}
+
+fn apply_scissor(
+    pass: &mut wgpu::RenderPass<'_>,
+    scissor: Option<ScissorRect>,
+    scale: f32,
+    target_w: u32,
+    target_h: u32,
+) {
+    let (x, y, w, h) = match scissor {
+        Some(s) => scissor_physical(s, scale, target_w, target_h),
+        None => (0, 0, target_w.max(1), target_h.max(1)),
+    };
+    pass.set_scissor_rect(x, y, w, h);
+}
+
+fn draw_all_instances(
+    pass: &mut wgpu::RenderPass<'_>,
+    r: &Renderer,
+    lists: &DrawLists,
+    target_w: u32,
+    target_h: u32,
+) {
+    if !lists.rects.is_empty() {
+        apply_scissor(pass, None, r.scale, target_w, target_h);
+        pass.set_pipeline(&r.rect_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
+        pass.draw(0..6, 0..lists.rects.len() as u32);
+    }
+    if !lists.quads.is_empty() {
+        apply_scissor(pass, None, r.scale, target_w, target_h);
+        pass.set_pipeline(&r.quad_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
+        pass.draw(0..6, 0..lists.quads.len() as u32);
+    }
+    if !lists.glyphs.is_empty() {
+        apply_scissor(pass, None, r.scale, target_w, target_h);
+        pass.set_pipeline(&r.glyph_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_bind_group(1, &r.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.glyph_buf.buffer.slice(..));
+        pass.draw(0..6, 0..lists.glyphs.len() as u32);
+    }
+}
+
+fn draw_batched(
+    pass: &mut wgpu::RenderPass<'_>,
+    r: &Renderer,
+    lists: &DrawLists,
+    target_w: u32,
+    target_h: u32,
+) {
+    let scale = r.scale;
+    for batch in &lists.batches {
+        match batch {
+            DrawBatch::Rects { start, count, scissor } => {
+                if *count == 0 {
+                    continue;
+                }
+                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                pass.set_pipeline(&r.rect_pipeline);
+                pass.set_bind_group(0, &r.globals_bind_group, &[]);
+                pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
+                pass.draw(0..6, *start..(*start + *count));
+            }
+            DrawBatch::Quads { start, count, scissor } => {
+                if *count == 0 {
+                    continue;
+                }
+                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                pass.set_pipeline(&r.quad_pipeline);
+                pass.set_bind_group(0, &r.globals_bind_group, &[]);
+                pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
+                pass.draw(0..6, *start..(*start + *count));
+            }
+            DrawBatch::Glyphs { start, count, scissor } => {
+                if *count == 0 {
+                    continue;
+                }
+                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                pass.set_pipeline(&r.glyph_pipeline);
+                pass.set_bind_group(0, &r.globals_bind_group, &[]);
+                pass.set_bind_group(1, &r.atlas_bind_group, &[]);
+                pass.set_vertex_buffer(0, r.glyph_buf.buffer.slice(..));
+                pass.draw(0..6, *start..(*start + *count));
+            }
+        }
+    }
+}
+
+fn batch_end(batches: &[DrawBatch]) -> (u32, u32, u32) {
+    let mut rects = 0u32;
+    let mut glyphs = 0u32;
+    let mut quads = 0u32;
+    for batch in batches {
+        match batch {
+            DrawBatch::Rects { start, count, .. } => rects = rects.max(start + count),
+            DrawBatch::Glyphs { start, count, .. } => glyphs = glyphs.max(start + count),
+            DrawBatch::Quads { start, count, .. } => quads = quads.max(start + count),
+        }
+    }
+    (rects, glyphs, quads)
+}
+
+/// Draw overlay / settings UI appended after batched frame content.
+fn draw_unbatched_tail(
+    pass: &mut wgpu::RenderPass<'_>,
+    r: &Renderer,
+    lists: &DrawLists,
+    target_w: u32,
+    target_h: u32,
+) {
+    let (rect_end, glyph_end, quad_end) = batch_end(&lists.batches);
+    apply_scissor(pass, None, r.scale, target_w, target_h);
+    if rect_end < lists.rects.len() as u32 {
+        pass.set_pipeline(&r.rect_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
+        pass.draw(0..6, rect_end..lists.rects.len() as u32);
+    }
+    if quad_end < lists.quads.len() as u32 {
+        pass.set_pipeline(&r.quad_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
+        pass.draw(0..6, quad_end..lists.quads.len() as u32);
+    }
+    if glyph_end < lists.glyphs.len() as u32 {
+        pass.set_pipeline(&r.glyph_pipeline);
+        pass.set_bind_group(0, &r.globals_bind_group, &[]);
+        pass.set_bind_group(1, &r.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, r.glyph_buf.buffer.slice(..));
+        pass.draw(0..6, glyph_end..lists.glyphs.len() as u32);
     }
 }
 
