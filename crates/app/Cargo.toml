@@ -14,6 +14,9 @@ arboard = "3.6.1"
 directories = "6.0.0"
 editor-surface = { version = "0.1.0", path = "../editor-surface" }
 flume = "0.12.0"
+imgui = "0.12"
+imgui-wgpu = "0.28"
+imgui-winit-support = "0.13"
 notify-debouncer-mini = "0.7.0"
 nvim-core = { version = "0.1.0", path = "../nvim-core" }
 nvim-rs = { version = "0.9.2", features = ["use_tokio"] }

@@ -371,8 +371,16 @@ impl Renderer {
         (self.config.width as f32 / self.scale, self.config.height as f32 / self.scale)
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
     }
 
     pub fn with_atlas_queue<R>(&mut self, f: impl FnOnce(&mut GlyphAtlas, &wgpu::Queue) -> R) -> R {
@@ -420,7 +428,7 @@ impl Renderer {
         store: &GridStateStore,
         anim: &mut AnimationState,
         overlay: Option<&str>,
-        ui: Option<(&[RectInstance], &[GlyphInstance])>,
+        mut ui_cb: impl FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) -> Result<()> {
         let shake = anim.shake_offset();
         let (lw, lh) = self.logical_size();
@@ -447,10 +455,6 @@ impl Renderer {
         }
         if let Some(text) = overlay {
             self.push_overlay(&mut lists, text);
-        }
-        if let Some((rects, glyphs)) = ui {
-            lists.rects.extend_from_slice(rects);
-            lists.glyphs.extend_from_slice(glyphs);
         }
         // Atlas may have grown into a new texture? It only resets on font/dpi
         // change (handled elsewhere); the bind group stays valid here.
@@ -509,6 +513,7 @@ impl Renderer {
                 draw_batched(&mut pass, self, &lists, target_w, target_h);
                 draw_unbatched_tail(&mut pass, self, &lists, target_w, target_h);
             }
+            ui_cb(&self.device, &self.queue, &mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

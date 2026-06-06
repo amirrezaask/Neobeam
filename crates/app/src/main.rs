@@ -2,6 +2,7 @@
 //! state and animation engine, and wires input/resize/redraw together
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
+mod imgui_layer;
 mod settings;
 mod settings_ui;
 
@@ -17,6 +18,7 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
+use imgui_layer::ImguiLayer;
 use settings::{spawn_watcher, Settings};
 use settings_ui::{revert_draft, SettingsAction, SettingsUi};
 use winit::application::ApplicationHandler;
@@ -93,6 +95,7 @@ enum UserEvent {
 struct State {
     window: Arc<Window>,
     renderer: Renderer,
+    imgui: ImguiLayer,
     session: NvimSession,
     store: GridStateStore,
     anim: AnimationState,
@@ -185,10 +188,12 @@ impl App {
         tracing::info!("nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}", renderer.scale());
 
         let anim = AnimationState::new(self.settings.animation_config());
+        let imgui = ImguiLayer::new(&window, &renderer);
 
         Ok(State {
             window,
             renderer,
+            imgui,
             session,
             store: GridStateStore::new(),
             anim,
@@ -303,7 +308,7 @@ impl State {
         }
     }
 
-    fn render(&mut self, settings_ui: &mut SettingsUi) -> bool {
+    fn render(&mut self, settings_ui: &mut SettingsUi) -> (bool, SettingsAction) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -321,20 +326,39 @@ impl State {
         };
 
         let (cw, ch) = self.renderer.cell_size();
-        let (lw, lh) = self.renderer.logical_size();
-        self.renderer.with_atlas_queue(|atlas, queue| {
-            settings_ui.rebuild(atlas, queue, lw, lh);
-        });
-        let ui = settings_ui.overlay();
+        let mut imgui_action = SettingsAction::None;
+        if settings_ui.open {
+            let window = self.window.clone();
+            if let Err(e) = self.imgui.prepare_ui(&window, |ui| {
+                imgui_action = settings_ui.draw(ui);
+            }) {
+                tracing::warn!("imgui frame failed: {e:#}");
+            }
+        }
 
         self.anim.update(dt, &self.store, cw, ch);
-        if let Err(e) = self.renderer.render(
-            &self.store,
-            &mut self.anim,
+
+        let draw_imgui = settings_ui.open;
+        let store = &self.store;
+        let anim = &mut self.anim;
+        let imgui = &mut self.imgui;
+        let renderer = &mut self.renderer;
+        if let Err(e) = renderer.render(
+            store,
+            anim,
             overlay.as_deref(),
-            ui,
+            |device, queue, pass| {
+                if draw_imgui {
+                    if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
+                        tracing::warn!("imgui draw failed: {e:#}");
+                    }
+                }
+            },
         ) {
             tracing::error!("render error: {e}");
+        }
+        if draw_imgui {
+            imgui.discard_frame();
         }
         self.frame_count += 1;
         let needs_anim = self.anim.is_animating()
@@ -343,7 +367,7 @@ impl State {
         if settings_ui.open || needs_anim {
             self.window.request_redraw();
         }
-        needs_anim
+        (needs_anim, imgui_action)
     }
 }
 
@@ -435,22 +459,32 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(state) = self.state.as_mut() else { return };
+        if let Some(state) = self.state.as_mut() {
+            state
+                .imgui
+                .handle_event(state.window.as_ref(), window_id, &event);
+            if self.settings_ui.open {
+                state.window.request_redraw();
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
+                let Some(state) = self.state.as_mut() else { return };
                 state.session.kill();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                let Some(state) = self.state.as_mut() else { return };
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
                 state.recompute_grid();
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                let Some(state) = self.state.as_mut() else { return };
                 let size = state.window.inner_size();
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
@@ -458,10 +492,12 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
             WindowEvent::Focused(focused) => {
+                let Some(state) = self.state.as_mut() else { return };
                 state.session.set_focus(focused);
                 state.anim.set_focus(focused);
             }
             WindowEvent::ModifiersChanged(m) => {
+                let Some(state) = self.state.as_mut() else { return };
                 let s = m.state();
                 state.mods = Mods {
                     ctrl: s.control_key(),
@@ -470,7 +506,9 @@ impl ApplicationHandler<UserEvent> for App {
                     shift: s.shift_key(),
                 };
             }
-            WindowEvent::Ime(ime) => match ime {
+            WindowEvent::Ime(ime) => {
+                let Some(state) = self.state.as_mut() else { return };
+                match ime {
                 Ime::Enabled => state.ime_active = true,
                 Ime::Preedit(text, _) => state.ime_active = !text.is_empty(),
                 Ime::Commit(text) => {
@@ -478,7 +516,8 @@ impl ApplicationHandler<UserEvent> for App {
                     state.session.paste(text);
                 }
                 Ime::Disabled => state.ime_active = false,
-            },
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 let ime_active = self.state.as_ref().is_some_and(|s| s.ime_active);
@@ -505,8 +544,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.settings_ui.open {
                     if matches!(&event.logical_key, Key::Named(WinitNamed::Escape)) {
                         self.handle_settings_action(SettingsAction::CloseCancel);
+                        return;
                     }
-                    return;
+                    if self.state.as_ref().is_some_and(|s| s.imgui.wants_keyboard()) {
+                        return;
+                    }
                 }
 
                 let Some(state) = self.state.as_mut() else { return };
@@ -524,35 +566,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(state) = self.state.as_mut() {
-                    state.cursor_pos = (position.x, position.y);
-                }
-                if self.settings_ui.open {
-                    let scale = self
-                        .state
-                        .as_ref()
-                        .map(|s| s.renderer.scale())
-                        .unwrap_or(1.0);
-                    let (lw, lh) = self
-                        .state
-                        .as_ref()
-                        .map(|s| s.renderer.logical_size())
-                        .unwrap_or((800.0, 600.0));
-                    self.settings_ui.handle_mouse_move(
-                        position.x as f32 / scale,
-                        position.y as f32 / scale,
-                        lw,
-                        lh,
-                    );
-                    if self.settings_ui.is_dragging() {
-                        self.apply_preview();
-                    }
-                    if let Some(state) = self.state.as_ref() {
-                        state.window.request_redraw();
-                    }
+                let Some(state) = self.state.as_mut() else { return };
+                state.cursor_pos = (position.x, position.y);
+                if self.settings_ui.open && state.imgui.wants_mouse() {
                     return;
                 }
-                let Some(state) = self.state.as_mut() else { return };
                 if let Some(btn) = state.mouse_down {
                     let (row, col) = state.hit_test();
                     state
@@ -561,25 +579,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
-                if self.settings_ui.open && button == MouseButton::Left {
-                    let (lx, ly, lw, lh) = {
-                        let Some(state) = self.state.as_ref() else { return };
-                        let scale = state.renderer.scale();
-                        let (lw, lh) = state.renderer.logical_size();
-                        (
-                            state.cursor_pos.0 as f32 / scale,
-                            state.cursor_pos.1 as f32 / scale,
-                            lw,
-                            lh,
-                        )
-                    };
-                    let action = match btn_state {
-                        ElementState::Pressed => {
-                            self.settings_ui.handle_mouse_down(lx, ly, lw, lh)
-                        }
-                        ElementState::Released => self.settings_ui.handle_mouse_up(),
-                    };
-                    self.handle_settings_action(action);
+                if self.settings_ui.open
+                    && self.state.as_ref().is_some_and(|s| s.imgui.wants_mouse())
+                {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else { return };
@@ -601,16 +603,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.settings_ui.open {
-                    let (lw, lh) = state.renderer.logical_size();
-                    let y = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
-                    };
-                    self.settings_ui.handle_wheel(y, lw, lh);
-                    state.window.request_redraw();
+                if self.settings_ui.open
+                    && self.state.as_ref().is_some_and(|s| s.imgui.wants_mouse())
+                {
                     return;
                 }
+                let Some(state) = self.state.as_mut() else { return };
                 let (row, col) = state.hit_test();
                 let (_, ch) = state.renderer.cell_size();
                 let scale = self.settings.mouse_scroll_sensitivity;
@@ -643,9 +641,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let needs_anim = state.render(&mut self.settings_ui);
+                let (needs_anim, action) = {
+                    let Some(state) = self.state.as_mut() else { return };
+                    state.render(&mut self.settings_ui)
+                };
+                self.handle_settings_action(action);
                 if needs_anim {
-                    if let Some(deadline) = state.anim.render_deadline() {
+                    if let Some(deadline) = self.state.as_ref().and_then(|s| s.anim.render_deadline()) {
                         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                     } else {
                         event_loop.set_control_flow(ControlFlow::Poll);
