@@ -90,13 +90,15 @@ impl WindowRenderState {
         }
 
         let h = grid.height as usize;
-        if h != self.actual_lines.len() {
+        let height_changed = h != self.actual_lines.len();
+        if height_changed {
             self.scroll_animation.reset();
+            self.scrollback_lines.resize(2 * h.max(1), None);
+            self.sync_lines_from_grid(grid);
+            self.scrollback_lines.clone_from_iter(self.actual_lines.iter());
+        } else {
+            self.sync_lines_from_grid(grid);
         }
-        self.scrollback_lines.resize(2 * h.max(1), None);
-
-        self.sync_lines_from_grid(grid);
-        self.scrollback_lines.clone_from_iter(self.actual_lines.iter());
     }
 
     pub fn add_scroll_delta(&mut self, delta: i64) {
@@ -147,6 +149,8 @@ impl WindowRenderState {
                 scroll_offset = scroll_offset.clamp(-(max_delta as f32), max_delta as f32);
             }
             self.scroll_animation.position = scroll_offset;
+        } else if scroll_delta != 0 {
+            self.scroll_animation.reset();
         }
 
         self.scroll_delta = 0;

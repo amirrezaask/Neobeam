@@ -188,6 +188,25 @@ impl NvimSession {
         });
     }
 
+    /// Read `g:neovide_scroll_animation_length` and `g:neovide_scroll_animation_far_lines` if set.
+    pub fn fetch_neovide_scroll_globals(&self) -> (Option<f32>, Option<u32>) {
+        let nvim = self.nvim.clone();
+        self.rt
+            .block_on(async move {
+                let scroll = nvim
+                    .get_var("neovide_scroll_animation_length")
+                    .await
+                    .ok()
+                    .and_then(|v| value_as_f32(&v));
+                let far = nvim
+                    .get_var("neovide_scroll_animation_far_lines")
+                    .await
+                    .ok()
+                    .and_then(|v| value_as_u32(&v));
+                (scroll, far)
+            })
+    }
+
     /// Try a graceful quit; the window lifecycle handles forced kill.
     pub fn quit(&self) {
         let nvim = self.nvim.clone();
@@ -244,4 +263,14 @@ impl Drop for NvimSession {
         self.exit_guard.store(true, Ordering::SeqCst);
         let _ = self.child.start_kill();
     }
+}
+
+fn value_as_f32(v: &Value) -> Option<f32> {
+    v.as_f64().map(|n| n as f32)
+}
+
+fn value_as_u32(v: &Value) -> Option<u32> {
+    v.as_u64()
+        .map(|n| n as u32)
+        .or_else(|| v.as_i64().filter(|&n| n >= 0).map(|n| n as u32))
 }

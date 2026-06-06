@@ -327,7 +327,16 @@ impl GridStateStore {
                 line_count: _,
                 scroll_delta,
             } => {
-                self.viewport_grids_this_batch.insert(grid);
+                // nvim reports viewports against the window's own grid handle.
+                // With `ext_multigrid` disabled, window content is rendered on
+                // the global grid (id 1), so a viewport for a grid that has no
+                // backing content grid drives grid 1's scroll animation instead.
+                // (Neovide always runs multigrid and never hits this remap.)
+                let target = if self.grids.contains_key(&grid) { grid } else { 1 };
+                // Viewport is the authoritative scroll signal; once we have one
+                // for the target grid, suppress the grid_scroll fallback so the
+                // delta is never double-counted.
+                self.viewport_grids_this_batch.insert(target);
                 let mut delta = scroll_delta;
                 if delta == 0 {
                     if let Some(prev) = self.viewports.get(&grid) {
@@ -335,7 +344,7 @@ impl GridStateStore {
                     }
                 }
                 if delta != 0 {
-                    self.pending_scroll.push((grid, delta));
+                    self.pending_scroll.push((target, delta));
                 }
                 self.viewports.insert(
                     grid,
@@ -345,7 +354,7 @@ impl GridStateStore {
                         scroll_delta: delta,
                     },
                 );
-                if let Some(g) = self.grids.get_mut(&grid) {
+                if let Some(g) = self.grids.get_mut(&target) {
                     g.scroll_delta = delta;
                 }
             }

@@ -105,6 +105,9 @@ impl App {
             redraw,
             on_close,
         )?;
+        let (scroll, far) = session.fetch_neovide_scroll_globals();
+        self.settings.apply_neovide_scroll_globals(scroll, far);
+        self.settings_ui.draft = self.settings.clone();
         tracing::info!("nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}", renderer.scale());
 
         let anim = AnimationState::new(self.settings.animation_config());

@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 580.0;
+const PANEL_H: f32 = 680.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -44,6 +44,8 @@ enum Hit {
     AnimToggle,
     SmoothBlinkToggle,
     AnimLengthSlider,
+    ScrollLengthSlider,
+    ScrollFarSlider,
     PowerToggle,
     Cancel,
     Apply,
@@ -54,6 +56,8 @@ enum Drag {
     FontSize,
     LineHeight,
     AnimLength,
+    ScrollLength,
+    ScrollFar,
 }
 
 pub struct SettingsUi {
@@ -86,6 +90,10 @@ struct Layout {
     smooth_blink_toggle: [f32; 4],
     anim_length_label_y: f32,
     anim_length_slider: [f32; 4],
+    scroll_length_label_y: f32,
+    scroll_length_slider: [f32; 4],
+    scroll_far_label_y: f32,
+    scroll_far_slider: [f32; 4],
     power_toggle: [f32; 4],
     cancel_btn: [f32; 4],
     apply_btn: [f32; 4],
@@ -195,6 +203,16 @@ impl SettingsUi {
             Some(Hit::AnimLengthSlider) if self.draft.animations_enabled => {
                 self.drag = Some(Drag::AnimLength);
                 self.set_slider(Drag::AnimLength, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::ScrollLengthSlider) if self.draft.animations_enabled => {
+                self.drag = Some(Drag::ScrollLength);
+                self.set_slider(Drag::ScrollLength, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::ScrollFarSlider) if self.draft.animations_enabled => {
+                self.drag = Some(Drag::ScrollFar);
+                self.set_slider(Drag::ScrollFar, x, &layout);
                 SettingsAction::Preview
             }
             Some(Hit::PowerToggle) if self.draft.animations_enabled => {
@@ -354,6 +372,43 @@ impl SettingsUi {
             self.draft.animation_length,
             self.hover == Some(Hit::AnimLengthSlider) || self.drag == Some(Drag::AnimLength),
         );
+        let scroll_len = self.draft.scroll_animation_length;
+        let scroll_len_label = if scroll_len <= 0.0 {
+            "Scroll animation length: disabled".to_string()
+        } else {
+            format!("Scroll animation length: {:.2}s", scroll_len)
+        };
+        p.label(
+            PAD + layout.ox,
+            layout.scroll_length_label_y,
+            &scroll_len_label,
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.scroll_length_slider,
+            0.0,
+            0.5,
+            scroll_len,
+            self.hover == Some(Hit::ScrollLengthSlider) || self.drag == Some(Drag::ScrollLength),
+        );
+        p.label(
+            PAD + layout.ox,
+            layout.scroll_far_label_y,
+            &format!(
+                "Far scroll lines: {} (0 = snap large jumps)",
+                self.draft.scroll_animation_far_lines
+            ),
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.scroll_far_slider,
+            0.0,
+            10.0,
+            self.draft.scroll_animation_far_lines as f32,
+            self.hover == Some(Hit::ScrollFarSlider) || self.drag == Some(Drag::ScrollFar),
+        );
 
         let cancel_hover = self.hover == Some(Hit::Cancel);
         p.rect(
@@ -509,6 +564,12 @@ impl SettingsUi {
         if in_rect(x, y, layout.anim_length_slider) && self.draft.animations_enabled {
             return Some(Hit::AnimLengthSlider);
         }
+        if in_rect(x, y, layout.scroll_length_slider) && self.draft.animations_enabled {
+            return Some(Hit::ScrollLengthSlider);
+        }
+        if in_rect(x, y, layout.scroll_far_slider) && self.draft.animations_enabled {
+            return Some(Hit::ScrollFarSlider);
+        }
         if in_rect(x, y, layout.power_toggle) && self.draft.animations_enabled {
             return Some(Hit::PowerToggle);
         }
@@ -538,6 +599,8 @@ impl SettingsUi {
             Drag::FontSize => (layout.size_slider, 10.0_f32, 32.0, true),
             Drag::LineHeight => (layout.lh_slider, 1.0, 2.0, false),
             Drag::AnimLength => (layout.anim_length_slider, 0.04, 0.35, false),
+            Drag::ScrollLength => (layout.scroll_length_slider, 0.0, 0.5, false),
+            Drag::ScrollFar => (layout.scroll_far_slider, 0.0, 10.0, true),
         };
         let t = ((x - track[0]) / track[2]).clamp(0.0, 1.0);
         let v = min + t * (max - min);
@@ -546,6 +609,12 @@ impl SettingsUi {
             Drag::LineHeight => self.draft.line_height = (v * 100.0).round() / 100.0,
             Drag::AnimLength => {
                 self.draft.animation_length = (v * 100.0).round() / 100.0;
+            }
+            Drag::ScrollLength => {
+                self.draft.scroll_animation_length = (v * 100.0).round() / 100.0;
+            }
+            Drag::ScrollFar => {
+                self.draft.scroll_animation_far_lines = v.round().clamp(0.0, 10.0) as u32;
             }
         }
     }
@@ -598,6 +667,14 @@ fn layout(lw: f32, lh: f32) -> Layout {
     let anim_length_label_y = y;
     y += 18.0;
     let anim_length_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
+    let scroll_length_label_y = y;
+    y += 18.0;
+    let scroll_length_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
+    let scroll_far_label_y = y;
+    y += 18.0;
+    let scroll_far_slider = [ox + PAD, y, content_w, SLIDER_H];
     let footer_y = oy + PANEL_H - PAD - 34.0;
 
     Layout {
@@ -617,6 +694,10 @@ fn layout(lw: f32, lh: f32) -> Layout {
         smooth_blink_toggle,
         anim_length_label_y,
         anim_length_slider,
+        scroll_length_label_y,
+        scroll_length_slider,
+        scroll_far_label_y,
+        scroll_far_slider,
         power_toggle,
         cancel_btn: [ox + PAD, footer_y, 100.0, 34.0],
         apply_btn: [ox + PANEL_W - PAD - 100.0, footer_y, 100.0, 34.0],
