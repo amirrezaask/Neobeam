@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use arboard::Clipboard;
 use editor_surface::Renderer;
+use imgui::ClipboardBackend;
 use imgui::{Context, FontConfig, FontSource, Ui};
 use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
@@ -15,6 +17,18 @@ static JETBRAINS_MONO: &[u8] =
     include_bytes!("../assets/fonts/JetBrainsMono-VariableFont_wght.ttf");
 
 const SETTINGS_UI_FONT_SIZE: f32 = 15.0;
+
+struct ArboardClipboard(Clipboard);
+
+impl ClipboardBackend for ArboardClipboard {
+    fn get(&mut self) -> Option<String> {
+        self.0.get_text().ok()
+    }
+
+    fn set(&mut self, value: &str) {
+        let _ = self.0.set_text(value);
+    }
+}
 
 pub struct ImguiLayer {
     ctx: Context,
@@ -28,6 +42,9 @@ impl ImguiLayer {
     pub fn new(window: &Window, editor: &Renderer) -> Self {
         let mut ctx = Context::create();
         ctx.set_ini_filename(None::<std::path::PathBuf>);
+        if let Ok(clipboard) = Clipboard::new() {
+            ctx.set_clipboard_backend(ArboardClipboard(clipboard));
+        }
 
         let hidpi = window.scale_factor();
         ctx.io_mut().font_global_scale = (1.0 / hidpi) as f32;

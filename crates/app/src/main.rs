@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use arboard::Clipboard;
 use editor_surface::{AnimationState, Renderer};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
@@ -467,6 +468,23 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                let paste_shortcut = self.state.as_ref().is_some_and(|s| {
+                    is_paste_shortcut(&event.logical_key, s.mods)
+                });
+                if paste_shortcut {
+                    let imgui_wants_kb = self.settings_ui.open
+                        && self.state.as_ref().is_some_and(|s| s.imgui.wants_keyboard());
+                    if !imgui_wants_kb {
+                        if let Some(text) = read_clipboard_text() {
+                            let Some(state) = self.state.as_mut() else { return };
+                            state.session.paste(text);
+                            state.anim.notify_keystroke();
+                            state.window.request_redraw();
+                        }
+                        return;
+                    }
+                }
+
                 if self.settings_ui.open {
                     if matches!(&event.logical_key, Key::Named(WinitNamed::Escape)) {
                         self.handle_settings_action(SettingsAction::CloseCancel);
@@ -602,6 +620,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
+}
+
+fn is_paste_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.shift {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+        && (mods.meta || mods.ctrl)
+}
+
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+    clipboard.get_text().ok().filter(|text| !text.is_empty())
 }
 
 fn main() -> Result<()> {
