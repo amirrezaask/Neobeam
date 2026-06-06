@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use editor_surface::{parse_vfx_modes, AnimationConfig, VfxMode};
+use editor_surface::{parse_vfx_modes, AnimationConfig, ChromeLayoutConfig, VfxMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +63,13 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn chrome_layout_config(&self) -> ChromeLayoutConfig {
+        ChromeLayoutConfig {
+            menu_bar_height: crate::menu_bar::menu_bar_height(self.font_size),
+            ..ChromeLayoutConfig::default()
+        }
+    }
+
     pub fn animation_config(&self) -> AnimationConfig {
         let mut cfg = AnimationConfig::default();
         cfg.animation_length = self.animation_length;

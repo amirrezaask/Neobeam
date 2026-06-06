@@ -188,6 +188,43 @@ impl NvimSession {
         });
     }
 
+    /// List installed colorschemes (same source as `:colorscheme <Tab>`).
+    pub fn fetch_colorschemes(&self) -> Vec<String> {
+        let nvim = self.nvim.clone();
+        self.rt.block_on(async move {
+            let result = nvim
+                .call_function(
+                    "getcompletion",
+                    vec![Value::from(""), Value::from("color")],
+                )
+                .await;
+            result
+                .ok()
+                .map(|v| value_as_string_list(&v))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Read `g:colors_name` for the active colorscheme.
+    pub fn current_colorscheme(&self) -> Option<String> {
+        let nvim = self.nvim.clone();
+        self.rt.block_on(async move {
+            nvim.get_var("colors_name")
+                .await
+                .ok()
+                .and_then(|v| value_as_string(&v))
+        })
+    }
+
+    /// Apply a colorscheme immediately.
+    pub fn set_colorscheme(&self, name: &str) {
+        let nvim = self.nvim.clone();
+        let cmd = format!("colorscheme {name}");
+        self.rt.spawn(async move {
+            let _ = nvim.command(&cmd).await;
+        });
+    }
+
     /// Read `g:neovide_scroll_animation_length` and `g:neovide_scroll_animation_far_lines` if set.
     pub fn fetch_neovide_scroll_globals(&self) -> (Option<f32>, Option<u32>) {
         let nvim = self.nvim.clone();
@@ -273,4 +310,18 @@ fn value_as_u32(v: &Value) -> Option<u32> {
     v.as_u64()
         .map(|n| n as u32)
         .or_else(|| v.as_i64().filter(|&n| n >= 0).map(|n| n as u32))
+}
+
+fn value_as_string(v: &Value) -> Option<String> {
+    v.as_str().map(|s| s.to_string())
+}
+
+fn value_as_string_list(v: &Value) -> Vec<String> {
+    let mut names: Vec<String> = match v {
+        Value::Array(arr) => arr.iter().filter_map(value_as_string).collect(),
+        _ => Vec::new(),
+    };
+    names.sort();
+    names.dedup();
+    names
 }

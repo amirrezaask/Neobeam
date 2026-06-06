@@ -422,13 +422,14 @@ impl Renderer {
         store: &GridStateStore,
         anim: &mut AnimationState,
         overlay: Option<&str>,
+        content_offset_y: f32,
         mut ui_cb: impl FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) -> Result<()> {
         let shake = anim.shake_offset();
         let (lw, lh) = self.logical_size();
         let globals = Globals {
             resolution: [lw, lh],
-            offset: shake,
+            offset: [shake[0], shake[1] + content_offset_y],
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
@@ -447,7 +448,7 @@ impl Renderer {
             }
         }
         if let Some(text) = overlay {
-            self.push_overlay(&mut lists, text);
+            self.push_overlay(&mut lists, text, content_offset_y);
         }
         // Atlas may have grown into a new texture? It only resets on font/dpi
         // change (handled elsewhere); the bind group stays valid here.
@@ -515,7 +516,7 @@ impl Renderer {
     }
 
     /// Append a top-right overlay string (e.g. the FPS meter) to the draw lists.
-    fn push_overlay(&mut self, lists: &mut DrawLists, text: &str) {
+    fn push_overlay(&mut self, lists: &mut DrawLists, text: &str, content_offset_y: f32) {
         let (lw, _) = self.logical_size();
         let adv = self.atlas.cell_w;
         let ch = self.atlas.cell_h;
@@ -523,7 +524,7 @@ impl Renderer {
         let count = text.chars().count() as f32;
         let width = count * adv;
         let x0 = (lw - width - margin).max(0.0);
-        let y0 = margin;
+        let y0 = margin + content_offset_y;
 
         // Translucent backdrop for legibility.
         lists.rects.push(RectInstance {

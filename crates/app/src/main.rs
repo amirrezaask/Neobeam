@@ -3,6 +3,8 @@
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
 mod imgui_layer;
+mod imgui_theme;
+mod menu_bar;
 mod settings;
 mod settings_ui;
 
@@ -11,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use arboard::Clipboard;
-use editor_surface::{AnimationState, Renderer};
+use editor_surface::{AnimationState, ChromeLayout, Renderer};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -20,6 +22,7 @@ use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
 use imgui_layer::ImguiLayer;
+use menu_bar::{MenuBar, MenuBarAction};
 use settings::{spawn_watcher, Settings};
 use settings_ui::{revert_draft, SettingsAction, SettingsUi};
 use winit::application::ApplicationHandler;
@@ -59,7 +62,23 @@ struct App {
     rt: tokio::runtime::Runtime,
     settings: Settings,
     settings_ui: SettingsUi,
+    menu_bar: MenuBar,
     state: Option<State>,
+}
+
+fn imgui_active(state: &State) -> bool {
+    state.imgui.wants_mouse() || state.imgui.wants_keyboard()
+}
+
+fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
+    let scale = state.renderer.scale() as f64;
+    let (lw, lh) = state.renderer.logical_size();
+    let layout = ChromeLayout::compute(lw, lh, &settings.chrome_layout_config());
+    state.cursor_pos.1 / scale < layout.editor_y as f64
+}
+
+fn imgui_captures_input(state: &State, settings: &Settings) -> bool {
+    imgui_active(state) || cursor_in_menu_bar(state, settings)
 }
 
 impl App {
@@ -79,6 +98,7 @@ impl App {
             rt,
             settings,
             settings_ui,
+            menu_bar: MenuBar::new(),
             state: None,
         })
     }
@@ -99,8 +119,9 @@ impl App {
 
         let (cw, ch) = renderer.cell_size();
         let (lw, lh) = renderer.logical_size();
-        let cols = ((lw / cw).floor() as u32).max(1);
-        let rows = ((lh / ch).floor() as u32).max(1);
+        let chrome_cfg = self.settings.chrome_layout_config();
+        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
+        let (cols, rows) = layout.editor_grid_size(cw, ch);
 
         let proxy = self.proxy.clone();
         let redraw = Arc::new(move |args: Vec<Value>| {
@@ -120,10 +141,11 @@ impl App {
         let (scroll, far) = session.fetch_neovide_scroll_globals();
         self.settings.apply_neovide_scroll_globals(scroll, far);
         self.settings_ui.draft = self.settings.clone();
+        self.menu_bar.init_theme(&session);
         tracing::info!("nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}", renderer.scale());
 
         let anim = AnimationState::new(self.settings.animation_config());
-        let imgui = ImguiLayer::new(&window, &renderer);
+        let imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
 
         Ok(State {
             window,
@@ -156,7 +178,7 @@ impl App {
             tracing::warn!("font preview failed: {e:#}");
         }
         state.anim.cfg = d.animation_config();
-        state.recompute_grid();
+        state.recompute_grid(&self.settings);
     }
 
     fn apply_settings(&mut self) {
@@ -184,6 +206,59 @@ impl App {
         self.apply_preview();
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
+        }
+    }
+
+    fn apply_font_and_zoom(&mut self) {
+        let Some(state) = self.state.as_mut() else { return };
+        if let Err(e) = state.renderer.apply_font(
+            self.settings.font_family.as_deref(),
+            self.settings.font_size,
+            self.settings.line_height,
+        ) {
+            tracing::warn!("font apply failed: {e:#}");
+        }
+        state.anim.cfg = self.settings.animation_config();
+        state.recompute_grid(&self.settings);
+    }
+
+    fn handle_menu_action(&mut self, action: MenuBarAction) {
+        match action {
+            MenuBarAction::None => {}
+            MenuBarAction::FontChanged { family } => {
+                self.settings.font_family = family;
+                self.settings_ui.draft.font_family = self.settings.font_family.clone();
+                self.settings.save();
+                self.apply_font_and_zoom();
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            MenuBarAction::ThemeChanged(name) => {
+                if let Some(state) = self.state.as_ref() {
+                    state.session.set_colorscheme(&name);
+                    self.menu_bar.selected_theme = Some(name);
+                    state.window.request_redraw();
+                }
+            }
+            MenuBarAction::ZoomIn => {
+                self.settings.font_size = (self.settings.font_size + 1.0).min(32.0);
+                self.settings_ui.draft.font_size = self.settings.font_size;
+                self.settings.save();
+                self.apply_font_and_zoom();
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            MenuBarAction::ZoomOut => {
+                self.settings.font_size = (self.settings.font_size - 1.0).max(10.0);
+                self.settings_ui.draft.font_size = self.settings.font_size;
+                self.settings.save();
+                self.apply_font_and_zoom();
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -215,19 +290,25 @@ impl App {
 }
 
 impl State {
-    fn hit_test(&self) -> (i64, i64) {
+    fn hit_test(&self, settings: &Settings) -> (i64, i64) {
         let scale = self.renderer.scale() as f64;
         let (cw, ch) = self.renderer.cell_size();
+        let (lw, lh) = self.renderer.logical_size();
+        let chrome_cfg = settings.chrome_layout_config();
+        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
+        let y = self.cursor_pos.1 / scale - layout.editor_y as f64;
         let col = (self.cursor_pos.0 / scale / cw as f64).floor() as i64;
-        let row = (self.cursor_pos.1 / scale / ch as f64).floor() as i64;
-        (row.max(0), col.max(0))
+        let max_row = (layout.editor_h / ch).floor() as i64;
+        let row = (y / ch as f64).floor() as i64;
+        (row.max(0).min(max_row), col.max(0))
     }
 
-    fn recompute_grid(&mut self) {
+    fn recompute_grid(&mut self, settings: &Settings) {
         let (cw, ch) = self.renderer.cell_size();
         let (lw, lh) = self.renderer.logical_size();
-        let cols = ((lw / cw).floor() as u32).max(1);
-        let rows = ((lh / ch).floor() as u32).max(1);
+        let chrome_cfg = settings.chrome_layout_config();
+        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
+        let (cols, rows) = layout.editor_grid_size(cw, ch);
         if cols != self.grid_cols || rows != self.grid_rows {
             self.grid_cols = cols;
             self.grid_rows = rows;
@@ -235,7 +316,12 @@ impl State {
         }
     }
 
-    fn render(&mut self, settings_ui: &mut SettingsUi) -> (bool, SettingsAction) {
+    fn render(
+        &mut self,
+        settings: &Settings,
+        menu_bar: &mut MenuBar,
+        settings_ui: &mut SettingsUi,
+    ) -> (bool, SettingsAction, MenuBarAction) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -253,20 +339,38 @@ impl State {
         };
 
         let (cw, ch) = self.renderer.cell_size();
+        let chrome_cfg = settings.chrome_layout_config();
+        let layout = ChromeLayout::compute(
+            self.renderer.logical_size().0,
+            self.renderer.logical_size().1,
+            &chrome_cfg,
+        );
+
         let mut imgui_action = SettingsAction::None;
-        if settings_ui.open {
-            let window = self.window.clone();
-            if let Err(e) = self.imgui.prepare_ui(&window, |ui| {
-                imgui_action = settings_ui.draw(ui);
-            }) {
-                tracing::warn!("imgui frame failed: {e:#}");
-            }
+        let mut menu_action = MenuBarAction::None;
+        let window = self.window.clone();
+        let session = &self.session;
+        let store = &self.store;
+        let device = self.renderer.device();
+        let queue = self.renderer.queue();
+        if let Err(e) = self.imgui.prepare_ui(
+            &window,
+            store,
+            settings.font_size,
+            device,
+            queue,
+            |ui| {
+                menu_action = menu_bar.draw(ui, settings, session);
+                if settings_ui.open {
+                    imgui_action = settings_ui.draw(ui);
+                }
+            },
+        ) {
+            tracing::warn!("imgui frame failed: {e:#}");
         }
 
         self.anim.update(dt, &self.store, cw, ch);
 
-        let draw_imgui = settings_ui.open;
-        let store = &self.store;
         let anim = &mut self.anim;
         let imgui = &mut self.imgui;
         let renderer = &mut self.renderer;
@@ -274,27 +378,23 @@ impl State {
             store,
             anim,
             overlay.as_deref(),
+            layout.editor_y,
             |device, queue, pass| {
-                if draw_imgui {
-                    if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
-                        tracing::warn!("imgui draw failed: {e:#}");
-                    }
+                if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
+                    tracing::warn!("imgui draw failed: {e:#}");
                 }
             },
         ) {
             tracing::error!("render error: {e}");
         }
-        if draw_imgui {
-            imgui.discard_frame();
-        }
         self.frame_count += 1;
         let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
             || self.anim.render_deadline().is_some();
-        if settings_ui.open || needs_anim {
+        if settings_ui.open || needs_anim || imgui_active(self) {
             self.window.request_redraw();
         }
-        (needs_anim, imgui_action)
+        (needs_anim, imgui_action, menu_action)
     }
 }
 
@@ -393,7 +493,7 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
-            if self.settings_ui.open {
+            if self.settings_ui.open || imgui_captures_input(state, &self.settings) {
                 state.window.request_redraw();
             }
         }
@@ -407,7 +507,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(state) = self.state.as_mut() else { return };
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid();
+                state.recompute_grid(&self.settings);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -415,7 +515,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = state.window.inner_size();
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid();
+                state.recompute_grid(&self.settings);
                 state.window.request_redraw();
             }
             WindowEvent::Focused(focused) => {
@@ -472,8 +572,9 @@ impl ApplicationHandler<UserEvent> for App {
                     is_paste_shortcut(&event.logical_key, s.mods)
                 });
                 if paste_shortcut {
-                    let imgui_wants_kb = self.settings_ui.open
-                        && self.state.as_ref().is_some_and(|s| s.imgui.wants_keyboard());
+                    let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
+                        imgui_captures_input(s, &self.settings)
+                    });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
                             let Some(state) = self.state.as_mut() else { return };
@@ -490,9 +591,9 @@ impl ApplicationHandler<UserEvent> for App {
                         self.handle_settings_action(SettingsAction::CloseCancel);
                         return;
                     }
-                    if self.state.as_ref().is_some_and(|s| s.imgui.wants_keyboard()) {
-                        return;
-                    }
+                }
+                if self.state.as_ref().is_some_and(|s| s.imgui.wants_keyboard()) {
+                    return;
                 }
 
                 let Some(state) = self.state.as_mut() else { return };
@@ -512,25 +613,33 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let Some(state) = self.state.as_mut() else { return };
                 state.cursor_pos = (position.x, position.y);
-                if self.settings_ui.open && state.imgui.wants_mouse() {
+                if cursor_in_menu_bar(state, &self.settings) {
+                    state.window.request_redraw();
+                }
+                if imgui_captures_input(state, &self.settings) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
-                    let (row, col) = state.hit_test();
+                    let (row, col) = state.hit_test(&self.settings);
                     state
                         .session
                         .mouse(btn, MouseAction::Drag, mods_string(state.mods), 0, row, col);
                 }
             }
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
-                if self.settings_ui.open
-                    && self.state.as_ref().is_some_and(|s| s.imgui.wants_mouse())
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| imgui_captures_input(s, &self.settings))
                 {
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
                     return;
                 }
                 let Some(state) = self.state.as_mut() else { return };
                 let Some(btn) = map_button(button) else { return };
-                let (row, col) = state.hit_test();
+                let (row, col) = state.hit_test(&self.settings);
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_down = Some(btn);
@@ -547,13 +656,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.settings_ui.open
-                    && self.state.as_ref().is_some_and(|s| s.imgui.wants_mouse())
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| imgui_captures_input(s, &self.settings))
                 {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else { return };
-                let (row, col) = state.hit_test();
+                let (row, col) = state.hit_test(&self.settings);
                 let (_, ch) = state.renderer.cell_size();
                 let scale = self.settings.mouse_scroll_sensitivity;
                 let lines = match delta {
@@ -585,10 +696,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (needs_anim, action) = {
+                let (needs_anim, action, menu_action) = {
                     let Some(state) = self.state.as_mut() else { return };
-                    state.render(&mut self.settings_ui)
+                    state.render(&self.settings, &mut self.menu_bar, &mut self.settings_ui)
                 };
+                self.handle_menu_action(menu_action);
                 self.handle_settings_action(action);
                 if needs_anim {
                     if let Some(deadline) = self.state.as_ref().and_then(|s| s.anim.render_deadline()) {
@@ -596,7 +708,12 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         event_loop.set_control_flow(ControlFlow::Poll);
                     }
-                } else if self.settings_ui.open {
+                } else if self.settings_ui.open
+                    || self
+                        .state
+                        .as_ref()
+                        .is_some_and(|s| imgui_captures_input(s, &self.settings))
+                {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
                     event_loop.set_control_flow(ControlFlow::Wait);
@@ -609,6 +726,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
         if self.settings_ui.open
+            || imgui_captures_input(state, &self.settings)
             || state.anim.is_animating()
             || state.anim.is_blinking(&state.store)
         {

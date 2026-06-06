@@ -8,6 +8,9 @@ use arboard::Clipboard;
 use editor_surface::Renderer;
 use imgui::ClipboardBackend;
 use imgui::{Context, FontConfig, FontSource, Ui};
+use nvim_core::grid::GridStateStore;
+
+use crate::imgui_theme::apply_nvim_theme;
 use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::event::{Event, WindowEvent};
@@ -15,8 +18,6 @@ use winit::window::{Window, WindowId};
 
 static JETBRAINS_MONO: &[u8] =
     include_bytes!("../assets/fonts/JetBrainsMono-VariableFont_wght.ttf");
-
-const SETTINGS_UI_FONT_SIZE: f32 = 15.0;
 
 struct ArboardClipboard(Clipboard);
 
@@ -36,34 +37,26 @@ pub struct ImguiLayer {
     renderer: ImguiRenderer,
     last_frame: Instant,
     frame_ready: bool,
+    font_size_px: f32,
+    hidpi: f32,
 }
 
 impl ImguiLayer {
-    pub fn new(window: &Window, editor: &Renderer) -> Self {
+    pub fn new(window: &Window, editor: &Renderer, font_size_px: f32) -> Self {
         let mut ctx = Context::create();
         ctx.set_ini_filename(None::<std::path::PathBuf>);
         if let Ok(clipboard) = Clipboard::new() {
             ctx.set_clipboard_backend(ArboardClipboard(clipboard));
         }
 
-        let hidpi = window.scale_factor();
+        let hidpi = window.scale_factor() as f32;
         ctx.io_mut().font_global_scale = (1.0 / hidpi) as f32;
-
-        ctx.fonts().add_font(&[FontSource::TtfData {
-            data: JETBRAINS_MONO,
-            size_pixels: SETTINGS_UI_FONT_SIZE * hidpi as f32,
-            config: Some(FontConfig {
-                oversample_h: 2,
-                oversample_v: 1,
-                pixel_snap_h: true,
-                ..Default::default()
-            }),
-        }]);
+        load_font(&mut ctx, font_size_px, hidpi);
 
         let mut platform = WinitPlatform::new(&mut ctx);
         platform.attach_window(ctx.io_mut(), window, HiDpiMode::Default);
 
-        let renderer = ImguiRenderer::new(
+        let mut imgui_renderer = ImguiRenderer::new(
             &mut ctx,
             editor.device(),
             editor.queue(),
@@ -72,13 +65,20 @@ impl ImguiLayer {
                 ..RendererConfig::new_srgb()
             },
         );
+        imgui_renderer.reload_font_texture(
+            &mut ctx,
+            editor.device(),
+            editor.queue(),
+        );
 
         ImguiLayer {
             ctx,
             platform,
-            renderer,
+            renderer: imgui_renderer,
             last_frame: Instant::now(),
             frame_ready: false,
+            font_size_px,
+            hidpi,
         }
     }
 
@@ -101,13 +101,44 @@ impl ImguiLayer {
         self.ctx.io().want_capture_keyboard
     }
 
+    /// Rebuild the font atlas when the editor font size or HiDPI scale changes.
+    pub fn sync_font_size(
+        &mut self,
+        window: &Window,
+        font_size_px: f32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        let hidpi = window.scale_factor() as f32;
+        self.ctx.io_mut().font_global_scale = (1.0 / hidpi) as f32;
+
+        if (self.font_size_px - font_size_px).abs() < f32::EPSILON
+            && (self.hidpi - hidpi).abs() < f32::EPSILON
+        {
+            return;
+        }
+
+        self.font_size_px = font_size_px;
+        self.hidpi = hidpi;
+        self.ctx.fonts().clear();
+        load_font(&mut self.ctx, font_size_px, hidpi);
+        self.renderer
+            .reload_font_texture(&mut self.ctx, device, queue);
+    }
+
     /// Build UI for the current frame. Pair with [`Self::draw_to_pass`] or
     /// [`Self::discard_frame`] on the same frame.
     pub fn prepare_ui(
         &mut self,
         window: &Arc<Window>,
+        store: &GridStateStore,
+        font_size_px: f32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         build: impl FnOnce(&mut Ui) -> (),
     ) -> Result<()> {
+        self.sync_font_size(window.as_ref(), font_size_px, device, queue);
+
         let now = Instant::now();
         self.ctx
             .io_mut()
@@ -115,6 +146,8 @@ impl ImguiLayer {
         self.last_frame = now;
 
         self.discard_frame();
+
+        apply_nvim_theme(&mut self.ctx, store);
 
         self.platform
             .prepare_frame(self.ctx.io_mut(), window.as_ref())?;
@@ -149,4 +182,17 @@ impl ImguiLayer {
             self.frame_ready = false;
         }
     }
+}
+
+fn load_font(ctx: &mut Context, font_size_px: f32, hidpi: f32) {
+    ctx.fonts().add_font(&[FontSource::TtfData {
+        data: JETBRAINS_MONO,
+        size_pixels: font_size_px * hidpi,
+        config: Some(FontConfig {
+            oversample_h: 2,
+            oversample_v: 1,
+            pixel_snap_h: true,
+            ..Default::default()
+        }),
+    }]);
 }

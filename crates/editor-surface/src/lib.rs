@@ -4,6 +4,7 @@ pub mod animation;
 pub mod atlas;
 pub mod blink;
 pub mod box_glyphs;
+pub mod chrome;
 pub mod color;
 pub mod cursor_vfx;
 pub mod fonts;
@@ -17,6 +18,7 @@ pub mod window_render;
 pub use animation::{AnimationConfig, AnimationState};
 pub use atlas::GlyphAtlas;
 pub use blink::ShouldRender;
+pub use chrome::{ChromeLayout, ChromeLayoutConfig};
 pub use cursor_vfx::{parse_vfx_modes, HighlightMode, TrailMode, VfxMode};
 pub use fonts::list_monospace_fonts;
 pub use frame::{
