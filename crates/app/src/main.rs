@@ -7,7 +7,6 @@ mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
 mod settings;
-mod settings_ui;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,7 +25,6 @@ use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
 use settings::{spawn_watcher, Settings};
-use settings_ui::{revert_draft, SettingsAction, SettingsUi};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -64,7 +62,6 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     rt: tokio::runtime::Runtime,
     settings: Settings,
-    settings_ui: SettingsUi,
     menu_bar: MenuBar,
     state: Option<State>,
 }
@@ -95,7 +92,6 @@ impl App {
             .build()?;
         let settings = Settings::load();
         settings.save(); // ensure a settings.json exists for the user to edit (§9)
-        let settings_ui = SettingsUi::new(&settings);
         let reload_proxy = proxy.clone();
         spawn_watcher(move || {
             let _ = reload_proxy.send_event(UserEvent::SettingsReloaded);
@@ -104,7 +100,6 @@ impl App {
             proxy,
             rt,
             settings,
-            settings_ui,
             menu_bar: MenuBar::new(),
             state: None,
         })
@@ -151,7 +146,6 @@ impl App {
         )?;
         let (scroll, far) = session.fetch_neovide_scroll_globals();
         self.settings.apply_neovide_scroll_globals(scroll, far);
-        self.settings_ui.draft = self.settings.clone();
         self.menu_bar.init_theme(&session);
         tracing::info!(
             "nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}",
@@ -182,45 +176,14 @@ impl App {
         })
     }
 
-    fn apply_preview(&mut self) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let d = self.settings_ui.draft.clone();
-        if let Err(e) =
-            state
-                .renderer
-                .apply_font(d.font_family.as_deref(), d.font_size, d.line_height)
-        {
-            tracing::warn!("font preview failed: {e:#}");
-        }
-        state.anim.cfg = d.animation_config();
-        state.recompute_grid(&self.settings);
-    }
-
-    fn apply_settings(&mut self) {
-        self.settings = self.settings_ui.draft.clone();
-        self.settings.save();
-        self.apply_preview();
-    }
-
-    fn cancel_settings(&mut self) {
-        revert_draft(&mut self.settings_ui, &self.settings);
-        self.apply_preview();
-    }
-
     fn reload_settings_from_disk(&mut self) {
-        if self.settings_ui.open {
-            return;
-        }
         let loaded = Settings::load();
         if loaded == self.settings {
             return;
         }
         tracing::info!("reloading settings from disk");
         self.settings = loaded;
-        revert_draft(&mut self.settings_ui, &self.settings);
-        self.apply_preview();
+        self.apply_font_and_zoom();
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
@@ -244,9 +207,7 @@ impl App {
     fn handle_menu_action(&mut self, action: MenuBarAction) {
         match action {
             MenuBarAction::None => {}
-            MenuBarAction::FontChanged { family } => {
-                self.settings.font_family = family;
-                self.settings_ui.draft.font_family = self.settings.font_family.clone();
+            MenuBarAction::SettingsChanged => {
                 self.settings.save();
                 self.apply_font_and_zoom();
                 if let Some(state) = self.state.as_ref() {
@@ -257,24 +218,6 @@ impl App {
                 if let Some(state) = self.state.as_ref() {
                     state.session.set_colorscheme(&name);
                     self.menu_bar.selected_theme = Some(name);
-                    state.window.request_redraw();
-                }
-            }
-            MenuBarAction::ZoomIn => {
-                self.settings.font_size = (self.settings.font_size + 1.0).min(32.0);
-                self.settings_ui.draft.font_size = self.settings.font_size;
-                self.settings.save();
-                self.apply_font_and_zoom();
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-            }
-            MenuBarAction::ZoomOut => {
-                self.settings.font_size = (self.settings.font_size - 1.0).max(10.0);
-                self.settings_ui.draft.font_size = self.settings.font_size;
-                self.settings.save();
-                self.apply_font_and_zoom();
-                if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
                 }
             }
@@ -293,31 +236,6 @@ impl App {
         state.window.request_redraw();
     }
 
-    fn handle_settings_action(&mut self, action: SettingsAction) {
-        match action {
-            SettingsAction::None => {}
-            SettingsAction::Preview => {
-                self.apply_preview();
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-            }
-            SettingsAction::Apply => {
-                self.apply_settings();
-                self.settings_ui.open = false;
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-            }
-            SettingsAction::CloseCancel => {
-                self.cancel_settings();
-                self.settings_ui.open = false;
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-            }
-        }
-    }
 }
 
 impl State {
@@ -362,10 +280,9 @@ impl State {
 
     fn render(
         &mut self,
-        settings: &Settings,
+        settings: &mut Settings,
         menu_bar: &mut MenuBar,
-        settings_ui: &mut SettingsUi,
-    ) -> (bool, SettingsAction, MenuBarAction, ContextMenuAction) {
+    ) -> (bool, MenuBarAction, ContextMenuAction) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -380,11 +297,7 @@ impl State {
                 self.fps * 0.9 + inst * 0.1
             };
         }
-        let overlay = if settings_ui.open {
-            None
-        } else {
-            Some(format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0))
-        };
+        let overlay = Some(format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0));
 
         let (cw, ch) = self.renderer.cell_size();
         let chrome_cfg = settings.chrome_layout_config();
@@ -394,7 +307,6 @@ impl State {
             &chrome_cfg,
         );
 
-        let mut imgui_action = SettingsAction::None;
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let window = self.window.clone();
@@ -407,9 +319,6 @@ impl State {
             self.imgui
                 .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
                     menu_action = menu_bar.draw(ui, settings, session);
-                    if settings_ui.open {
-                        imgui_action = settings_ui.draw(ui);
-                    }
                     context_action = context_menu.draw(ui);
                 })
         {
@@ -438,10 +347,10 @@ impl State {
         let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
             || self.anim.render_deadline().is_some();
-        if settings_ui.open || self.context_menu.open || needs_anim || imgui_active(self) {
+        if self.context_menu.open || needs_anim || imgui_active(self) {
             self.window.request_redraw();
         }
-        (needs_anim, imgui_action, menu_action, context_action)
+        (needs_anim, menu_action, context_action)
     }
 }
 
@@ -574,9 +483,8 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
-            let redraw = self.settings_ui.open
-                || state.context_menu.open
-                || imgui_captures_input(state, &self.settings);
+            let redraw =
+                state.context_menu.open || imgui_captures_input(state, &self.settings);
             if redraw {
                 state.window.request_redraw();
             }
@@ -648,22 +556,6 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                let cmd_comma = self.state.as_ref().is_some_and(|s| {
-                    matches!(&event.logical_key, Key::Character(c) if c.as_str() == "," && s.mods.meta)
-                });
-                if cmd_comma {
-                    self.settings_ui.toggle(&self.settings);
-                    if self.settings_ui.open {
-                        self.apply_preview();
-                    } else {
-                        self.cancel_settings();
-                    }
-                    if let Some(state) = self.state.as_ref() {
-                        state.window.request_redraw();
-                    }
-                    return;
-                }
-
                 let paste_shortcut = self
                     .state
                     .as_ref()
@@ -686,12 +578,6 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if self.settings_ui.open {
-                    if matches!(&event.logical_key, Key::Named(WinitNamed::Escape)) {
-                        self.handle_settings_action(SettingsAction::CloseCancel);
-                        return;
-                    }
-                }
                 if self
                     .state
                     .as_ref()
@@ -759,13 +645,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
 
                 if button == MouseButton::Right && btn_state == ElementState::Pressed {
-                    if !self.settings_ui.open {
-                        if let Some(grid_pos) = state.hit_test_editor(&self.settings) {
-                            let screen_pos = state.imgui.mouse_pos();
-                            state.context_menu.open_at(screen_pos, grid_pos);
-                            state.window.request_redraw();
-                            return;
-                        }
+                    if let Some(grid_pos) = state.hit_test_editor(&self.settings) {
+                        let screen_pos = state.imgui.mouse_pos();
+                        state.context_menu.open_at(screen_pos, grid_pos);
+                        state.window.request_redraw();
+                        return;
                     }
                 }
 
@@ -841,14 +725,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (needs_anim, action, menu_action, context_action) = {
+                let (needs_anim, menu_action, context_action) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
-                    state.render(&self.settings, &mut self.menu_bar, &mut self.settings_ui)
+                    state.render(&mut self.settings, &mut self.menu_bar)
                 };
                 self.handle_menu_action(menu_action);
-                self.handle_settings_action(action);
                 self.handle_context_menu_action(context_action);
                 if needs_anim {
                     if let Some(deadline) =
@@ -858,10 +741,9 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         event_loop.set_control_flow(ControlFlow::Poll);
                     }
-                } else if self.settings_ui.open
-                    || self.state.as_ref().is_some_and(|s| {
-                        s.context_menu.open || imgui_captures_input(s, &self.settings)
-                    })
+                } else if self.state.as_ref().is_some_and(|s| {
+                    s.context_menu.open || imgui_captures_input(s, &self.settings)
+                })
                 {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
@@ -876,8 +758,7 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        if self.settings_ui.open
-            || state.context_menu.open
+        if state.context_menu.open
             || imgui_captures_input(state, &self.settings)
             || state.anim.is_animating()
             || state.anim.is_blinking(&state.store)
