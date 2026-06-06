@@ -46,25 +46,102 @@ pub fn resolve_cell(store: &GridStateStore, hl_id: u32) -> CellColors {
 }
 
 /// Cursor fill (rect) and glyph colors for the active mode.
+///
+/// Matches Neovim's `mode_info_set` contract: when `attr_id` is 0, Normal fg/bg
+/// are swapped; otherwise the mode highlight's bg/fg are used with swapped
+/// Normal colors as fallback (see `:h ui-global`).
 pub fn resolve_cursor(store: &GridStateStore) -> (Rgba, Rgba) {
-    let mode = store.current_mode();
-    let attr_id = mode.map(|m| m.attr_id).unwrap_or(0);
+    let def = store.default_colors;
+    let default_fill = rgb_to_rgba(def.fg);
+    let default_glyph = rgb_to_rgba(def.bg);
 
-    // Underlying cell at the cursor (for the invert fallback).
-    let under = store
-        .grid(store.cursor.grid)
-        .and_then(|g| g.cell(store.cursor.row, store.cursor.col))
-        .map(|c| c.hl_id)
+    let attr_id = store
+        .current_mode()
+        .map(|m| m.attr_id)
         .unwrap_or(0);
-    let cell = resolve_cell(store, under);
 
-    if attr_id != 0 {
-        if let Some(a) = store.highlight(attr_id) {
-            let fill = a.background.map(rgb_to_rgba).unwrap_or(cell.fg);
-            let glyph = a.foreground.map(rgb_to_rgba).unwrap_or(cell.bg);
-            return (fill, glyph);
-        }
+    if attr_id == 0 {
+        return (default_fill, default_glyph);
     }
-    // Invert the underlying cell: fill = cell fg, glyph = cell bg.
-    (cell.fg, cell.bg)
+
+    let Some(attr) = store.highlight(attr_id) else {
+        return (default_fill, default_glyph);
+    };
+
+    let fill = attr.background.map(rgb_to_rgba).unwrap_or(default_fill);
+    let glyph = attr.foreground.map(rgb_to_rgba).unwrap_or(default_glyph);
+    (fill, glyph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nvim_core::protocol::{HlAttr, ModeInfo, UiEvent};
+
+    fn store_with_mode(attr_id: u32, fg: u32, bg: u32) -> GridStateStore {
+        let mut store = GridStateStore::new();
+        store.apply(UiEvent::DefaultColorsSet {
+            fg: 0xffffff,
+            bg: 0x000000,
+            sp: 0xff0000,
+            bg_none: false,
+        });
+        if attr_id != 0 {
+            store.apply(UiEvent::HlAttrDefine {
+                id: attr_id,
+                attr: HlAttr {
+                    foreground: Some(fg),
+                    background: Some(bg),
+                    ..HlAttr::default()
+                },
+            });
+        }
+        store.apply(UiEvent::ModeInfoSet {
+            cursor_style_enabled: true,
+            mode_infos: vec![ModeInfo {
+                short_name: "n".into(),
+                attr_id,
+                ..ModeInfo::default()
+            }],
+        });
+        store.apply(UiEvent::ModeChange { mode_idx: 0 });
+        store
+    }
+
+    #[test]
+    fn cursor_attr_id_zero_swaps_normal_colors() {
+        let store = store_with_mode(0, 0, 0);
+        let (fill, glyph) = resolve_cursor(&store);
+        assert_eq!(fill, rgb_to_rgba(0xffffff));
+        assert_eq!(glyph, rgb_to_rgba(0x000000));
+    }
+
+    #[test]
+    fn cursor_uses_mode_highlight_colors() {
+        let store = store_with_mode(7, 0x00ff00, 0x0000ff);
+        let (fill, glyph) = resolve_cursor(&store);
+        assert_eq!(fill, rgb_to_rgba(0x0000ff));
+        assert_eq!(glyph, rgb_to_rgba(0x00ff00));
+    }
+
+    #[test]
+    fn cursor_highlight_missing_colors_fall_back_to_swapped_normal() {
+        let mut store = store_with_mode(0, 0, 0);
+        store.apply(UiEvent::HlAttrDefine {
+            id: 3,
+            attr: HlAttr::default(),
+        });
+        store.apply(UiEvent::ModeInfoSet {
+            cursor_style_enabled: true,
+            mode_infos: vec![ModeInfo {
+                short_name: "n".into(),
+                attr_id: 3,
+                ..ModeInfo::default()
+            }],
+        });
+
+        let (fill, glyph) = resolve_cursor(&store);
+        assert_eq!(fill, rgb_to_rgba(0xffffff));
+        assert_eq!(glyph, rgb_to_rgba(0x000000));
+    }
 }
