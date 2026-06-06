@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nvim-core",
+    "crates/editor-surface",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["nvim-ui rust port"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
