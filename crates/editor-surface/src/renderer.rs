@@ -58,6 +58,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scale: f32,
+    opacity: f32,
 
     globals_buf: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -124,6 +125,19 @@ impl Renderer {
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
+            .or_else(|| {
+                caps.alpha_modes
+                    .iter()
+                    .copied()
+                    .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
+            })
+            .unwrap_or(caps.alpha_modes[0]);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -131,7 +145,7 @@ impl Renderer {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
@@ -324,6 +338,7 @@ impl Renderer {
             queue,
             config,
             scale,
+            opacity: 1.0,
             globals_buf,
             globals_bind_group,
             rect_pipeline,
@@ -341,6 +356,10 @@ impl Renderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
     }
 
     /// Logical cell metrics for grid sizing / hit testing.
@@ -413,8 +432,14 @@ impl Renderer {
 
         sync_float_cache(store, &mut self.float_cache);
 
-        let mut lists: DrawLists =
-            FrameBuilder::build(store, anim, &mut self.atlas, &self.queue, &self.float_cache);
+        let mut lists: DrawLists = FrameBuilder::build(
+            store,
+            anim,
+            &mut self.atlas,
+            &self.queue,
+            &self.float_cache,
+            self.opacity,
+        );
         for id in anim.fading_out_float_ids() {
             if anim.float_opacity(id) <= 0.01 {
                 self.float_cache.remove(&id);
@@ -465,7 +490,7 @@ impl Renderer {
                             r: clear[0] as f64,
                             g: clear[1] as f64,
                             b: clear[2] as f64,
-                            a: 1.0,
+                            a: clear[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },

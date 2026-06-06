@@ -104,11 +104,20 @@ impl FrameBuilder {
         atlas: &mut GlyphAtlas,
         queue: &wgpu::Queue,
         float_cache: &FloatCache,
+        bg_opacity: f32,
     ) -> DrawLists {
+        // `guibg=NONE` forces a fully transparent editor background regardless of
+        // the opacity setting; otherwise the slider scales the default bg alpha.
+        let default_bg_alpha = if store.default_colors.bg_none {
+            0.0
+        } else {
+            bg_opacity.clamp(0.0, 1.0)
+        };
         let mut lists = DrawLists {
             clear: rgb_to_rgba(store.default_colors.bg),
             ..Default::default()
         };
+        lists.clear[3] = default_bg_alpha;
         let cell_w = atlas.cell_w;
         let cell_h = atlas.cell_h;
         let thickness = (atlas.size_px / 12.0).max(1.0);
@@ -155,6 +164,7 @@ impl FrameBuilder {
                 grid,
                 win,
                 opacity,
+                default_bg_alpha,
                 DrawOpts {
                     clip: !is_float,
                     scroll: !is_float,
@@ -191,6 +201,7 @@ impl FrameBuilder {
                 &cached.grid,
                 Some(&cached.window),
                 opacity,
+                default_bg_alpha,
                 DrawOpts {
                     clip: false,
                     scroll: false,
@@ -251,6 +262,7 @@ fn draw_grid(
     grid: &Grid,
     win: Option<&WindowMeta>,
     opacity: f32,
+    default_bg_alpha: f32,
     opts: DrawOpts,
     anim: &AnimationState,
     atlas: &mut GlyphAtlas,
@@ -298,11 +310,14 @@ fn draw_grid(
     let glyph_start = lists.glyphs.len();
     let cursor_glyph = anim.glyph_color;
 
-    lists.rects.push(RectInstance {
-        pos: [grid_x, grid_y],
-        size: [grid_w, grid_h],
-        color: scale_alpha(rgb_to_rgba(store.default_colors.bg), opacity),
-    });
+    let bg_alpha = opacity * default_bg_alpha;
+    if bg_alpha > 0.0 {
+        lists.rects.push(RectInstance {
+            pos: [grid_x, grid_y],
+            size: [grid_w, grid_h],
+            color: scale_alpha(rgb_to_rgba(store.default_colors.bg), bg_alpha),
+        });
+    }
 
     let use_scrollback = opts.scroll
         && anim.cfg.enable_smooth_scroll

@@ -94,7 +94,7 @@ pub enum UiEvent {
     GridCursorGoto { grid: i64, row: u32, col: u32 },
     GridScroll { grid: i64, top: i64, bot: i64, left: i64, right: i64, rows: i64, cols: i64 },
     GridDestroy { grid: i64 },
-    DefaultColorsSet { fg: u32, bg: u32, sp: u32 },
+    DefaultColorsSet { fg: u32, bg: u32, sp: u32, bg_none: bool },
     HlAttrDefine { id: u32, attr: HlAttr },
     ModeInfoSet { cursor_style_enabled: bool, mode_infos: Vec<ModeInfo> },
     ModeChange { mode_idx: usize },
@@ -176,6 +176,8 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
             fg: as_u32(&p[0]),
             bg: as_u32(&p[1]),
             sp: as_u32(&p[2]),
+            // nvim sends -1 for an unset color, e.g. `:hi Normal guibg=NONE`.
+            bg_none: as_i64(&p[1]) < 0,
         }),
         "hl_attr_define" if p.len() >= 2 => out.push(UiEvent::HlAttrDefine {
             id: as_u32(&p[0]),

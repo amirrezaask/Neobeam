@@ -25,6 +25,64 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey as WinitNamed};
 use winit::window::{Window, WindowId};
 
+/// Apply (or clear) a native blurred backdrop behind the transparent window.
+///
+/// Idempotent: any previously-applied effect view is removed first, so this is
+/// safe to call repeatedly. On macOS we use `NSVisualEffectView` with
+/// `BehindWindow` blending and then force the wgpu `CAMetalLayer` in front of it
+/// (see `raise_metal_layer`), because the effect view and the Metal layer are
+/// siblings whose z-order is otherwise ambiguous.
+#[cfg(target_os = "macos")]
+fn apply_window_blur(window: &Window, enabled: bool) {
+    use window_vibrancy::{
+        apply_vibrancy, clear_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+    };
+    let _ = clear_vibrancy(window);
+    if enabled {
+        let _ = apply_vibrancy(
+            window,
+            NSVisualEffectMaterial::UnderWindowBackground,
+            Some(NSVisualEffectState::Active),
+            None,
+        );
+        raise_metal_layer(window);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_window_blur(_window: &Window, _enabled: bool) {}
+
+/// Force the wgpu `CAMetalLayer` to render in front of the blur effect view by
+/// giving it a higher `zPosition`. The blur view's backing layer stays at the
+/// default `zPosition` of 0, so the editor content composites on top of it
+/// while still letting the translucent background reveal the blur behind.
+#[cfg(target_os = "macos")]
+fn raise_metal_layer(window: &Window) {
+    use objc2::runtime::NSObjectProtocol;
+    use objc2::ClassType;
+    use objc2_app_kit::NSView;
+    use objc2_quartz_core::CAMetalLayer;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return };
+    // SAFETY: winit hands us a valid `NSView` pointer for the window's content
+    // view, and we only touch it on the main (event-loop) thread.
+    unsafe {
+        let view: &NSView = h.ns_view.cast().as_ref();
+        let Some(layer) = view.layer() else { return };
+        let Some(sublayers) = layer.sublayers() else { return };
+        for sub in sublayers.iter() {
+            if sub.isKindOfClass(CAMetalLayer::class()) {
+                sub.setZPosition(1.0);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raise_metal_layer(_window: &Window) {}
+
 #[derive(Debug)]
 enum UserEvent {
     Redraw(Vec<Value>),
@@ -48,6 +106,7 @@ struct State {
     wheel_scroll_accum: f32,
     grid_cols: u32,
     grid_rows: u32,
+    blur_on: bool,
 }
 
 struct App {
@@ -80,16 +139,25 @@ impl App {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
-        let attrs = Window::default_attributes().with_title("nvim-ui");
+        let attrs = Window::default_attributes()
+            .with_title("nvim-ui")
+            .with_transparent(true);
         let window = Arc::new(event_loop.create_window(attrs)?);
         window.set_ime_allowed(true);
+        apply_window_blur(&window, self.settings.window_blur);
 
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             window.clone(),
             self.settings.font_family.as_deref(),
             self.settings.font_size,
             self.settings.line_height,
         )?;
+        renderer.set_opacity(self.settings.window_opacity);
+        // The Metal layer only exists after the renderer is created, so put it
+        // in front of the (already-applied) blur backdrop now.
+        if self.settings.window_blur {
+            raise_metal_layer(&window);
+        }
 
         let (cw, ch) = renderer.cell_size();
         let (lw, lh) = renderer.logical_size();
@@ -134,6 +202,7 @@ impl App {
             wheel_scroll_accum: 0.0,
             grid_cols: cols,
             grid_rows: rows,
+            blur_on: self.settings.window_blur,
         })
     }
 
@@ -148,6 +217,13 @@ impl App {
             tracing::warn!("font preview failed: {e:#}");
         }
         state.anim.cfg = d.animation_config();
+        state.renderer.set_opacity(d.window_opacity);
+        // Only (re)apply the native blur when it actually toggles, so dragging
+        // the opacity slider doesn't restack the effect view every frame.
+        if d.window_blur != state.blur_on {
+            apply_window_blur(&state.window, d.window_blur);
+            state.blur_on = d.window_blur;
+        }
         state.recompute_grid();
     }
 

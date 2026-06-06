@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 824.0;
+const PANEL_H: f32 = 932.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -51,6 +51,8 @@ enum Hit {
     FloatFadeToggle,
     FloatFadeSpeedSlider,
     PowerToggle,
+    OpacitySlider,
+    BlurToggle,
     Cancel,
     Apply,
 }
@@ -65,6 +67,7 @@ enum Drag {
     ScrollLength,
     ScrollFar,
     FloatFadeSpeed,
+    Opacity,
 }
 
 pub struct SettingsUi {
@@ -83,6 +86,10 @@ pub struct SettingsUi {
 struct Layout {
     ox: f32,
     oy: f32,
+    appearance_section_y: f32,
+    opacity_label_y: f32,
+    opacity_slider: [f32; 4],
+    blur_toggle: [f32; 4],
     font_section_y: f32,
     family_label_y: f32,
     list: [f32; 4],
@@ -254,6 +261,15 @@ impl SettingsUi {
                 self.draft.power_mode = !self.draft.power_mode;
                 SettingsAction::Preview
             }
+            Some(Hit::OpacitySlider) => {
+                self.drag = Some(Drag::Opacity);
+                self.set_slider(Drag::Opacity, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::BlurToggle) => {
+                self.draft.window_blur = !self.draft.window_blur;
+                SettingsAction::Preview
+            }
             None if !point_in_panel(x, y, &layout) => SettingsAction::CloseCancel,
             _ => SettingsAction::None,
         }
@@ -316,6 +332,33 @@ impl SettingsUi {
         let close_hover = self.hover == Some(Hit::Close);
         p.rect(close, if close_hover { BTN_HOVER } else { BTN });
         p.text_centered(close, "×", TEXT);
+
+        p.section_label(PAD + layout.ox, layout.appearance_section_y, "Appearance");
+        p.label(
+            PAD + layout.ox,
+            layout.opacity_label_y,
+            &format!(
+                "Window opacity: {:.0}%",
+                self.draft.window_opacity * 100.0
+            ),
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.opacity_slider,
+            0.0,
+            1.0,
+            self.draft.window_opacity,
+            self.hover == Some(Hit::OpacitySlider) || self.drag == Some(Drag::Opacity),
+        );
+        self.draw_toggle(
+            &mut p,
+            layout.blur_toggle,
+            "Window blur (macOS)",
+            self.draft.window_blur,
+            self.hover == Some(Hit::BlurToggle),
+            true,
+        );
 
         p.section_label(PAD + layout.ox, layout.font_section_y, "Font");
         p.label(PAD + layout.ox, layout.family_label_y, "Family", TEXT_DIM);
@@ -692,6 +735,12 @@ impl SettingsUi {
         if in_rect(x, y, layout.power_toggle) && self.draft.animations_enabled {
             return Some(Hit::PowerToggle);
         }
+        if in_rect(x, y, layout.opacity_slider) {
+            return Some(Hit::OpacitySlider);
+        }
+        if in_rect(x, y, layout.blur_toggle) {
+            return Some(Hit::BlurToggle);
+        }
 
         let list = layout.list;
         if in_rect(x, y, list) {
@@ -723,6 +772,7 @@ impl SettingsUi {
             Drag::ScrollLength => (layout.scroll_length_slider, 0.0, 0.5, false),
             Drag::ScrollFar => (layout.scroll_far_slider, 0.0, 10.0, true),
             Drag::FloatFadeSpeed => (layout.float_fade_speed_slider, 6.0, 48.0, true),
+            Drag::Opacity => (layout.opacity_slider, 0.0, 1.0, false),
         };
         let t = ((x - track[0]) / track[2]).clamp(0.0, 1.0);
         let v = min + t * (max - min);
@@ -747,6 +797,9 @@ impl SettingsUi {
             Drag::FloatFadeSpeed => {
                 self.draft.float_fade_speed = v.round().clamp(6.0, 48.0);
             }
+            Drag::Opacity => {
+                self.draft.window_opacity = (v * 100.0).round() / 100.0;
+            }
         }
     }
 }
@@ -769,6 +822,14 @@ fn layout(lw: f32, lh: f32) -> Layout {
     let content_w = PANEL_W - PAD * 2.0;
 
     let mut y = oy + 48.0;
+    let appearance_section_y = y;
+    y += 22.0;
+    let opacity_label_y = y;
+    y += 18.0;
+    let opacity_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
+    let blur_toggle = [ox + PAD, y, content_w, ROW];
+    y += ROW + 8.0;
     let font_section_y = y;
     y += 22.0;
     let family_label_y = y;
@@ -825,6 +886,10 @@ fn layout(lw: f32, lh: f32) -> Layout {
     Layout {
         ox,
         oy,
+        appearance_section_y,
+        opacity_label_y,
+        opacity_slider,
+        blur_toggle,
         font_section_y,
         family_label_y,
         list,

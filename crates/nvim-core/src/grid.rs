@@ -134,6 +134,9 @@ pub struct DefaultColors {
     pub fg: u32,
     pub bg: u32,
     pub sp: u32,
+    /// True when the colorscheme leaves the default background unset
+    /// (`:hi Normal guibg=NONE`); the editor background should be transparent.
+    pub bg_none: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -325,8 +328,11 @@ impl GridStateStore {
                     *self.grid_scroll_pending.entry(grid).or_insert(0) += rows;
                 }
             }
-            UiEvent::DefaultColorsSet { fg, bg, sp } => {
-                self.default_colors = DefaultColors { fg, bg, sp };
+            UiEvent::DefaultColorsSet { fg, bg, sp, bg_none } => {
+                // When the background is unset, keep a black value for color math
+                // (reverse video, cursor glyph fallback) but flag it transparent.
+                let bg = if bg_none { 0x000000 } else { bg };
+                self.default_colors = DefaultColors { fg, bg, sp, bg_none };
             }
             UiEvent::HlAttrDefine { id, attr } => {
                 self.highlights.insert(id, attr);
