@@ -79,8 +79,11 @@ If your Neovim config sets `g:neovide_scroll_animation_length` or `g:neovide_scr
 # Run tests (spawns real nvim processes for integration tests)
 cargo test
 
-# Verbose logging
+# Verbose logging (`cargo run` stays attached to the terminal)
 RUST_LOG=nvim_ui=debug cargo run -p app
+
+# Release binary detaches from the shell by default; keep the terminal for logs:
+RUST_LOG=nvim_ui=debug ./target/release/nvim-ui --foreground
 ```
 
 ## Credits

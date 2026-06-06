@@ -8,6 +8,8 @@ mod imgui_theme;
 mod menu_bar;
 mod settings;
 
+use std::io::IsTerminal;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -785,7 +787,40 @@ fn read_clipboard_text() -> Option<String> {
     clipboard.get_text().ok().filter(|text| !text.is_empty())
 }
 
+/// When launched from a shell, re-exec in the background so the terminal prompt returns.
+const DETACHED_ENV: &str = "NVIM_UI_DETACHED";
+
+fn try_detach_from_terminal() -> Result<bool> {
+    if std::env::var_os(DETACHED_ENV).is_some() {
+        return Ok(false);
+    }
+    // Keep `cargo run` attached so logs and errors stay on the terminal.
+    if std::env::var_os("CARGO").is_some() {
+        return Ok(false);
+    }
+    if !std::io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--foreground" || a == "-f") {
+        return Ok(false);
+    }
+
+    Command::new(std::env::current_exe()?)
+        .args(args)
+        .env(DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(true)
+}
+
 fn main() -> Result<()> {
+    if try_detach_from_terminal()? {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
