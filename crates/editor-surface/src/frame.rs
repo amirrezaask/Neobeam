@@ -11,6 +11,9 @@ use crate::atlas::GlyphAtlas;
 use crate::box_glyphs;
 use crate::color::{resolve_cell, rgb_to_rgba, Rgba};
 
+/// Vertical slide distance (px) for float fade-in/out.
+const FLOAT_SLIDE_PX: f32 = 8.0;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct RectInstance {
@@ -89,6 +92,7 @@ pub fn sync_float_cache(store: &GridStateStore, cache: &mut FloatCache) {
 struct DrawOpts {
     clip: bool,
     scroll: bool,
+    slide_y: f32,
 }
 
 pub struct FrameBuilder;
@@ -139,6 +143,11 @@ impl FrameBuilder {
             if is_float && opacity <= 0.01 {
                 continue;
             }
+            let slide_y = if is_float && anim.cfg.enable_float_animation {
+                (1.0 - opacity) * FLOAT_SLIDE_PX
+            } else {
+                0.0
+            };
             draw_grid(
                 &mut lists,
                 store,
@@ -149,6 +158,7 @@ impl FrameBuilder {
                 DrawOpts {
                     clip: !is_float,
                     scroll: !is_float,
+                    slide_y,
                 },
                 anim,
                 atlas,
@@ -169,6 +179,11 @@ impl FrameBuilder {
             if opacity <= 0.01 {
                 continue;
             }
+            let slide_y = if anim.cfg.enable_float_animation {
+                (1.0 - opacity) * FLOAT_SLIDE_PX
+            } else {
+                0.0
+            };
             draw_grid(
                 &mut lists,
                 store,
@@ -179,6 +194,7 @@ impl FrameBuilder {
                 DrawOpts {
                     clip: false,
                     scroll: false,
+                    slide_y,
                 },
                 anim,
                 atlas,
@@ -255,7 +271,7 @@ fn draw_grid(
     };
 
     let grid_x = win_col * cell_w;
-    let grid_y = win_row * cell_h;
+    let grid_y = win_row * cell_h + opts.slide_y;
     let grid_w = grid.width as f32 * cell_w;
     let grid_h = grid.height as f32 * cell_h;
 

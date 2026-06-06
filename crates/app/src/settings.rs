@@ -24,6 +24,7 @@ pub struct Settings {
     pub enable_cursor_glow: bool,
     pub enable_flashes: bool,
     pub enable_float_animation: bool,
+    pub float_fade_speed: f32,
     pub vfx_modes: String,
 }
 
@@ -46,6 +47,7 @@ impl Default for Settings {
             enable_cursor_glow: true,
             enable_flashes: true,
             enable_float_animation: true,
+            float_fade_speed: 24.0,
             vfx_modes: String::new(),
         }
     }
@@ -65,6 +67,7 @@ impl Settings {
         cfg.enable_cursor_glow = self.enable_cursor_glow;
         cfg.enable_flashes = self.enable_flashes;
         cfg.enable_float_animation = self.enable_float_animation;
+        cfg.float_fade_speed = self.float_fade_speed;
         cfg.vfx_modes = parse_vfx_modes(&self.vfx_modes);
         cfg.enable_power_mode = self.power_mode;
 

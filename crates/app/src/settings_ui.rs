@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 680.0;
+const PANEL_H: f32 = 740.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -46,6 +46,8 @@ enum Hit {
     AnimLengthSlider,
     ScrollLengthSlider,
     ScrollFarSlider,
+    FloatFadeToggle,
+    FloatFadeSpeedSlider,
     PowerToggle,
     Cancel,
     Apply,
@@ -58,6 +60,7 @@ enum Drag {
     AnimLength,
     ScrollLength,
     ScrollFar,
+    FloatFadeSpeed,
 }
 
 pub struct SettingsUi {
@@ -94,6 +97,9 @@ struct Layout {
     scroll_length_slider: [f32; 4],
     scroll_far_label_y: f32,
     scroll_far_slider: [f32; 4],
+    float_fade_toggle: [f32; 4],
+    float_fade_speed_label_y: f32,
+    float_fade_speed_slider: [f32; 4],
     power_toggle: [f32; 4],
     cancel_btn: [f32; 4],
     apply_btn: [f32; 4],
@@ -213,6 +219,17 @@ impl SettingsUi {
             Some(Hit::ScrollFarSlider) if self.draft.animations_enabled => {
                 self.drag = Some(Drag::ScrollFar);
                 self.set_slider(Drag::ScrollFar, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::FloatFadeToggle) if self.draft.animations_enabled => {
+                self.draft.enable_float_animation = !self.draft.enable_float_animation;
+                SettingsAction::Preview
+            }
+            Some(Hit::FloatFadeSpeedSlider)
+                if self.draft.animations_enabled && self.draft.enable_float_animation =>
+            {
+                self.drag = Some(Drag::FloatFadeSpeed);
+                self.set_slider(Drag::FloatFadeSpeed, x, &layout);
                 SettingsAction::Preview
             }
             Some(Hit::PowerToggle) if self.draft.animations_enabled => {
@@ -409,6 +426,30 @@ impl SettingsUi {
             self.draft.scroll_animation_far_lines as f32,
             self.hover == Some(Hit::ScrollFarSlider) || self.drag == Some(Drag::ScrollFar),
         );
+        self.draw_toggle(
+            &mut p,
+            layout.float_fade_toggle,
+            "Float fade + slide",
+            self.draft.enable_float_animation,
+            self.hover == Some(Hit::FloatFadeToggle),
+            self.draft.animations_enabled,
+        );
+        p.label(
+            PAD + layout.ox,
+            layout.float_fade_speed_label_y,
+            &format!("Float fade speed: {:.0}", self.draft.float_fade_speed),
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.float_fade_speed_slider,
+            6.0,
+            48.0,
+            self.draft.float_fade_speed,
+            (self.hover == Some(Hit::FloatFadeSpeedSlider)
+                || self.drag == Some(Drag::FloatFadeSpeed))
+                && self.draft.enable_float_animation,
+        );
 
         let cancel_hover = self.hover == Some(Hit::Cancel);
         p.rect(
@@ -570,6 +611,15 @@ impl SettingsUi {
         if in_rect(x, y, layout.scroll_far_slider) && self.draft.animations_enabled {
             return Some(Hit::ScrollFarSlider);
         }
+        if in_rect(x, y, layout.float_fade_toggle) && self.draft.animations_enabled {
+            return Some(Hit::FloatFadeToggle);
+        }
+        if in_rect(x, y, layout.float_fade_speed_slider)
+            && self.draft.animations_enabled
+            && self.draft.enable_float_animation
+        {
+            return Some(Hit::FloatFadeSpeedSlider);
+        }
         if in_rect(x, y, layout.power_toggle) && self.draft.animations_enabled {
             return Some(Hit::PowerToggle);
         }
@@ -601,6 +651,7 @@ impl SettingsUi {
             Drag::AnimLength => (layout.anim_length_slider, 0.04, 0.35, false),
             Drag::ScrollLength => (layout.scroll_length_slider, 0.0, 0.5, false),
             Drag::ScrollFar => (layout.scroll_far_slider, 0.0, 10.0, true),
+            Drag::FloatFadeSpeed => (layout.float_fade_speed_slider, 6.0, 48.0, true),
         };
         let t = ((x - track[0]) / track[2]).clamp(0.0, 1.0);
         let v = min + t * (max - min);
@@ -615,6 +666,9 @@ impl SettingsUi {
             }
             Drag::ScrollFar => {
                 self.draft.scroll_animation_far_lines = v.round().clamp(0.0, 10.0) as u32;
+            }
+            Drag::FloatFadeSpeed => {
+                self.draft.float_fade_speed = v.round().clamp(6.0, 48.0);
             }
         }
     }
@@ -675,6 +729,12 @@ fn layout(lw: f32, lh: f32) -> Layout {
     let scroll_far_label_y = y;
     y += 18.0;
     let scroll_far_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
+    let float_fade_toggle = [ox + PAD, y, content_w, ROW];
+    y += ROW + 4.0;
+    let float_fade_speed_label_y = y;
+    y += 18.0;
+    let float_fade_speed_slider = [ox + PAD, y, content_w, SLIDER_H];
     let footer_y = oy + PANEL_H - PAD - 34.0;
 
     Layout {
@@ -698,6 +758,9 @@ fn layout(lw: f32, lh: f32) -> Layout {
         scroll_length_slider,
         scroll_far_label_y,
         scroll_far_slider,
+        float_fade_toggle,
+        float_fade_speed_label_y,
+        float_fade_speed_slider,
         power_toggle,
         cancel_btn: [ox + PAD, footer_y, 100.0, 34.0],
         apply_btn: [ox + PANEL_W - PAD - 100.0, footer_y, 100.0, 34.0],

@@ -276,6 +276,26 @@ impl GridStateStore {
                     },
                 );
             }
+            UiEvent::MsgSetPos { grid, row } => {
+                let (width, height) = self
+                    .grids
+                    .get(&grid)
+                    .map(|g| (g.width, g.height))
+                    .unwrap_or((0, 0));
+                let prev = self.windows.get(&grid).copied();
+                self.windows.insert(
+                    grid,
+                    WindowMeta {
+                        grid_id: grid,
+                        row,
+                        col: prev.map(|w| w.col).unwrap_or(0),
+                        width: prev.map(|w| w.width).unwrap_or(width),
+                        height: prev.map(|w| w.height).unwrap_or(height),
+                        is_float: false,
+                        z_index: prev.map(|w| w.z_index).unwrap_or(0),
+                    },
+                );
+            }
             UiEvent::GridLine { grid, row, col_start, cells } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     let mut col = col_start;
@@ -327,11 +347,10 @@ impl GridStateStore {
                 line_count: _,
                 scroll_delta,
             } => {
-                // nvim reports viewports against the window's own grid handle.
-                // With `ext_multigrid` disabled, window content is rendered on
-                // the global grid (id 1), so a viewport for a grid that has no
-                // backing content grid drives grid 1's scroll animation instead.
-                // (Neovide always runs multigrid and never hits this remap.)
+                // `win_viewport` targets the window's content grid. With
+                // `ext_multigrid` enabled each window owns its grid, so `grid`
+                // usually resolves directly. The fallback to grid 1 covers any
+                // legacy/non-multigrid viewport handles without content.
                 let target = if self.grids.contains_key(&grid) { grid } else { 1 };
                 // Viewport is the authoritative scroll signal; once we have one
                 // for the target grid, suppress the grid_scroll fallback so the

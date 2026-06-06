@@ -123,7 +123,7 @@ impl NvimSession {
                 let mut opts = UiAttachOptions::new();
                 opts.set_rgb(true)
                     .set_linegrid_external(true)
-                    .set_multigrid_external(false)
+                    .set_multigrid_external(true)
                     .set_cmdline_external(cmdline)
                     .set_popupmenu_external(popup)
                     .set_messages_externa(msgs);

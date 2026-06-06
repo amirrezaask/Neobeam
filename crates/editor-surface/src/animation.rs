@@ -81,7 +81,7 @@ impl Default for AnimationConfig {
             position_animation_length: 0.15,
             scroll_animation_length: 0.3,
             scroll_animation_far_lines: 1,
-            float_fade_speed: 18.0,
+            float_fade_speed: 24.0,
             flash_duration: 0.35,
             cursor_glow_layers: 20,
             cursor_glow_radius: 20.0,
@@ -353,6 +353,11 @@ impl AnimationState {
             let mut inherit_from = None;
             for (&other_id, state) in &self.float_states {
                 if active.contains_key(&other_id) {
+                    continue;
+                }
+                // Only hand off opacity from floats that are fading out; never
+                // inherit from a fully visible float (would skip fade-in).
+                if state.target != 0.0 || state.opacity >= 0.99 {
                     continue;
                 }
                 if (state.row - row).abs() <= FLOAT_REUSE_ROW_TOLERANCE

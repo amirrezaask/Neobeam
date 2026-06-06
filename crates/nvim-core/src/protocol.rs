@@ -105,6 +105,7 @@ pub enum UiEvent {
     WinFloatPos { grid: i64, anchor: Anchor, anchor_grid: i64, anchor_row: f64, anchor_col: f64, z_index: i64, focusable: bool },
     WinClose { grid: i64 },
     WinHide { grid: i64 },
+    MsgSetPos { grid: i64, row: i32 },
     Flush,
 }
 
@@ -220,6 +221,10 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
         }),
         "win_close" if !p.is_empty() => out.push(UiEvent::WinClose { grid: as_i64(&p[0]) }),
         "win_hide" if !p.is_empty() => out.push(UiEvent::WinHide { grid: as_i64(&p[0]) }),
+        "msg_set_pos" if p.len() >= 2 => out.push(UiEvent::MsgSetPos {
+            grid: as_i64(&p[0]),
+            row: as_i64(&p[1]) as i32,
+        }),
         "flush" => out.push(UiEvent::Flush),
         _ => {}
     }
