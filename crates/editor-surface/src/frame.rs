@@ -104,14 +104,13 @@ impl FrameBuilder {
         atlas: &mut GlyphAtlas,
         queue: &wgpu::Queue,
         float_cache: &FloatCache,
-        bg_opacity: f32,
     ) -> DrawLists {
-        // `guibg=NONE` forces a fully transparent editor background regardless of
-        // the opacity setting; otherwise the slider scales the default bg alpha.
+        // `guibg=NONE` keeps the editor background transparent so the colorscheme
+        // can show the desktop through; otherwise the background is fully opaque.
         let default_bg_alpha = if store.default_colors.bg_none {
             0.0
         } else {
-            bg_opacity.clamp(0.0, 1.0)
+            1.0
         };
         let mut lists = DrawLists {
             clear: rgb_to_rgba(store.default_colors.bg),

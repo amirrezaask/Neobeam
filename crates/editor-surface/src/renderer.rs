@@ -58,7 +58,6 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scale: f32,
-    opacity: f32,
 
     globals_buf: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -338,7 +337,6 @@ impl Renderer {
             queue,
             config,
             scale,
-            opacity: 1.0,
             globals_buf,
             globals_bind_group,
             rect_pipeline,
@@ -356,10 +354,6 @@ impl Renderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
-    }
-
-    pub fn set_opacity(&mut self, opacity: f32) {
-        self.opacity = opacity.clamp(0.0, 1.0);
     }
 
     /// Logical cell metrics for grid sizing / hit testing.
@@ -446,7 +440,6 @@ impl Renderer {
             &mut self.atlas,
             &self.queue,
             &self.float_cache,
-            self.opacity,
         );
         for id in anim.fading_out_float_ids() {
             if anim.float_opacity(id) <= 0.01 {

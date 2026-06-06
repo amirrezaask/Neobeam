@@ -30,24 +30,10 @@ pub struct Settings {
     /// Fraction of one editor line per wheel unit (1.0 = one line per notch).
     #[serde(default = "default_mouse_scroll_sensitivity")]
     pub mouse_scroll_sensitivity: f32,
-    /// Default editor background opacity (1.0 = opaque, lower = more see-through).
-    #[serde(default = "default_window_opacity")]
-    pub window_opacity: f32,
-    /// macOS: native blur/vibrancy behind the transparent window.
-    #[serde(default = "default_window_blur")]
-    pub window_blur: bool,
 }
 
 fn default_mouse_scroll_sensitivity() -> f32 {
     0.35
-}
-
-fn default_window_opacity() -> f32 {
-    1.0
-}
-
-fn default_window_blur() -> bool {
-    true
 }
 
 impl Default for Settings {
@@ -72,8 +58,6 @@ impl Default for Settings {
             float_fade_speed: 24.0,
             vfx_modes: String::new(),
             mouse_scroll_sensitivity: 0.35,
-            window_opacity: 1.0,
-            window_blur: true,
         }
     }
 }

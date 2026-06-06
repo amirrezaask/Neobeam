@@ -100,20 +100,6 @@ impl SettingsUi {
     fn draw_settings_page(&mut self, ui: &Ui, action: &mut SettingsAction) -> bool {
         let mut changed = false;
 
-        if ui.collapsing_header("Appearance", TreeNodeFlags::DEFAULT_OPEN) {
-            if ui
-                .slider_config("Window opacity", 0.3, 1.0)
-                .display_format("%.2f")
-                .build(&mut self.draft.window_opacity)
-            {
-                self.draft.window_opacity = (self.draft.window_opacity * 100.0).round() / 100.0;
-                changed = true;
-            }
-            if ui.checkbox("Window blur (macOS)", &mut self.draft.window_blur) {
-                changed = true;
-            }
-        }
-
         if ui.collapsing_header("Font", TreeNodeFlags::DEFAULT_OPEN) {
             changed |= self.draw_font_family_combo(ui);
 

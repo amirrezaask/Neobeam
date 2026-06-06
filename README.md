@@ -21,7 +21,6 @@ A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the edit
 - **Smooth animations** — interpolated cursor, scroll springs, highlight flashes, float fade/slide
 - **Cursor effects** — glow, trails, squash/stretch, and optional power-mode particles
 - **Neovide-compatible VFX** — `sonicboom`, `railgun`, `torpedo`, `pixiedust` cursor modes
-- **Transparent window** — adjustable opacity with native macOS blur/vibrancy behind the editor
 - **Live settings** — in-app panel with hot-reload from disk
 
 ## Requirements
@@ -30,7 +29,7 @@ A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the edit
 - [Neovim](https://neovim.io/) on your `PATH` (used via `--embed`)
 - A monospace font; Nerd Font glyphs are supported for icons
 
-macOS is the primary target today. Window blur is macOS-only; the editor runs on other platforms without it.
+macOS is the primary target today, but the editor runs on other platforms too.
 
 ## Build & run
 
@@ -61,8 +60,6 @@ Open the in-app settings panel with **⌘,** (Cmd+Comma). Press **Esc** to cance
 | `cursor_glow` | Bloom around the cursor (0 = off) |
 | `scroll_animation_length` | Smooth-scroll duration in seconds |
 | `vfx_modes` | Comma-separated cursor VFX, e.g. `railgun,sonicboom` |
-| `window_opacity` | Editor background opacity (0.3–1.0) |
-| `window_blur` | macOS vibrancy behind the window |
 
 If your Neovim config sets `g:neovide_scroll_animation_length` or `g:neovide_scroll_animation_far_lines`, those values are picked up on startup when the corresponding keys are absent from `settings.json`.
 
