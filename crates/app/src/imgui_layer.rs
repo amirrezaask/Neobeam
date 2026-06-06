@@ -11,6 +11,11 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::event::{Event, WindowEvent};
 use winit::window::{Window, WindowId};
 
+static JETBRAINS_MONO: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMono-VariableFont_wght.ttf");
+
+const SETTINGS_UI_FONT_SIZE: f32 = 15.0;
+
 pub struct ImguiLayer {
     ctx: Context,
     platform: WinitPlatform,
@@ -27,9 +32,13 @@ impl ImguiLayer {
         let hidpi = window.scale_factor();
         ctx.io_mut().font_global_scale = (1.0 / hidpi) as f32;
 
-        ctx.fonts().add_font(&[FontSource::DefaultFontData {
+        ctx.fonts().add_font(&[FontSource::TtfData {
+            data: JETBRAINS_MONO,
+            size_pixels: SETTINGS_UI_FONT_SIZE * hidpi as f32,
             config: Some(FontConfig {
-                size_pixels: (16.0 * hidpi) as f32,
+                oversample_h: 2,
+                oversample_v: 1,
+                pixel_snap_h: true,
                 ..Default::default()
             }),
         }]);
