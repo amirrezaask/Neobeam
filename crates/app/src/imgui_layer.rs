@@ -101,6 +101,10 @@ impl ImguiLayer {
         self.ctx.io().want_capture_keyboard
     }
 
+    pub fn mouse_pos(&self) -> [f32; 2] {
+        self.ctx.io().mouse_pos
+    }
+
     /// Rebuild the font atlas when the editor font size or HiDPI scale changes.
     pub fn sync_font_size(
         &mut self,

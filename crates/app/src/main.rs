@@ -2,6 +2,7 @@
 //! state and animation engine, and wires input/resize/redraw together
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
+mod context_menu;
 mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
@@ -21,6 +22,7 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
+use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
 use settings::{spawn_watcher, Settings};
@@ -55,6 +57,7 @@ struct State {
     wheel_scroll_accum: f32,
     grid_cols: u32,
     grid_rows: u32,
+    context_menu: ContextMenu,
 }
 
 struct App {
@@ -79,6 +82,10 @@ fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
 
 fn imgui_captures_input(state: &State, settings: &Settings) -> bool {
     imgui_active(state) || cursor_in_menu_bar(state, settings)
+}
+
+fn mouse_to_nvim_blocked(state: &State, settings: &Settings) -> bool {
+    state.context_menu.open || imgui_captures_input(state, settings)
 }
 
 impl App {
@@ -164,6 +171,7 @@ impl App {
             wheel_scroll_accum: 0.0,
             grid_cols: cols,
             grid_rows: rows,
+            context_menu: ContextMenu::new(),
         })
     }
 
@@ -262,6 +270,16 @@ impl App {
         }
     }
 
+    fn handle_context_menu_action(&mut self, action: ContextMenuAction) {
+        let ContextMenuAction::Dispatch { grid_pos, command } = action else {
+            return;
+        };
+        let Some(state) = self.state.as_mut() else { return };
+        dispatch_context_command(&state.session, grid_pos, command);
+        state.anim.notify_keystroke();
+        state.window.request_redraw();
+    }
+
     fn handle_settings_action(&mut self, action: SettingsAction) {
         match action {
             SettingsAction::None => {}
@@ -303,6 +321,19 @@ impl State {
         (row.max(0).min(max_row), col.max(0))
     }
 
+    fn hit_test_editor(&self, settings: &Settings) -> Option<(i64, i64)> {
+        let scale = self.renderer.scale() as f64;
+        let (lw, lh) = self.renderer.logical_size();
+        let layout = ChromeLayout::compute(lw, lh, &settings.chrome_layout_config());
+        let y = self.cursor_pos.1 / scale;
+        let editor_top = layout.editor_y as f64;
+        let editor_bottom = (layout.editor_y + layout.editor_h) as f64;
+        if y < editor_top || y >= editor_bottom {
+            return None;
+        }
+        Some(self.hit_test(settings))
+    }
+
     fn recompute_grid(&mut self, settings: &Settings) {
         let (cw, ch) = self.renderer.cell_size();
         let (lw, lh) = self.renderer.logical_size();
@@ -321,7 +352,7 @@ impl State {
         settings: &Settings,
         menu_bar: &mut MenuBar,
         settings_ui: &mut SettingsUi,
-    ) -> (bool, SettingsAction, MenuBarAction) {
+    ) -> (bool, SettingsAction, MenuBarAction, ContextMenuAction) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -348,11 +379,13 @@ impl State {
 
         let mut imgui_action = SettingsAction::None;
         let mut menu_action = MenuBarAction::None;
+        let mut context_action = ContextMenuAction::None;
         let window = self.window.clone();
         let session = &self.session;
         let store = &self.store;
         let device = self.renderer.device();
         let queue = self.renderer.queue();
+        let context_menu = &mut self.context_menu;
         if let Err(e) = self.imgui.prepare_ui(
             &window,
             store,
@@ -364,6 +397,7 @@ impl State {
                 if settings_ui.open {
                     imgui_action = settings_ui.draw(ui);
                 }
+                context_action = context_menu.draw(ui);
             },
         ) {
             tracing::warn!("imgui frame failed: {e:#}");
@@ -391,10 +425,42 @@ impl State {
         let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
             || self.anim.render_deadline().is_some();
-        if settings_ui.open || needs_anim || imgui_active(self) {
+        if settings_ui.open || self.context_menu.open || needs_anim || imgui_active(self) {
             self.window.request_redraw();
         }
-        (needs_anim, imgui_action, menu_action)
+        (needs_anim, imgui_action, menu_action, context_action)
+    }
+}
+
+fn dispatch_context_command(
+    session: &NvimSession,
+    grid_pos: (i64, i64),
+    command: ContextMenuCommand,
+) {
+    let (row, col) = grid_pos;
+    session.mouse(
+        CoreButton::Left,
+        MouseAction::Press,
+        String::new(),
+        0,
+        row,
+        col,
+    );
+    session.mouse(
+        CoreButton::Left,
+        MouseAction::Release,
+        String::new(),
+        0,
+        row,
+        col,
+    );
+    match command {
+        ContextMenuCommand::Input(keys) => session.input(keys),
+        ContextMenuCommand::Paste => {
+            if let Some(text) = read_clipboard_text() {
+                session.paste(text);
+            }
+        }
     }
 }
 
@@ -493,7 +559,10 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
-            if self.settings_ui.open || imgui_captures_input(state, &self.settings) {
+            let redraw = self.settings_ui.open
+                || state.context_menu.open
+                || imgui_captures_input(state, &self.settings);
+            if redraw {
                 state.window.request_redraw();
             }
         }
@@ -616,7 +685,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if cursor_in_menu_bar(state, &self.settings) {
                     state.window.request_redraw();
                 }
-                if imgui_captures_input(state, &self.settings) {
+                if mouse_to_nvim_blocked(state, &self.settings) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -630,7 +699,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| imgui_captures_input(s, &self.settings))
+                    .is_some_and(|s| mouse_to_nvim_blocked(s, &self.settings))
                 {
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
@@ -638,6 +707,18 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else { return };
+
+                if button == MouseButton::Right && btn_state == ElementState::Pressed {
+                    if !self.settings_ui.open {
+                        if let Some(grid_pos) = state.hit_test_editor(&self.settings) {
+                            let screen_pos = state.imgui.mouse_pos();
+                            state.context_menu.open_at(screen_pos, grid_pos);
+                            state.window.request_redraw();
+                            return;
+                        }
+                    }
+                }
+
                 let Some(btn) = map_button(button) else { return };
                 let (row, col) = state.hit_test(&self.settings);
                 match btn_state {
@@ -659,7 +740,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| imgui_captures_input(s, &self.settings))
+                    .is_some_and(|s| mouse_to_nvim_blocked(s, &self.settings))
                 {
                     return;
                 }
@@ -696,12 +777,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (needs_anim, action, menu_action) = {
+                let (needs_anim, action, menu_action, context_action) = {
                     let Some(state) = self.state.as_mut() else { return };
                     state.render(&self.settings, &mut self.menu_bar, &mut self.settings_ui)
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_settings_action(action);
+                self.handle_context_menu_action(context_action);
                 if needs_anim {
                     if let Some(deadline) = self.state.as_ref().and_then(|s| s.anim.render_deadline()) {
                         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
@@ -712,7 +794,7 @@ impl ApplicationHandler<UserEvent> for App {
                     || self
                         .state
                         .as_ref()
-                        .is_some_and(|s| imgui_captures_input(s, &self.settings))
+                        .is_some_and(|s| s.context_menu.open || imgui_captures_input(s, &self.settings))
                 {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
@@ -726,6 +808,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
         if self.settings_ui.open
+            || state.context_menu.open
             || imgui_captures_input(state, &self.settings)
             || state.anim.is_animating()
             || state.anim.is_blinking(&state.store)
