@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 740.0;
+const PANEL_H: f32 = 782.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -44,6 +44,7 @@ enum Hit {
     AnimToggle,
     SmoothBlinkToggle,
     AnimLengthSlider,
+    CursorGlowSlider,
     ScrollLengthSlider,
     ScrollFarSlider,
     FloatFadeToggle,
@@ -58,6 +59,7 @@ enum Drag {
     FontSize,
     LineHeight,
     AnimLength,
+    CursorGlow,
     ScrollLength,
     ScrollFar,
     FloatFadeSpeed,
@@ -93,6 +95,8 @@ struct Layout {
     smooth_blink_toggle: [f32; 4],
     anim_length_label_y: f32,
     anim_length_slider: [f32; 4],
+    cursor_glow_label_y: f32,
+    cursor_glow_slider: [f32; 4],
     scroll_length_label_y: f32,
     scroll_length_slider: [f32; 4],
     scroll_far_label_y: f32,
@@ -209,6 +213,11 @@ impl SettingsUi {
             Some(Hit::AnimLengthSlider) if self.draft.animations_enabled => {
                 self.drag = Some(Drag::AnimLength);
                 self.set_slider(Drag::AnimLength, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::CursorGlowSlider) if self.draft.animations_enabled => {
+                self.drag = Some(Drag::CursorGlow);
+                self.set_slider(Drag::CursorGlow, x, &layout);
                 SettingsAction::Preview
             }
             Some(Hit::ScrollLengthSlider) if self.draft.animations_enabled => {
@@ -375,19 +384,45 @@ impl SettingsUi {
             self.hover == Some(Hit::SmoothBlinkToggle),
             self.draft.animations_enabled,
         );
+        let cursor_len = self.draft.animation_length;
+        let cursor_len_label = if cursor_len <= 0.0 {
+            "Cursor animation length: disabled".to_string()
+        } else {
+            format!("Cursor animation length: {:.2}s", cursor_len)
+        };
         p.label(
             PAD + layout.ox,
             layout.anim_length_label_y,
-            &format!("Cursor animation length: {:.2}s", self.draft.animation_length),
+            &cursor_len_label,
             TEXT_DIM,
         );
         self.draw_slider(
             &mut p,
             layout.anim_length_slider,
-            0.04,
+            0.0,
             0.35,
-            self.draft.animation_length,
+            cursor_len,
             self.hover == Some(Hit::AnimLengthSlider) || self.drag == Some(Drag::AnimLength),
+        );
+        let cursor_glow = self.draft.cursor_glow;
+        let cursor_glow_label = if cursor_glow <= 0.0 {
+            "Cursor glow: disabled".to_string()
+        } else {
+            format!("Cursor glow: {:.0}%", cursor_glow * 100.0)
+        };
+        p.label(
+            PAD + layout.ox,
+            layout.cursor_glow_label_y,
+            &cursor_glow_label,
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.cursor_glow_slider,
+            0.0,
+            2.0,
+            cursor_glow,
+            self.hover == Some(Hit::CursorGlowSlider) || self.drag == Some(Drag::CursorGlow),
         );
         let scroll_len = self.draft.scroll_animation_length;
         let scroll_len_label = if scroll_len <= 0.0 {
@@ -605,6 +640,9 @@ impl SettingsUi {
         if in_rect(x, y, layout.anim_length_slider) && self.draft.animations_enabled {
             return Some(Hit::AnimLengthSlider);
         }
+        if in_rect(x, y, layout.cursor_glow_slider) && self.draft.animations_enabled {
+            return Some(Hit::CursorGlowSlider);
+        }
         if in_rect(x, y, layout.scroll_length_slider) && self.draft.animations_enabled {
             return Some(Hit::ScrollLengthSlider);
         }
@@ -648,7 +686,8 @@ impl SettingsUi {
         let (track, min, max, round) = match drag {
             Drag::FontSize => (layout.size_slider, 10.0_f32, 32.0, true),
             Drag::LineHeight => (layout.lh_slider, 1.0, 2.0, false),
-            Drag::AnimLength => (layout.anim_length_slider, 0.04, 0.35, false),
+            Drag::AnimLength => (layout.anim_length_slider, 0.0, 0.35, false),
+            Drag::CursorGlow => (layout.cursor_glow_slider, 0.0, 2.0, false),
             Drag::ScrollLength => (layout.scroll_length_slider, 0.0, 0.5, false),
             Drag::ScrollFar => (layout.scroll_far_slider, 0.0, 10.0, true),
             Drag::FloatFadeSpeed => (layout.float_fade_speed_slider, 6.0, 48.0, true),
@@ -660,6 +699,9 @@ impl SettingsUi {
             Drag::LineHeight => self.draft.line_height = (v * 100.0).round() / 100.0,
             Drag::AnimLength => {
                 self.draft.animation_length = (v * 100.0).round() / 100.0;
+            }
+            Drag::CursorGlow => {
+                self.draft.cursor_glow = (v * 100.0).round() / 100.0;
             }
             Drag::ScrollLength => {
                 self.draft.scroll_animation_length = (v * 100.0).round() / 100.0;
@@ -722,6 +764,10 @@ fn layout(lw: f32, lh: f32) -> Layout {
     y += 18.0;
     let anim_length_slider = [ox + PAD, y, content_w, SLIDER_H];
     y += 24.0;
+    let cursor_glow_label_y = y;
+    y += 18.0;
+    let cursor_glow_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
     let scroll_length_label_y = y;
     y += 18.0;
     let scroll_length_slider = [ox + PAD, y, content_w, SLIDER_H];
@@ -754,6 +800,8 @@ fn layout(lw: f32, lh: f32) -> Layout {
         smooth_blink_toggle,
         anim_length_label_y,
         anim_length_slider,
+        cursor_glow_label_y,
+        cursor_glow_slider,
         scroll_length_label_y,
         scroll_length_slider,
         scroll_far_label_y,

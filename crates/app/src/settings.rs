@@ -21,7 +21,8 @@ pub struct Settings {
     pub position_animation_length: f32,
     pub scroll_animation_length: f32,
     pub scroll_animation_far_lines: u32,
-    pub enable_cursor_glow: bool,
+    /// 0 = off; 1 = default glow; up to 2 = stronger.
+    pub cursor_glow: f32,
     pub enable_flashes: bool,
     pub enable_float_animation: bool,
     pub float_fade_speed: f32,
@@ -44,7 +45,7 @@ impl Default for Settings {
             position_animation_length: 0.15,
             scroll_animation_length: 0.3,
             scroll_animation_far_lines: 1,
-            enable_cursor_glow: true,
+            cursor_glow: 1.0,
             enable_flashes: true,
             enable_float_animation: true,
             float_fade_speed: 24.0,
@@ -64,7 +65,15 @@ impl Settings {
         cfg.position_animation_length = self.position_animation_length;
         cfg.scroll_animation_length = self.scroll_animation_length;
         cfg.scroll_animation_far_lines = self.scroll_animation_far_lines;
-        cfg.enable_cursor_glow = self.enable_cursor_glow;
+        if self.cursor_glow > 0.0 {
+            let g = self.cursor_glow;
+            cfg.enable_cursor_glow = true;
+            cfg.cursor_glow_alpha = 0.20 * g;
+            cfg.cursor_glow_radius = 20.0 * g;
+            cfg.cursor_glow_layers = (20.0 * g).round().max(1.0) as i32;
+        } else {
+            cfg.enable_cursor_glow = false;
+        }
         cfg.enable_flashes = self.enable_flashes;
         cfg.enable_float_animation = self.enable_float_animation;
         cfg.float_fade_speed = self.float_fade_speed;
@@ -79,6 +88,9 @@ impl Settings {
             cfg.enable_float_animation = false;
             cfg.enable_power_mode = false;
             cfg.vfx_modes = Vec::<VfxMode>::new();
+        }
+        if self.animation_length <= 0.0 {
+            cfg.enable_cursor_animation = false;
         }
         if self.scroll_animation_length <= 0.0 {
             cfg.enable_smooth_scroll = false;

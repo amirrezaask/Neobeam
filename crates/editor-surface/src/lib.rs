@@ -7,6 +7,7 @@ pub mod box_glyphs;
 pub mod color;
 pub mod cursor_vfx;
 pub mod fonts;
+pub mod nerd_glyphs;
 pub mod frame;
 pub mod renderer;
 pub mod ring_buffer;

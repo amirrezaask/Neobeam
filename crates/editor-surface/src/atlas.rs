@@ -9,6 +9,11 @@ use anyhow::{anyhow, Result};
 use etagere::{size2, AtlasAllocator};
 use fontdue::{Font, FontSettings};
 
+use crate::nerd_glyphs::is_nerd_glyph;
+
+static SYMBOLS_NERD_FONT: &[u8] =
+    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
 const ATLAS_SIZE: u32 = 2048;
 const PADDING: i32 = 1;
 
@@ -25,6 +30,9 @@ pub struct GlyphInfo {
 
 pub struct GlyphAtlas {
     font: Font,
+    /// Bundled Symbols Nerd Font Mono for icon fallback when the primary font
+    /// lacks Nerd Font glyphs.
+    symbols: Font,
     /// Logical font size in px.
     pub size_px: f32,
     pub scale: f32,
@@ -49,9 +57,11 @@ impl GlyphAtlas {
         scale: f32,
     ) -> Result<Self> {
         let font = load_font(font_family)?;
+        let symbols = load_symbols_font()?;
         let (texture, view, sampler) = create_atlas_texture(device);
         let mut atlas = GlyphAtlas {
             font,
+            symbols,
             size_px,
             scale,
             cell_w: 0.0,
@@ -138,9 +148,20 @@ impl GlyphAtlas {
         info
     }
 
+    fn select_font(&self, ch: char) -> &Font {
+        if font_has_glyph(&self.font, ch) {
+            return &self.font;
+        }
+        if is_nerd_glyph(ch) && font_has_glyph(&self.symbols, ch) {
+            return &self.symbols;
+        }
+        &self.font
+    }
+
     fn rasterize(&mut self, queue: &wgpu::Queue, ch: char) -> Option<GlyphInfo> {
         let px = self.size_px * self.scale;
-        let (metrics, bitmap) = self.font.rasterize(ch, px);
+        let font = self.select_font(ch);
+        let (metrics, bitmap) = font.rasterize(ch, px);
         if metrics.width == 0 || metrics.height == 0 || bitmap.iter().all(|b| *b == 0) {
             return None;
         }
@@ -213,6 +234,20 @@ fn create_atlas_texture(
     (texture, view, sampler)
 }
 
+fn font_has_glyph(font: &Font, ch: char) -> bool {
+    font.lookup_glyph_index(ch) != 0
+}
+
+fn load_symbols_font() -> Result<Font> {
+    Font::from_bytes(
+        SYMBOLS_NERD_FONT,
+        FontSettings {
+            ..FontSettings::default()
+        },
+    )
+    .map_err(|e| anyhow!("failed to parse Symbols Nerd Font Mono: {e:?}"))
+}
+
 fn load_font(family: Option<&str>) -> Result<Font> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
@@ -251,4 +286,52 @@ fn load_font(family: Option<&str>) -> Result<Font> {
         .flatten()
         .ok_or_else(|| anyhow!("failed to parse selected font face"))?;
     Ok(font)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbols_font_loads_and_has_nerd_icons() {
+        let symbols = load_symbols_font().expect("symbols font should parse");
+        assert!(font_has_glyph(&symbols, '\u{E0B0}')); // powerline separator
+        assert!(font_has_glyph(&symbols, '\u{E7A8}')); // devicon
+    }
+
+    #[test]
+    fn symbols_font_rasterizes_powerline_glyph() {
+        let symbols = load_symbols_font().expect("symbols font should parse");
+        let (metrics, bitmap) = symbols.rasterize('\u{E0B0}', 16.0);
+        assert!(metrics.width > 0 && metrics.height > 0);
+        assert!(bitmap.iter().any(|b| *b > 0));
+    }
+
+    #[test]
+    fn primary_font_falls_back_to_symbols_for_missing_nerd_glyph() {
+        let primary = load_font(None).expect("system monospace should exist");
+        let symbols = load_symbols_font().expect("symbols font should parse");
+        let ch = '\u{E0B0}';
+
+        if font_has_glyph(&primary, ch) {
+            // Default monospace is already Nerd-patched on this system.
+            return;
+        }
+
+        assert!(font_has_glyph(&symbols, ch));
+        assert!(is_nerd_glyph(ch));
+
+        let font = if font_has_glyph(&primary, ch) {
+            &primary
+        } else if is_nerd_glyph(ch) && font_has_glyph(&symbols, ch) {
+            &symbols
+        } else {
+            &primary
+        };
+        assert!(std::ptr::eq(font, &symbols));
+
+        let (metrics, bitmap) = font.rasterize(ch, 16.0);
+        assert!(metrics.width > 0 && metrics.height > 0);
+        assert!(bitmap.iter().any(|b| *b > 0));
+    }
 }
