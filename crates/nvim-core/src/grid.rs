@@ -1,6 +1,6 @@
 //! Authoritative grid + window + highlight + cursor state, mutated by `UiEvent`s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{Anchor, CursorShape, HlAttr, ModeInfo, UiEvent};
 
@@ -168,6 +168,8 @@ pub struct GridStateStore {
     pub busy: bool,
     pub dirty: bool,
     pub pending_scroll: Vec<(i64, i64)>,
+    grid_scroll_pending: HashMap<i64, i64>,
+    viewport_grids_this_batch: HashSet<i64>,
 }
 
 impl Default for GridStateStore {
@@ -190,6 +192,8 @@ impl GridStateStore {
             busy: false,
             dirty: false,
             pending_scroll: Vec::new(),
+            grid_scroll_pending: HashMap::new(),
+            viewport_grids_this_batch: HashSet::new(),
         }
     }
 
@@ -297,6 +301,9 @@ impl GridStateStore {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.scroll(top, bot, left, right, rows);
                 }
+                if rows != 0 {
+                    *self.grid_scroll_pending.entry(grid).or_insert(0) += rows;
+                }
             }
             UiEvent::DefaultColorsSet { fg, bg, sp } => {
                 self.default_colors = DefaultColors { fg, bg, sp };
@@ -320,6 +327,7 @@ impl GridStateStore {
                 line_count: _,
                 scroll_delta,
             } => {
+                self.viewport_grids_this_batch.insert(grid);
                 let mut delta = scroll_delta;
                 if delta == 0 {
                     if let Some(prev) = self.viewports.get(&grid) {
@@ -391,11 +399,19 @@ impl GridStateStore {
 
     /// Take scroll deltas produced by the last batch (consume once when seeding animation).
     pub fn take_pending_scroll(&mut self) -> Vec<(i64, i64)> {
+        for (grid, rows) in std::mem::take(&mut self.grid_scroll_pending) {
+            if rows != 0 && !self.viewport_grids_this_batch.contains(&grid) {
+                self.pending_scroll.push((grid, rows));
+            }
+        }
+        self.viewport_grids_this_batch.clear();
         std::mem::take(&mut self.pending_scroll)
     }
 
     pub fn apply_batch(&mut self, events: impl IntoIterator<Item = UiEvent>) -> bool {
         self.pending_scroll.clear();
+        self.grid_scroll_pending.clear();
+        self.viewport_grids_this_batch.clear();
         let mut flushed = false;
         for ev in events {
             if matches!(ev, UiEvent::Flush) {

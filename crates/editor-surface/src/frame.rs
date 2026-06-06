@@ -167,7 +167,7 @@ impl FrameBuilder {
             );
         }
 
-        build_cursor_effects(&mut lists, anim, cursor_visible);
+        build_cursor_effects(&mut lists, store, anim, cursor_visible);
         build_particles(&mut lists, anim);
         lists
     }
@@ -297,7 +297,13 @@ fn draw_grid(
     }
 }
 
-fn build_cursor_effects(lists: &mut DrawLists, anim: &AnimationState, cursor_visible: bool) {
+fn build_cursor_effects(
+    lists: &mut DrawLists,
+    store: &GridStateStore,
+    anim: &AnimationState,
+    cursor_visible: bool,
+) {
+    let scroll_off = anim.scroll_offset(store.cursor.grid);
     let fd = anim.cfg.flash_duration;
     for f in &anim.flashes {
         let a = (1.0 - f.age / fd) * 0.35;
@@ -305,7 +311,7 @@ fn build_cursor_effects(lists: &mut DrawLists, anim: &AnimationState, cursor_vis
             continue;
         }
         lists.rects.push(RectInstance {
-            pos: [f.rect.x, f.rect.y],
+            pos: [f.rect.x, f.rect.y + scroll_off],
             size: [f.rect.w, f.rect.h],
             color: with_alpha(anim.fill_color, a),
         });
@@ -317,7 +323,7 @@ fn build_cursor_effects(lists: &mut DrawLists, anim: &AnimationState, cursor_vis
             continue;
         }
         lists.rects.push(RectInstance {
-            pos: [s.rect.x, s.rect.y],
+            pos: [s.rect.x, s.rect.y + scroll_off],
             size: [s.rect.w, s.rect.h],
             color: with_alpha(anim.fill_color, a),
         });
@@ -335,7 +341,7 @@ fn build_cursor_effects(lists: &mut DrawLists, anim: &AnimationState, cursor_vis
             let expand = anim.cfg.cursor_glow_radius * f;
             let a = anim.cfg.cursor_glow_alpha * (1.0 - f);
             lists.rects.push(RectInstance {
-                pos: [cur.x - expand, cur.y - expand],
+                pos: [cur.x - expand, cur.y - expand + scroll_off],
                 size: [cur.w + expand * 2.0, cur.h + expand * 2.0],
                 color: with_alpha(anim.fill_color, a),
             });
@@ -343,7 +349,7 @@ fn build_cursor_effects(lists: &mut DrawLists, anim: &AnimationState, cursor_vis
     }
 
     lists.rects.push(RectInstance {
-        pos: [cur.x, cur.y],
+        pos: [cur.x, cur.y + scroll_off],
         size: [cur.w, cur.h],
         color: anim.fill_color,
     });

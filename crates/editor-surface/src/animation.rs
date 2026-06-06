@@ -198,7 +198,8 @@ impl AnimationState {
             self.scroll.remove(&grid_id);
             return;
         }
-        self.scroll.insert(grid_id, -(lines_moved as f32) * cell_h);
+        let delta = -(lines_moved as f32) * cell_h;
+        *self.scroll.entry(grid_id).or_insert(0.0) += delta;
     }
 
     /// Track active floats; inherit opacity from nearby fading-out popups (§4.9).
@@ -357,14 +358,20 @@ impl AnimationState {
         }
 
         if self.cfg.enable_smooth_scroll {
-            let t = if self.cfg.scroll_smooth_time > 0.0 {
-                1.0 - (-dt / self.cfg.scroll_smooth_time).exp()
+            // Same exponential ease as cursor motion (animations.md §smooth scroll).
+            let t = if self.cfg.cursor_speed > 0.0 {
+                1.0 - (-self.cfg.cursor_speed * dt).exp()
             } else {
                 1.0
             };
+            let snap = self.cfg.cursor_snap_epsilon;
             self.scroll.retain(|_, off| {
                 *off += (0.0 - *off) * t;
-                off.abs() > 0.5
+                if off.abs() < snap {
+                    false
+                } else {
+                    true
+                }
             });
         } else {
             self.scroll.clear();
@@ -490,7 +497,10 @@ impl AnimationState {
             || (self.render.w - self.target.w).abs() > self.cfg.cursor_snap_epsilon
             || (self.render.h - self.target.h).abs() > self.cfg.cursor_snap_epsilon;
         cur_far
-            || self.scroll.values().any(|o| o.abs() > 0.5)
+            || self
+                .scroll
+                .values()
+                .any(|o| o.abs() > self.cfg.cursor_snap_epsilon)
             || !self.trail.is_empty()
             || !self.flashes.is_empty()
             || !self.particles.is_empty()
