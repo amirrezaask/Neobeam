@@ -9,5 +9,5 @@ pub mod renderer;
 
 pub use animation::{AnimationConfig, AnimationState};
 pub use atlas::GlyphAtlas;
-pub use frame::{DrawLists, FrameBuilder};
+pub use frame::{DrawLists, FloatCache, FloatCacheEntry, FrameBuilder, sync_float_cache};
 pub use renderer::Renderer;

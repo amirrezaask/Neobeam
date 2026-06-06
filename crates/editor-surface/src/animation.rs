@@ -1,7 +1,5 @@
 //! Frame-delta animation engine. Logical state (the protocol cursor) is kept
 //! separate from the rendered/animated state (AGENT_RUST_PORT.md §6).
-//!
-//! All easing uses the frame-rate-independent form `1 - exp(-k*dt)`.
 
 use std::collections::HashMap;
 
@@ -13,6 +11,8 @@ use crate::color::{resolve_cursor, Rgba};
 const DT_MAX: f32 = 0.05;
 const TRAIL_CAP: usize = 12;
 const TRAIL_LIFE: f32 = 0.35;
+const FLOAT_REUSE_ROW_TOLERANCE: i32 = 2;
+const FLOAT_REUSE_COL_TOLERANCE: i32 = 12;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AnimationConfig {
@@ -98,6 +98,14 @@ pub struct Particle {
     pub color: Rgba,
 }
 
+#[derive(Clone, Copy)]
+struct FloatAnimState {
+    opacity: f32,
+    target: f32,
+    row: i32,
+    col: i32,
+}
+
 pub struct AnimationState {
     pub cfg: AnimationConfig,
 
@@ -113,6 +121,7 @@ pub struct AnimationState {
     pub flashes: Vec<Flash>,
     pub particles: Vec<Particle>,
     pub scroll: HashMap<i64, f32>,
+    float_states: HashMap<i64, FloatAnimState>,
 
     pub shake: f32,
     shake_phase: u32,
@@ -138,6 +147,7 @@ impl AnimationState {
             flashes: Vec::new(),
             particles: Vec::new(),
             scroll: HashMap::new(),
+            float_states: HashMap::new(),
             shake: 0.0,
             shake_phase: 0,
             last_cell: (u32::MAX, u32::MAX),
@@ -149,7 +159,6 @@ impl AnimationState {
     }
 
     fn rand(&mut self) -> f32 {
-        // xorshift -> [0,1)
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 17;
@@ -158,7 +167,6 @@ impl AnimationState {
         (x as f32 / u32::MAX as f32).fract()
     }
 
-    /// Per-keystroke effects for power mode (§6.8).
     pub fn notify_keystroke(&mut self) {
         if !self.cfg.enable_power_mode {
             return;
@@ -180,10 +188,77 @@ impl AnimationState {
         }
     }
 
+    /// Seed smooth scroll once per viewport change (§6.4).
+    pub fn seed_scroll(&mut self, grid_id: i64, lines_moved: i64, cell_h: f32, visible_rows: u32) {
+        if !self.cfg.enable_smooth_scroll || lines_moved == 0 {
+            return;
+        }
+        let cap = visible_rows.max(1).min(40) as i64;
+        if lines_moved.abs() > cap {
+            self.scroll.remove(&grid_id);
+            return;
+        }
+        self.scroll.insert(grid_id, -(lines_moved as f32) * cell_h);
+    }
+
+    /// Track active floats; inherit opacity from nearby fading-out popups (§4.9).
+    pub fn sync_floats(&mut self, active: &HashMap<i64, (i32, i32)>) {
+        if !self.cfg.enable_float_animation {
+            self.float_states.clear();
+            return;
+        }
+
+        for (&grid_id, &(row, col)) in active {
+            if let Some(state) = self.float_states.get_mut(&grid_id) {
+                state.target = 1.0;
+                state.row = row;
+                state.col = col;
+                continue;
+            }
+
+            let mut inherited = 0.0f32;
+            let mut inherit_from = None;
+            for (&other_id, state) in &self.float_states {
+                if active.contains_key(&other_id) {
+                    continue;
+                }
+                if (state.row - row).abs() <= FLOAT_REUSE_ROW_TOLERANCE
+                    && (state.col - col).abs() <= FLOAT_REUSE_COL_TOLERANCE
+                    && state.opacity > inherited
+                {
+                    inherited = state.opacity;
+                    inherit_from = Some(other_id);
+                }
+            }
+            if let Some(id) = inherit_from {
+                self.float_states.remove(&id);
+            }
+            self.float_states.insert(
+                grid_id,
+                FloatAnimState {
+                    opacity: inherited,
+                    target: 1.0,
+                    row,
+                    col,
+                },
+            );
+        }
+
+        let ids: Vec<i64> = self.float_states.keys().copied().collect();
+        for id in ids {
+            if !active.contains_key(&id) {
+                if let Some(state) = self.float_states.get_mut(&id) {
+                    state.target = 0.0;
+                }
+            }
+        }
+    }
+
     fn cursor_target(store: &GridStateStore, cell_w: f32, cell_h: f32) -> Rect {
         let c = store.cursor;
-        let x = c.col as f32 * cell_w;
-        let y = c.row as f32 * cell_h;
+        let (win_row, win_col) = store.window_origin(c.grid);
+        let x = (win_col as f32 + c.col as f32) * cell_w;
+        let y = (win_row as f32 + c.row as f32) * cell_h;
         match store.cursor_shape() {
             CursorShape::Block => Rect { x, y, w: cell_w, h: cell_h },
             CursorShape::Vertical => {
@@ -204,7 +279,6 @@ impl AnimationState {
         let (fill, glyph) = resolve_cursor(store);
         self.fill_color = fill;
         self.glyph_color = glyph;
-
         self.target = Self::cursor_target(store, cell_w, cell_h);
 
         let cell = (store.cursor.row, store.cursor.col);
@@ -239,7 +313,6 @@ impl AnimationState {
         self.last_cell = cell;
         self.last_mode = store.mode_idx;
 
-        // Integrate render cursor (frame-rate independent).
         self.prev = self.render;
         if self.cfg.enable_cursor_animation {
             let t = 1.0 - (-self.cfg.cursor_speed * dt).exp();
@@ -252,7 +325,6 @@ impl AnimationState {
             self.render = self.target;
         }
 
-        // Squash / stretch from velocity.
         self.display = self.render;
         if self.cfg.enable_cursor_squash_stretch && dt > 0.0 {
             let vx = (self.render.x - self.prev.x) / dt;
@@ -275,7 +347,6 @@ impl AnimationState {
             }
         }
 
-        // Trail aging.
         if self.cfg.enable_cursor_trail {
             for s in self.trail.iter_mut() {
                 s.age += dt;
@@ -285,18 +356,7 @@ impl AnimationState {
             self.trail.clear();
         }
 
-        // Smooth scroll: seed from pending deltas, ease toward 0.
         if self.cfg.enable_smooth_scroll {
-            for (grid, delta) in &store.pending_scroll {
-                let visible_rows = store.grid(*grid).map(|g| g.height as i64).unwrap_or(40);
-                let cap = visible_rows.min(40);
-                if delta.abs() > cap {
-                    self.scroll.insert(*grid, 0.0); // snap big jumps
-                } else {
-                    let seed = -(*delta as f32) * cell_h;
-                    *self.scroll.entry(*grid).or_insert(0.0) += seed;
-                }
-            }
             let t = if self.cfg.scroll_smooth_time > 0.0 {
                 1.0 - (-dt / self.cfg.scroll_smooth_time).exp()
             } else {
@@ -310,14 +370,12 @@ impl AnimationState {
             self.scroll.clear();
         }
 
-        // Flash aging.
         for f in self.flashes.iter_mut() {
             f.age += dt;
         }
         let fd = self.cfg.flash_duration;
         self.flashes.retain(|f| f.age < fd);
 
-        // Particles + shake (power mode).
         let grav = 420.0 * dt;
         let plife = self.cfg.particle_lifetime;
         for p in self.particles.iter_mut() {
@@ -334,8 +392,28 @@ impl AnimationState {
             }
         }
 
-        // Blink timer.
         self.blink_t += dt;
+        self.update_floats(dt);
+    }
+
+    fn update_floats(&mut self, dt: f32) {
+        if !self.cfg.enable_float_animation {
+            self.float_states.clear();
+            return;
+        }
+        let t = 1.0 - (-self.cfg.float_fade_speed * dt).exp();
+        let mut remove = Vec::new();
+        for (&id, state) in self.float_states.iter_mut() {
+            state.opacity += (state.target - state.opacity) * t;
+            if state.target == 0.0 && state.opacity < 0.01 {
+                remove.push(id);
+            } else if state.target == 1.0 && state.opacity > 0.99 {
+                state.opacity = 1.0;
+            }
+        }
+        for id in remove {
+            self.float_states.remove(&id);
+        }
     }
 
     fn snap_axes(&mut self) {
@@ -358,7 +436,21 @@ impl AnimationState {
         self.scroll.get(&grid).copied().unwrap_or(0.0)
     }
 
-    /// Compute the per-frame screen-shake pixel offset.
+    pub fn float_opacity(&self, grid_id: i64) -> f32 {
+        if !self.cfg.enable_float_animation {
+            return 1.0;
+        }
+        self.float_states.get(&grid_id).map(|s| s.opacity).unwrap_or(1.0)
+    }
+
+    pub fn fading_out_float_ids(&self) -> Vec<i64> {
+        self.float_states
+            .iter()
+            .filter(|(_, s)| s.target == 0.0 && s.opacity > 0.01)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     pub fn shake_offset(&mut self) -> [f32; 2] {
         if self.shake <= 0.0 {
             return [0.0, 0.0];
@@ -370,7 +462,6 @@ impl AnimationState {
         [dx, dy]
     }
 
-    /// Whether the cursor is currently visible given blink timings.
     pub fn cursor_visible(&self, store: &GridStateStore) -> bool {
         let Some(m) = store.current_mode() else { return true };
         let (wait, on, off) = (m.blinkwait as f32, m.blinkon as f32, m.blinkoff as f32);
@@ -393,7 +484,6 @@ impl AnimationState {
             .unwrap_or(false)
     }
 
-    /// True while any animation is in progress (§6.9 idle gate).
     pub fn is_animating(&self) -> bool {
         let cur_far = (self.render.x - self.target.x).abs() > self.cfg.cursor_snap_epsilon
             || (self.render.y - self.target.y).abs() > self.cfg.cursor_snap_epsilon
@@ -405,9 +495,45 @@ impl AnimationState {
             || !self.flashes.is_empty()
             || !self.particles.is_empty()
             || self.shake > 0.0
+            || (self.cfg.enable_float_animation
+                && self
+                    .float_states
+                    .values()
+                    .any(|s| (s.opacity - s.target).abs() > 0.01))
     }
 
     pub fn render_cursor(&self) -> Rect {
         self.display
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_scroll_sets_offset_and_eases_to_zero() {
+        let mut anim = AnimationState::new(AnimationConfig::default());
+        anim.seed_scroll(1, 2, 18.0, 10);
+        assert!((anim.scroll_offset(1) + 36.0).abs() < 0.01);
+
+        for _ in 0..200 {
+            anim.update(0.016, &GridStateStore::new(), 9.0, 18.0);
+        }
+        assert!(anim.scroll_offset(1).abs() < 0.5);
+    }
+
+    #[test]
+    fn float_fades_in() {
+        let mut anim = AnimationState::new(AnimationConfig::default());
+        let mut active = HashMap::new();
+        active.insert(5, (3, 10));
+        anim.sync_floats(&active);
+        assert!(anim.float_opacity(5) < 0.01);
+
+        for _ in 0..100 {
+            anim.update(0.016, &GridStateStore::new(), 9.0, 18.0);
+        }
+        assert!(anim.float_opacity(5) > 0.95);
     }
 }

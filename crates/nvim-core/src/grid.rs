@@ -1,7 +1,4 @@
-//! Authoritative grid + highlight + cursor state, mutated by `UiEvent`s.
-//!
-//! v1 is single-grid (`ext_linegrid` only). The store still keys grids by id so
-//! multigrid can be enabled later without restructuring (AGENT_RUST_PORT.md §1, §3).
+//! Authoritative grid + window + highlight + cursor state, mutated by `UiEvent`s.
 
 use std::collections::HashMap;
 
@@ -20,18 +17,19 @@ pub struct Grid {
     pub width: u32,
     pub height: u32,
     pub cells: Vec<Cell>,
-    /// Animated pixel scroll offset seed (lines moved on last viewport event).
     pub scroll_delta: i64,
-    /// Float placement, if this grid is a floating window.
-    pub float: Option<FloatInfo>,
+    pub z_index: i64,
 }
 
+/// Resolved screen position for a normal or floating window.
 #[derive(Debug, Clone, Copy)]
-pub struct FloatInfo {
-    pub anchor: Anchor,
-    pub anchor_grid: i64,
-    pub anchor_row: f64,
-    pub anchor_col: f64,
+pub struct WindowMeta {
+    pub grid_id: i64,
+    pub row: i32,
+    pub col: i32,
+    pub width: u32,
+    pub height: u32,
+    pub is_float: bool,
     pub z_index: i64,
 }
 
@@ -43,7 +41,7 @@ impl Grid {
             height,
             cells: vec![Cell::default(); len],
             scroll_delta: 0,
-            float: None,
+            z_index: 0,
         }
     }
 
@@ -95,7 +93,6 @@ impl Grid {
             }
         };
         if rows > 0 {
-            // content moves up: copy top-to-bottom
             let mut dst = top;
             let mut src = top + rows;
             while src < bot {
@@ -104,7 +101,6 @@ impl Grid {
                 src += 1;
             }
         } else {
-            // content moves down: copy bottom-to-top
             let mut dst = bot - 1;
             let mut src = bot - 1 + rows;
             while src >= top {
@@ -114,6 +110,23 @@ impl Grid {
             }
         }
     }
+}
+
+/// Resolve absolute row/col for a float from its anchor (§4.9).
+pub fn resolve_float_position(anchor: Anchor, row: f64, col: f64, width: u32, height: u32) -> (i32, i32) {
+    let row = row as i32;
+    let col = col as i32;
+    let h = height as i32;
+    let w = width as i32;
+    let r = match anchor {
+        Anchor::SW | Anchor::SE => (row - h).max(0),
+        _ => row.max(0),
+    };
+    let c = match anchor {
+        Anchor::NE | Anchor::SE => (col - w).max(0),
+        _ => col.max(0),
+    };
+    (r, c)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -136,17 +149,24 @@ impl Default for Cursor {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ViewportState {
+    pub topline: i64,
+    pub botline: i64,
+    pub scroll_delta: i64,
+}
+
 pub struct GridStateStore {
     pub grids: HashMap<i64, Grid>,
+    pub windows: HashMap<i64, WindowMeta>,
+    viewports: HashMap<i64, ViewportState>,
     pub default_colors: DefaultColors,
     pub highlights: HashMap<u32, HlAttr>,
     pub cursor: Cursor,
     pub mode_infos: Vec<ModeInfo>,
     pub mode_idx: usize,
     pub busy: bool,
-    /// Set true whenever a `Flush` is applied; the host presents a frame and clears it.
     pub dirty: bool,
-    /// Per-grid scroll delta produced by the most recent flush (consumed by the animator).
     pub pending_scroll: Vec<(i64, i64)>,
 }
 
@@ -160,6 +180,8 @@ impl GridStateStore {
     pub fn new() -> Self {
         GridStateStore {
             grids: HashMap::new(),
+            windows: HashMap::new(),
+            viewports: HashMap::new(),
             default_colors: DefaultColors::default(),
             highlights: HashMap::new(),
             cursor: Cursor::default(),
@@ -175,7 +197,10 @@ impl GridStateStore {
         self.grids.get(&id)
     }
 
-    /// The primary (global) grid for single-grid v1.
+    pub fn window(&self, id: i64) -> Option<&WindowMeta> {
+        self.windows.get(&id)
+    }
+
     pub fn primary(&self) -> Option<&Grid> {
         self.grids.get(&1)
     }
@@ -192,6 +217,23 @@ impl GridStateStore {
         self.current_mode().map(|m| m.cursor_shape).unwrap_or(CursorShape::Block)
     }
 
+    /// Screen cell origin `(row, col)` for a grid, defaulting to `(0, 0)`.
+    pub fn window_origin(&self, grid_id: i64) -> (i32, i32) {
+        self.windows
+            .get(&grid_id)
+            .map(|w| (w.row, w.col))
+            .unwrap_or((0, 0))
+    }
+
+    /// Active floating windows and their resolved screen positions.
+    pub fn active_floats(&self) -> HashMap<i64, (i32, i32)> {
+        self.windows
+            .iter()
+            .filter(|(_, w)| w.is_float)
+            .map(|(&id, w)| (id, (w.row, w.col)))
+            .collect()
+    }
+
     pub fn apply(&mut self, ev: UiEvent) {
         match ev {
             UiEvent::GridResize { grid, width, height } => {
@@ -199,19 +241,36 @@ impl GridStateStore {
                     .entry(grid)
                     .and_modify(|g| g.resize(width, height))
                     .or_insert_with(|| Grid::new(width, height));
+                if let Some(win) = self.windows.get_mut(&grid) {
+                    win.width = width;
+                    win.height = height;
+                }
             }
             UiEvent::GridClear { grid } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.clear();
                 }
             }
-            UiEvent::GridDestroy { grid } | UiEvent::WinClose { grid } => {
+            UiEvent::GridDestroy { grid } => {
                 self.grids.remove(&grid);
+                self.windows.remove(&grid);
             }
-            UiEvent::WinHide { grid } => {
-                if let Some(g) = self.grids.get_mut(&grid) {
-                    g.float = None;
-                }
+            UiEvent::WinClose { grid } | UiEvent::WinHide { grid } => {
+                self.windows.remove(&grid);
+            }
+            UiEvent::WinPos { grid, row, col, width, height } => {
+                self.windows.insert(
+                    grid,
+                    WindowMeta {
+                        grid_id: grid,
+                        row,
+                        col,
+                        width,
+                        height,
+                        is_float: false,
+                        z_index: 0,
+                    },
+                );
             }
             UiEvent::GridLine { grid, row, col_start, cells } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
@@ -252,17 +311,75 @@ impl GridStateStore {
                 self.mode_idx = mode_idx;
             }
             UiEvent::Busy(b) => self.busy = b,
-            UiEvent::WinViewport { grid, scroll_delta, .. } => {
-                if scroll_delta != 0 {
-                    self.pending_scroll.push((grid, scroll_delta));
+            UiEvent::WinViewport {
+                grid,
+                topline,
+                botline,
+                curline: _,
+                curcol: _,
+                line_count: _,
+                scroll_delta,
+            } => {
+                let mut delta = scroll_delta;
+                if delta == 0 {
+                    if let Some(prev) = self.viewports.get(&grid) {
+                        delta = topline - prev.topline;
+                    }
                 }
+                if delta != 0 {
+                    self.pending_scroll.push((grid, delta));
+                }
+                self.viewports.insert(
+                    grid,
+                    ViewportState {
+                        topline,
+                        botline,
+                        scroll_delta: delta,
+                    },
+                );
                 if let Some(g) = self.grids.get_mut(&grid) {
-                    g.scroll_delta = scroll_delta;
+                    g.scroll_delta = delta;
                 }
             }
-            UiEvent::WinFloatPos { grid, anchor, anchor_grid, anchor_row, anchor_col, z_index, .. } => {
+            UiEvent::WinFloatPos {
+                grid,
+                anchor,
+                anchor_grid,
+                anchor_row,
+                anchor_col,
+                z_index,
+                ..
+            } => {
+                let old = self.windows.get(&grid);
+                let g = self.grids.get(&grid);
+                let width = old.map(|w| w.width).or_else(|| g.map(|g| g.width)).unwrap_or(0);
+                let height = old.map(|w| w.height).or_else(|| g.map(|g| g.height)).unwrap_or(0);
+                let (anchor_row_base, anchor_col_base) = self
+                    .windows
+                    .get(&anchor_grid)
+                    .map(|w| (w.row, w.col))
+                    .unwrap_or((0, 0));
+                let (row, col) = resolve_float_position(
+                    anchor,
+                    anchor_row_base as f64 + anchor_row,
+                    anchor_col_base as f64 + anchor_col,
+                    width,
+                    height,
+                );
+                self.windows.insert(
+                    grid,
+                    WindowMeta {
+                        grid_id: grid,
+                        row,
+                        col,
+                        width,
+                        height,
+                        is_float: true,
+                        z_index,
+                    },
+                );
                 if let Some(g) = self.grids.get_mut(&grid) {
-                    g.float = Some(FloatInfo { anchor, anchor_grid, anchor_row, anchor_col, z_index });
+                    g.z_index = z_index;
                 }
             }
             UiEvent::OptionSet { .. } => {}
@@ -272,7 +389,11 @@ impl GridStateStore {
         }
     }
 
-    /// Apply a whole batch; returns true if a flush occurred (frame should present).
+    /// Take scroll deltas produced by the last batch (consume once when seeding animation).
+    pub fn take_pending_scroll(&mut self) -> Vec<(i64, i64)> {
+        std::mem::take(&mut self.pending_scroll)
+    }
+
     pub fn apply_batch(&mut self, events: impl IntoIterator<Item = UiEvent>) -> bool {
         self.pending_scroll.clear();
         let mut flushed = false;
@@ -283,5 +404,18 @@ impl GridStateStore {
             self.apply(ev);
         }
         flushed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Anchor;
+
+    #[test]
+    fn float_anchor_se() {
+        let (r, c) = resolve_float_position(Anchor::SE, 10.0, 20.0, 5, 3);
+        assert_eq!(r, 7);
+        assert_eq!(c, 15);
     }
 }

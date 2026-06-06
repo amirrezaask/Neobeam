@@ -101,6 +101,7 @@ pub enum UiEvent {
     OptionSet { name: String, value: Value },
     Busy(bool),
     WinViewport { grid: i64, topline: i64, botline: i64, curline: i64, curcol: i64, line_count: i64, scroll_delta: i64 },
+    WinPos { grid: i64, row: i32, col: i32, width: u32, height: u32 },
     WinFloatPos { grid: i64, anchor: Anchor, anchor_grid: i64, anchor_row: f64, anchor_col: f64, z_index: i64, focusable: bool },
     WinClose { grid: i64 },
     WinHide { grid: i64 },
@@ -195,6 +196,13 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
             curcol: as_i64(&p[5]),
             line_count: p.get(6).map(as_i64).unwrap_or(0),
             scroll_delta: p.get(7).map(as_i64).unwrap_or(0),
+        }),
+        "win_pos" if p.len() >= 6 => out.push(UiEvent::WinPos {
+            grid: as_i64(&p[0]),
+            row: as_i64(&p[2]) as i32,
+            col: as_i64(&p[3]) as i32,
+            width: as_u32(&p[4]),
+            height: as_u32(&p[5]),
         }),
         "win_float_pos" if p.len() >= 6 => out.push(UiEvent::WinFloatPos {
             grid: as_i64(&p[0]),

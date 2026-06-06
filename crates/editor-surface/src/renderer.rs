@@ -12,7 +12,7 @@ use winit::window::Window;
 
 use crate::animation::AnimationState;
 use crate::atlas::GlyphAtlas;
-use crate::frame::{DrawLists, FrameBuilder, GlyphInstance, RectInstance};
+use crate::frame::{DrawLists, FloatCache, FrameBuilder, GlyphInstance, RectInstance, sync_float_cache};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -67,6 +67,7 @@ pub struct Renderer {
     rect_buf: InstanceBuffer,
     glyph_buf: InstanceBuffer,
 
+    float_cache: FloatCache,
     pub atlas: GlyphAtlas,
 }
 
@@ -291,6 +292,7 @@ impl Renderer {
             atlas_bind_group,
             rect_buf,
             glyph_buf,
+            float_cache: FloatCache::new(),
             atlas,
         })
     }
@@ -344,7 +346,15 @@ impl Renderer {
         };
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        let mut lists: DrawLists = FrameBuilder::build(store, anim, &mut self.atlas, &self.queue);
+        sync_float_cache(store, &mut self.float_cache);
+
+        let mut lists: DrawLists =
+            FrameBuilder::build(store, anim, &mut self.atlas, &self.queue, &self.float_cache);
+        for id in anim.fading_out_float_ids() {
+            if anim.float_opacity(id) <= 0.01 {
+                self.float_cache.remove(&id);
+            }
+        }
         if let Some(text) = overlay {
             self.push_overlay(&mut lists, text);
         }

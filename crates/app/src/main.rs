@@ -111,6 +111,7 @@ impl App {
             cfg.enable_cursor_squash_stretch = false;
             cfg.enable_smooth_scroll = false;
             cfg.enable_flashes = false;
+            cfg.enable_float_animation = false;
         }
         cfg.enable_power_mode = self.settings.power_mode;
 
@@ -246,6 +247,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let events = parse_redraw(&args);
                 let flushed = state.store.apply_batch(events);
                 if flushed {
+                    let (_, ch) = state.renderer.cell_size();
+                    for (grid, delta) in state.store.take_pending_scroll() {
+                        let visible = state.store.grid(grid).map(|g| g.height).unwrap_or(40);
+                        state.anim.seed_scroll(grid, delta, ch, visible);
+                    }
+                    state.anim.sync_floats(&state.store.active_floats());
                     state.window.request_redraw();
                 }
             }
@@ -371,6 +378,13 @@ impl ApplicationHandler<UserEvent> for App {
                 state.render();
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else { return };
+        if state.anim.is_animating() || state.anim.is_blinking(&state.store) {
+            state.window.request_redraw();
         }
     }
 }
