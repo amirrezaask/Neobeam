@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use editor_surface::AnimationConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,25 @@ impl Default for Settings {
             animations_enabled: true,
             power_mode: false,
         }
+    }
+}
+
+impl Settings {
+    pub fn animation_config(&self) -> AnimationConfig {
+        let mut cfg = AnimationConfig::default();
+        if !self.animations_enabled {
+            cfg.enable_cursor_animation = false;
+            cfg.enable_cursor_trail = false;
+            cfg.enable_cursor_glow = false;
+            cfg.enable_cursor_squash_stretch = false;
+            cfg.enable_smooth_scroll = false;
+            cfg.enable_flashes = false;
+            cfg.enable_float_animation = false;
+            cfg.enable_power_mode = false;
+        } else {
+            cfg.enable_power_mode = self.power_mode;
+        }
+        cfg
     }
 }
 

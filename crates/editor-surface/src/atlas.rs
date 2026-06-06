@@ -100,6 +100,24 @@ impl GlyphAtlas {
         self.recompute_metrics();
     }
 
+    /// Change font family, size, and line height; clears all cached glyphs.
+    pub fn reconfigure_font(
+        &mut self,
+        device: &wgpu::Device,
+        font_family: Option<&str>,
+        size_px: f32,
+        line_height: f32,
+        scale: f32,
+    ) -> Result<()> {
+        self.font = load_font(font_family)?;
+        self.size_px = size_px;
+        self.line_height = line_height;
+        self.scale = scale;
+        self.clear(device);
+        self.recompute_metrics();
+        Ok(())
+    }
+
     fn clear(&mut self, device: &wgpu::Device) {
         self.map.clear();
         self.alloc.clear();

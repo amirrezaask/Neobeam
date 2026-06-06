@@ -3,12 +3,12 @@
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
 mod settings;
+mod settings_ui;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use editor_surface::animation::AnimationConfig;
 use editor_surface::{AnimationState, Renderer};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
@@ -18,6 +18,7 @@ use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
 use settings::Settings;
+use settings_ui::{revert_draft, SettingsAction, SettingsUi};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -51,6 +52,7 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     rt: tokio::runtime::Runtime,
     settings: Settings,
+    settings_ui: SettingsUi,
     state: Option<State>,
 }
 
@@ -61,10 +63,12 @@ impl App {
             .build()?;
         let settings = Settings::load();
         settings.save(); // ensure a settings.json exists for the user to edit (§9)
+        let settings_ui = SettingsUi::new(&settings);
         Ok(App {
             proxy,
             rt,
             settings,
+            settings_ui,
             state: None,
         })
     }
@@ -103,24 +107,14 @@ impl App {
         )?;
         tracing::info!("nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}", renderer.scale());
 
-        let mut cfg = AnimationConfig::default();
-        if !self.settings.animations_enabled {
-            cfg.enable_cursor_animation = false;
-            cfg.enable_cursor_trail = false;
-            cfg.enable_cursor_glow = false;
-            cfg.enable_cursor_squash_stretch = false;
-            cfg.enable_smooth_scroll = false;
-            cfg.enable_flashes = false;
-            cfg.enable_float_animation = false;
-        }
-        cfg.enable_power_mode = self.settings.power_mode;
+        let anim = AnimationState::new(self.settings.animation_config());
 
         Ok(State {
             window,
             renderer,
             session,
             store: GridStateStore::new(),
-            anim: AnimationState::new(cfg),
+            anim,
             last_frame: Instant::now(),
             frame_count: 0,
             fps: 0.0,
@@ -131,6 +125,57 @@ impl App {
             grid_cols: cols,
             grid_rows: rows,
         })
+    }
+
+    fn apply_preview(&mut self) {
+        let Some(state) = self.state.as_mut() else { return };
+        let d = self.settings_ui.draft.clone();
+        if let Err(e) = state.renderer.apply_font(
+            d.font_family.as_deref(),
+            d.font_size,
+            d.line_height,
+        ) {
+            tracing::warn!("font preview failed: {e:#}");
+        }
+        state.anim.cfg = d.animation_config();
+        state.recompute_grid();
+    }
+
+    fn apply_settings(&mut self) {
+        self.settings = self.settings_ui.draft.clone();
+        self.settings.save();
+        self.apply_preview();
+    }
+
+    fn cancel_settings(&mut self) {
+        revert_draft(&mut self.settings_ui, &self.settings);
+        self.apply_preview();
+    }
+
+    fn handle_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::None => {}
+            SettingsAction::Preview => {
+                self.apply_preview();
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            SettingsAction::Apply => {
+                self.apply_settings();
+                self.settings_ui.open = false;
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+            SettingsAction::CloseCancel => {
+                self.cancel_settings();
+                self.settings_ui.open = false;
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
+        }
     }
 }
 
@@ -155,7 +200,7 @@ impl State {
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, settings_ui: &mut SettingsUi) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -166,15 +211,33 @@ impl State {
             let inst = 1.0 / dt;
             self.fps = if self.fps == 0.0 { inst } else { self.fps * 0.9 + inst * 0.1 };
         }
-        let overlay = format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0);
+        let overlay = if settings_ui.open {
+            None
+        } else {
+            Some(format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0))
+        };
 
         let (cw, ch) = self.renderer.cell_size();
+        let (lw, lh) = self.renderer.logical_size();
+        self.renderer.with_atlas_queue(|atlas, queue| {
+            settings_ui.rebuild(atlas, queue, lw, lh);
+        });
+        let ui = settings_ui.overlay();
+
         self.anim.update(dt, &self.store, cw, ch);
-        if let Err(e) = self.renderer.render(&self.store, &mut self.anim, Some(&overlay)) {
+        if let Err(e) = self.renderer.render(
+            &self.store,
+            &mut self.anim,
+            overlay.as_deref(),
+            ui,
+        ) {
             tracing::error!("render error: {e}");
         }
         self.frame_count += 1;
-        if self.anim.is_animating() || self.anim.is_blinking(&self.store) {
+        if settings_ui.open
+            || self.anim.is_animating()
+            || self.anim.is_blinking(&self.store)
+        {
             self.window.request_redraw();
         }
     }
@@ -312,9 +375,36 @@ impl ApplicationHandler<UserEvent> for App {
                 Ime::Disabled => state.ime_active = false,
             },
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || state.ime_active {
+                let pressed = event.state == ElementState::Pressed;
+                let ime_active = self.state.as_ref().is_some_and(|s| s.ime_active);
+                if !pressed || ime_active {
                     return;
                 }
+
+                let cmd_comma = self.state.as_ref().is_some_and(|s| {
+                    matches!(&event.logical_key, Key::Character(c) if c.as_str() == "," && s.mods.meta)
+                });
+                if cmd_comma {
+                    self.settings_ui.toggle(&self.settings);
+                    if self.settings_ui.open {
+                        self.apply_preview();
+                    } else {
+                        self.cancel_settings();
+                    }
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self.settings_ui.open {
+                    if matches!(&event.logical_key, Key::Named(WinitNamed::Escape)) {
+                        self.handle_settings_action(SettingsAction::CloseCancel);
+                    }
+                    return;
+                }
+
+                let Some(state) = self.state.as_mut() else { return };
                 let key = match &event.logical_key {
                     Key::Named(n) => map_named(*n).map(KeyInput::Named),
                     Key::Character(s) => s.chars().next().map(KeyInput::Char),
@@ -329,7 +419,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.cursor_pos = (position.x, position.y);
+                if let Some(state) = self.state.as_mut() {
+                    state.cursor_pos = (position.x, position.y);
+                }
+                if self.settings_ui.open {
+                    let scale = self
+                        .state
+                        .as_ref()
+                        .map(|s| s.renderer.scale())
+                        .unwrap_or(1.0);
+                    let (lw, lh) = self
+                        .state
+                        .as_ref()
+                        .map(|s| s.renderer.logical_size())
+                        .unwrap_or((800.0, 600.0));
+                    self.settings_ui.handle_mouse_move(
+                        position.x as f32 / scale,
+                        position.y as f32 / scale,
+                        lw,
+                        lh,
+                    );
+                    if self.settings_ui.is_dragging() {
+                        self.apply_preview();
+                    }
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+                let Some(state) = self.state.as_mut() else { return };
                 if let Some(btn) = state.mouse_down {
                     let (row, col) = state.hit_test();
                     state
@@ -338,6 +456,28 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                if self.settings_ui.open && button == MouseButton::Left {
+                    let (lx, ly, lw, lh) = {
+                        let Some(state) = self.state.as_ref() else { return };
+                        let scale = state.renderer.scale();
+                        let (lw, lh) = state.renderer.logical_size();
+                        (
+                            state.cursor_pos.0 as f32 / scale,
+                            state.cursor_pos.1 as f32 / scale,
+                            lw,
+                            lh,
+                        )
+                    };
+                    let action = match btn_state {
+                        ElementState::Pressed => {
+                            self.settings_ui.handle_mouse_down(lx, ly, lw, lh)
+                        }
+                        ElementState::Released => self.settings_ui.handle_mouse_up(),
+                    };
+                    self.handle_settings_action(action);
+                    return;
+                }
+                let Some(state) = self.state.as_mut() else { return };
                 let Some(btn) = map_button(button) else { return };
                 let (row, col) = state.hit_test();
                 match btn_state {
@@ -356,6 +496,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.settings_ui.open {
+                    let (lw, lh) = state.renderer.logical_size();
+                    let y = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y * 3.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
+                    };
+                    self.settings_ui.handle_wheel(y, lw, lh);
+                    state.window.request_redraw();
+                    return;
+                }
                 let (row, col) = state.hit_test();
                 let (_, ch) = state.renderer.cell_size();
                 let lines = match delta {
@@ -375,7 +525,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                state.render();
+                state.render(&mut self.settings_ui);
             }
             _ => {}
         }
@@ -383,7 +533,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let Some(state) = self.state.as_ref() else { return };
-        if state.anim.is_animating() || state.anim.is_blinking(&state.store) {
+        if self.settings_ui.open
+            || state.anim.is_animating()
+            || state.anim.is_blinking(&state.store)
+        {
             state.window.request_redraw();
         }
     }

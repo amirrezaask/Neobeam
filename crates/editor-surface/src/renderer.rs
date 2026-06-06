@@ -310,6 +310,14 @@ impl Renderer {
         (self.config.width as f32 / self.scale, self.config.height as f32 / self.scale)
     }
 
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn with_atlas_queue<R>(&mut self, f: impl FnOnce(&mut GlyphAtlas, &wgpu::Queue) -> R) -> R {
+        f(&mut self.atlas, &self.queue)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32, scale: f32) {
         if width == 0 || height == 0 {
             return;
@@ -332,11 +340,26 @@ impl Renderer {
             make_atlas_bind_group(&self.device, &self.atlas_bind_group_layout, &self.atlas);
     }
 
+    /// Apply font family, size, and line height; resets the atlas.
+    pub fn apply_font(
+        &mut self,
+        font_family: Option<&str>,
+        size_px: f32,
+        line_height: f32,
+    ) -> Result<()> {
+        self.atlas
+            .reconfigure_font(&self.device, font_family, size_px, line_height, self.scale)?;
+        self.atlas_bind_group =
+            make_atlas_bind_group(&self.device, &self.atlas_bind_group_layout, &self.atlas);
+        Ok(())
+    }
+
     pub fn render(
         &mut self,
         store: &GridStateStore,
         anim: &mut AnimationState,
         overlay: Option<&str>,
+        ui: Option<(&[RectInstance], &[GlyphInstance])>,
     ) -> Result<()> {
         let shake = anim.shake_offset();
         let (lw, lh) = self.logical_size();
@@ -357,6 +380,10 @@ impl Renderer {
         }
         if let Some(text) = overlay {
             self.push_overlay(&mut lists, text);
+        }
+        if let Some((rects, glyphs)) = ui {
+            lists.rects.extend_from_slice(rects);
+            lists.glyphs.extend_from_slice(glyphs);
         }
         // Atlas may have grown into a new texture? It only resets on font/dpi
         // change (handled elsewhere); the bind group stays valid here.
