@@ -17,7 +17,7 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimSession, SessionConfig};
 use nvim_core::Value;
-use settings::Settings;
+use settings::{spawn_watcher, Settings};
 use settings_ui::{revert_draft, SettingsAction, SettingsUi};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -28,6 +28,7 @@ use winit::window::{Window, WindowId};
 #[derive(Debug)]
 enum UserEvent {
     Redraw(Vec<Value>),
+    SettingsReloaded,
     Exited,
 }
 
@@ -44,6 +45,7 @@ struct State {
     ime_active: bool,
     cursor_pos: (f64, f64),
     mouse_down: Option<CoreButton>,
+    wheel_scroll_accum: f32,
     grid_cols: u32,
     grid_rows: u32,
 }
@@ -64,6 +66,10 @@ impl App {
         let settings = Settings::load();
         settings.save(); // ensure a settings.json exists for the user to edit (§9)
         let settings_ui = SettingsUi::new(&settings);
+        let reload_proxy = proxy.clone();
+        spawn_watcher(move || {
+            let _ = reload_proxy.send_event(UserEvent::SettingsReloaded);
+        });
         Ok(App {
             proxy,
             rt,
@@ -125,6 +131,7 @@ impl App {
             ime_active: false,
             cursor_pos: (0.0, 0.0),
             mouse_down: None,
+            wheel_scroll_accum: 0.0,
             grid_cols: cols,
             grid_rows: rows,
         })
@@ -153,6 +160,23 @@ impl App {
     fn cancel_settings(&mut self) {
         revert_draft(&mut self.settings_ui, &self.settings);
         self.apply_preview();
+    }
+
+    fn reload_settings_from_disk(&mut self) {
+        if self.settings_ui.open {
+            return;
+        }
+        let loaded = Settings::load();
+        if loaded == self.settings {
+            return;
+        }
+        tracing::info!("reloading settings from disk");
+        self.settings = loaded;
+        revert_draft(&mut self.settings_ui, &self.settings);
+        self.apply_preview();
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
     }
 
     fn handle_settings_action(&mut self, action: SettingsAction) {
@@ -319,6 +343,9 @@ impl ApplicationHandler<UserEvent> for App {
                     state.anim.sync_floats(&state.store.active_floats());
                     state.window.request_redraw();
                 }
+            }
+            UserEvent::SettingsReloaded => {
+                self.reload_settings_from_disk();
             }
             UserEvent::Exited => {
                 // nvim exited (e.g. `:q`); tear down and close the app.
@@ -510,20 +537,33 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let (row, col) = state.hit_test();
                 let (_, ch) = state.renderer.cell_size();
+                let scale = self.settings.mouse_scroll_sensitivity;
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / ch.max(1.0),
+                    MouseScrollDelta::LineDelta(_, y) => y * scale,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / ch.max(1.0) * scale,
                 };
-                let steps = lines.abs().round().max(1.0) as i32;
-                let btn = if lines >= 0.0 {
-                    CoreButton::WheelUp
-                } else {
-                    CoreButton::WheelDown
-                };
-                for _ in 0..steps {
-                    state
-                        .session
-                        .mouse(btn, MouseAction::Press, mods_string(state.mods), 0, row, col);
+                state.wheel_scroll_accum += lines;
+                while state.wheel_scroll_accum >= 1.0 {
+                    state.wheel_scroll_accum -= 1.0;
+                    state.session.mouse(
+                        CoreButton::WheelUp,
+                        MouseAction::Press,
+                        mods_string(state.mods),
+                        0,
+                        row,
+                        col,
+                    );
+                }
+                while state.wheel_scroll_accum <= -1.0 {
+                    state.wheel_scroll_accum += 1.0;
+                    state.session.mouse(
+                        CoreButton::WheelDown,
+                        MouseAction::Press,
+                        mods_string(state.mods),
+                        0,
+                        row,
+                        col,
+                    );
                 }
             }
             WindowEvent::RedrawRequested => {

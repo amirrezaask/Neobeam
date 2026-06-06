@@ -1,11 +1,11 @@
-//! Persisted settings in the OS user-config dir (AGENT_RUST_PORT.md §9).
+//! Persisted settings in `$XDG_CONFIG_HOME/nvim-ui/settings.json` (or `~/.config/...`).
 
 use std::path::PathBuf;
 
 use editor_surface::{parse_vfx_modes, AnimationConfig, VfxMode};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub font_family: Option<String>,
     pub font_size: f32,
@@ -27,6 +27,13 @@ pub struct Settings {
     pub enable_float_animation: bool,
     pub float_fade_speed: f32,
     pub vfx_modes: String,
+    /// Fraction of one editor line per wheel unit (1.0 = one line per notch).
+    #[serde(default = "default_mouse_scroll_sensitivity")]
+    pub mouse_scroll_sensitivity: f32,
+}
+
+fn default_mouse_scroll_sensitivity() -> f32 {
+    0.35
 }
 
 impl Default for Settings {
@@ -50,6 +57,7 @@ impl Default for Settings {
             enable_float_animation: true,
             float_fade_speed: 24.0,
             vfx_modes: String::new(),
+            mouse_scroll_sensitivity: 0.35,
         }
     }
 }
@@ -125,9 +133,22 @@ impl Settings {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "nvim-ui", "nvim-ui")?;
-    Some(dirs.config_dir().join("settings.json"))
+pub fn config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let dirs = directories::ProjectDirs::from("", "", "nvim-ui")?;
+        return Some(dirs.config_dir().join("settings.json"));
+    }
+    #[cfg(not(windows))]
+    {
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                directories::BaseDirs::new().map(|d| d.home_dir().join(".config"))
+            })?;
+        Some(config_home.join("nvim-ui").join("settings.json"))
+    }
 }
 
 impl Settings {
@@ -148,4 +169,44 @@ impl Settings {
             let _ = std::fs::write(path, json);
         }
     }
+}
+
+/// Watch `settings.json` and invoke `on_change` after writes settle (debounced).
+pub fn spawn_watcher(mut on_change: impl FnMut() + Send + 'static) {
+    let Some(path) = config_path() else { return };
+    let Some(parent) = path.parent().map(|p| p.to_path_buf()) else { return };
+    let settings_path = path;
+
+    std::thread::spawn(move || {
+        use std::time::Duration;
+
+        use notify_debouncer_mini::{new_debouncer, DebounceEventResult, notify::RecursiveMode};
+
+        let watch_target = settings_path.clone();
+        let mut debouncer = match new_debouncer(Duration::from_millis(300), move |res: DebounceEventResult| {
+            let Ok(events) = res else { return };
+            if events.iter().any(|e| e.path == watch_target) {
+                on_change();
+            }
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("settings watcher failed to start: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = debouncer
+            .watcher()
+            .watch(&parent, RecursiveMode::NonRecursive)
+        {
+            tracing::warn!("settings watcher failed to watch {}: {e}", parent.display());
+            return;
+        }
+
+        tracing::info!("watching settings at {}", settings_path.display());
+        loop {
+            std::thread::park();
+        }
+    });
 }

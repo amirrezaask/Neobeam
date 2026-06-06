@@ -6,7 +6,7 @@ use wgpu::Queue;
 use crate::settings::Settings;
 
 const PANEL_W: f32 = 540.0;
-const PANEL_H: f32 = 782.0;
+const PANEL_H: f32 = 824.0;
 const PAD: f32 = 20.0;
 const ROW: f32 = 32.0;
 const LIST_H: f32 = 96.0;
@@ -41,6 +41,7 @@ enum Hit {
     FontItem(usize),
     FontSizeSlider,
     LineHeightSlider,
+    ScrollSensitivitySlider,
     AnimToggle,
     SmoothBlinkToggle,
     AnimLengthSlider,
@@ -58,6 +59,7 @@ enum Hit {
 enum Drag {
     FontSize,
     LineHeight,
+    ScrollSensitivity,
     AnimLength,
     CursorGlow,
     ScrollLength,
@@ -88,6 +90,8 @@ struct Layout {
     size_slider: [f32; 4],
     lh_label_y: f32,
     lh_slider: [f32; 4],
+    scroll_sensitivity_label_y: f32,
+    scroll_sensitivity_slider: [f32; 4],
     preview_label_y: f32,
     preview: [f32; 4],
     anim_section_y: f32,
@@ -197,6 +201,11 @@ impl SettingsUi {
             Some(Hit::LineHeightSlider) => {
                 self.drag = Some(Drag::LineHeight);
                 self.set_slider(Drag::LineHeight, x, &layout);
+                SettingsAction::Preview
+            }
+            Some(Hit::ScrollSensitivitySlider) => {
+                self.drag = Some(Drag::ScrollSensitivity);
+                self.set_slider(Drag::ScrollSensitivity, x, &layout);
                 SettingsAction::Preview
             }
             Some(Hit::AnimToggle) => {
@@ -346,6 +355,25 @@ impl SettingsUi {
             2.0,
             self.draft.line_height,
             self.hover == Some(Hit::LineHeightSlider) || self.drag == Some(Drag::LineHeight),
+        );
+
+        p.label(
+            PAD + layout.ox,
+            layout.scroll_sensitivity_label_y,
+            &format!(
+                "Mouse scroll sensitivity: {:.0}%",
+                self.draft.mouse_scroll_sensitivity * 100.0
+            ),
+            TEXT_DIM,
+        );
+        self.draw_slider(
+            &mut p,
+            layout.scroll_sensitivity_slider,
+            0.05,
+            1.0,
+            self.draft.mouse_scroll_sensitivity,
+            self.hover == Some(Hit::ScrollSensitivitySlider)
+                || self.drag == Some(Drag::ScrollSensitivity),
         );
 
         p.label(PAD + layout.ox, layout.preview_label_y, "Preview", TEXT_DIM);
@@ -631,6 +659,9 @@ impl SettingsUi {
         if in_rect(x, y, layout.lh_slider) {
             return Some(Hit::LineHeightSlider);
         }
+        if in_rect(x, y, layout.scroll_sensitivity_slider) {
+            return Some(Hit::ScrollSensitivitySlider);
+        }
         if in_rect(x, y, layout.anim_toggle) {
             return Some(Hit::AnimToggle);
         }
@@ -686,6 +717,7 @@ impl SettingsUi {
         let (track, min, max, round) = match drag {
             Drag::FontSize => (layout.size_slider, 10.0_f32, 32.0, true),
             Drag::LineHeight => (layout.lh_slider, 1.0, 2.0, false),
+            Drag::ScrollSensitivity => (layout.scroll_sensitivity_slider, 0.05, 1.0, false),
             Drag::AnimLength => (layout.anim_length_slider, 0.0, 0.35, false),
             Drag::CursorGlow => (layout.cursor_glow_slider, 0.0, 2.0, false),
             Drag::ScrollLength => (layout.scroll_length_slider, 0.0, 0.5, false),
@@ -697,6 +729,9 @@ impl SettingsUi {
         match drag {
             Drag::FontSize => self.draft.font_size = if round { v.round() } else { v },
             Drag::LineHeight => self.draft.line_height = (v * 100.0).round() / 100.0,
+            Drag::ScrollSensitivity => {
+                self.draft.mouse_scroll_sensitivity = (v * 100.0).round() / 100.0;
+            }
             Drag::AnimLength => {
                 self.draft.animation_length = (v * 100.0).round() / 100.0;
             }
@@ -748,6 +783,10 @@ fn layout(lw: f32, lh: f32) -> Layout {
     y += 18.0;
     let lh_slider = [ox + PAD, y, content_w, SLIDER_H];
     y += 24.0;
+    let scroll_sensitivity_label_y = y;
+    y += 18.0;
+    let scroll_sensitivity_slider = [ox + PAD, y, content_w, SLIDER_H];
+    y += 24.0;
     let preview_label_y = y;
     y += 18.0;
     let preview = [ox + PAD, y, content_w, 32.0];
@@ -793,6 +832,8 @@ fn layout(lw: f32, lh: f32) -> Layout {
         size_slider,
         lh_label_y,
         lh_slider,
+        scroll_sensitivity_label_y,
+        scroll_sensitivity_slider,
         preview_label_y,
         preview,
         anim_section_y,
