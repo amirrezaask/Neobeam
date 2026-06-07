@@ -147,37 +147,31 @@ impl MenuBar {
     fn draw_font_section(&mut self, ui: &Ui, settings: &mut Settings) -> bool {
         let mut changed = false;
 
-        let is_default = settings.font_family.is_none();
-        if ui
-            .menu_item_config("System default")
-            .selected(is_default)
-            .build()
-            && !is_default
-        {
-            settings.font_family = None;
-            changed = true;
-        }
-
+        let mut font_labels: Vec<&str> = Vec::with_capacity(self.fonts.len() + 1);
+        font_labels.push("System default");
         for name in &self.fonts {
-            let selected = settings.font_family.as_deref() == Some(name.as_str());
-            if ui.menu_item_config(name).selected(selected).build() && !selected {
-                settings.font_family = Some(name.clone());
-                changed = true;
-            }
+            font_labels.push(name);
         }
 
-        ui.separator();
+        let mut font_idx = match &settings.font_family {
+            None => 0,
+            Some(name) => self
+                .fonts
+                .iter()
+                .position(|f| f == name)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+        };
 
-        if ui.menu_item("Increase Font Size") {
-            settings.font_size = (settings.font_size + 1.0).min(32.0);
+        ui.set_next_item_width(-1.0);
+        if ui.combo_simple_string("Font", &mut font_idx, &font_labels) {
+            settings.font_family = if font_idx == 0 {
+                None
+            } else {
+                Some(self.fonts[font_idx - 1].clone())
+            };
             changed = true;
         }
-        if ui.menu_item("Decrease Font Size") {
-            settings.font_size = (settings.font_size - 1.0).max(10.0);
-            changed = true;
-        }
-
-        ui.separator();
 
         let mut font_size = settings.font_size;
         if ui.slider("Size (px)", 10.0, 32.0, &mut font_size) {
@@ -214,14 +208,25 @@ impl MenuBar {
             self.colorschemes_loaded = true;
         }
 
-        let mut selected = None;
-        for name in &self.colorschemes {
-            let is_selected = self.selected_theme.as_deref() == Some(name.as_str());
-            if ui.menu_item_config(name).selected(is_selected).build() && !is_selected {
-                selected = Some(name.clone());
+        if self.colorschemes.is_empty() {
+            ui.text_disabled("No colorschemes available");
+            return None;
+        }
+
+        let mut theme_idx = self
+            .selected_theme
+            .as_ref()
+            .and_then(|name| self.colorschemes.iter().position(|s| s == name))
+            .unwrap_or(0);
+
+        ui.set_next_item_width(-1.0);
+        if ui.combo_simple_string("Theme", &mut theme_idx, &self.colorschemes) {
+            let name = self.colorschemes[theme_idx].clone();
+            if self.selected_theme.as_deref() != Some(name.as_str()) {
+                return Some(name);
             }
         }
-        selected
+        None
     }
 
     fn draw_animations_menu(&mut self, ui: &Ui, settings: &mut Settings) -> bool {
