@@ -61,6 +61,29 @@ pub fn unstage_file(repo: &Path, path: &str) -> Result<(), String> {
     git_file_op(repo, &["restore", "--staged", "--", path], "unstage file")
 }
 
+/// Commit all staged changes with the given message.
+pub fn commit_staged(repo: &Path, message: &str) -> Result<(), String> {
+    let repo_str = repo
+        .to_str()
+        .ok_or_else(|| "invalid repository path".to_string())?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_str)
+        .args(["commit", "-m", message])
+        .output()
+        .map_err(|e| format!("failed to commit: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "git commit failed".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
 /// Apply a unified-diff hunk to the index (`git apply --cached`).
 pub fn stage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
     git_apply(

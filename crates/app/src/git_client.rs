@@ -8,12 +8,13 @@ use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 
 use crate::git_diff::{
-    expand_tilde, fetch_head_vs_worktree, hunk_is_staged, list_changed_files, repo_root,
-    restore_hunk_worktree, stage_file, stage_hunk, unstage_file, unstage_hunk, ChangedFile,
-    FileContent,
+    commit_staged, expand_tilde, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
+    repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file, unstage_hunk,
+    ChangedFile, FileContent,
 };
 
 const MAX_DIFF_LINES: usize = 2000;
+const COMMIT_AREA_HEIGHT: f32 = 88.0;
 
 #[derive(Clone, Debug)]
 pub struct DiffSegment {
@@ -99,6 +100,7 @@ pub struct GitClient {
     sidebar_width: f32,
     view_mode: ViewMode,
     files: Vec<ChangedFile>,
+    commit_message: String,
     selected: Option<SelectedEntry>,
     cached_diff: Option<CachedDiff>,
     error: Option<String>,
@@ -117,6 +119,7 @@ impl GitClient {
             sidebar_width: 220.0,
             view_mode: ViewMode::default(),
             files: Vec::new(),
+            commit_message: String::new(),
             selected: None,
             cached_diff: None,
             error: None,
@@ -261,13 +264,60 @@ impl GitClient {
     }
 
     fn draw_file_sidebar(&mut self, ui: &Ui) {
-        let files = self.files.clone();
-        if files.is_empty() {
-            ui.text_disabled("No changes.");
+        let avail = ui.content_region_avail();
+        let list_h = (avail[1] - COMMIT_AREA_HEIGHT).max(40.0);
+
+        ui.child_window("##file_list_scroll")
+            .size([avail[0], list_h])
+            .border(false)
+            .build(|| {
+                let files = self.files.clone();
+                if files.is_empty() {
+                    ui.text_disabled("No changes.");
+                } else {
+                    for file in &files {
+                        self.draw_file_entry(ui, file);
+                    }
+                }
+            });
+
+        ui.separator();
+        self.draw_commit_area(ui);
+    }
+
+    fn draw_commit_area(&mut self, ui: &Ui) {
+        let width = ui.content_region_avail()[0];
+        let msg_h = 52.0;
+
+        ui.input_text_multiline("##commit_msg", &mut self.commit_message, [width, msg_h])
+            .build();
+
+        let has_staged = self.files.iter().any(|f| f.staged);
+        let can_commit = has_staged && !self.commit_message.trim().is_empty();
+
+        if ui.button("Commit") && can_commit {
+            self.commit_staged_changes();
+        }
+    }
+
+    fn commit_staged_changes(&mut self) {
+        let Some(repo) = self.repo_root.clone() else {
+            return;
+        };
+        let message = self.commit_message.trim().to_string();
+        if message.is_empty() {
             return;
         }
-        for file in &files {
-            self.draw_file_entry(ui, file);
+        match commit_staged(&repo, &message) {
+            Ok(()) => {
+                self.error = None;
+                self.commit_message.clear();
+                self.cached_diff = None;
+                self.generation = self.generation.wrapping_add(1);
+                self.refresh_files();
+                self.last_file_refresh = std::time::Instant::now();
+            }
+            Err(e) => self.error = Some(e),
         }
     }
 
