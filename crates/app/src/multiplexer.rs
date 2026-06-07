@@ -1,6 +1,6 @@
 //! In-app tiling window manager: splits, draggable title bars, drop previews.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use editor_surface::Spring;
 use imgui::{DrawListMut, Ui};
@@ -116,11 +116,14 @@ pub struct TilingManager {
     pub focused: WinId,
     preview_alpha: f32,
     last_removed: Vec<WinId>,
+    hidden: HashSet<WinId>,
 }
 
 const LAYOUT_ANIM_LEN: f32 = 0.25;
 const FULLSCREEN_BTN_SIZE: f32 = 18.0;
 const FULLSCREEN_BTN_MARGIN: f32 = 6.0;
+const CLOSE_BTN_SIZE: f32 = 18.0;
+const TITLE_BAR_BTN_GAP: f32 = 4.0;
 
 impl TilingManager {
     pub fn new(title_bar_h: f32) -> Self {
@@ -140,7 +143,34 @@ impl TilingManager {
             focused: id,
             preview_alpha: 0.0,
             last_removed: Vec::new(),
+            hidden: HashSet::new(),
         }
+    }
+
+    pub fn is_hidden(&self, id: WinId) -> bool {
+        self.hidden.contains(&id)
+    }
+
+    pub fn is_visible(&self, id: WinId) -> bool {
+        self.windows.iter().any(|w| w.id == id) && !self.is_hidden(id)
+    }
+
+    pub fn find_hidden_by_view(&self, view: ViewKind) -> Option<WinId> {
+        self.windows
+            .iter()
+            .find(|w| w.view == view && self.is_hidden(w.id))
+            .map(|w| w.id)
+    }
+
+    pub fn visible_window_count(&self) -> usize {
+        self.windows.iter().filter(|w| self.is_visible(w.id)).count()
+    }
+
+    pub fn can_close(&self, win_id: WinId) -> bool {
+        self.windows
+            .iter()
+            .find(|w| w.id == win_id)
+            .is_some_and(|w| w.view != ViewKind::Editor && self.is_visible(win_id))
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -150,7 +180,8 @@ impl TilingManager {
     pub fn focused_view(&self) -> ViewKind {
         self.windows
             .iter()
-            .find(|w| w.id == self.focused)
+            .find(|w| w.id == self.focused && self.is_visible(w.id))
+            .or_else(|| self.windows.iter().find(|w| self.is_visible(w.id)))
             .map(|w| w.view)
             .unwrap_or(ViewKind::Editor)
     }
@@ -162,22 +193,98 @@ impl TilingManager {
     pub fn editor_win(&self) -> Option<WinId> {
         self.windows
             .iter()
-            .find(|w| w.view == ViewKind::Editor)
+            .find(|w| w.view == ViewKind::Editor && self.is_visible(w.id))
             .map(|w| w.id)
     }
 
     pub fn set_focus(&mut self, id: WinId) {
-        if self.windows.iter().any(|w| w.id == id) {
+        if self.is_visible(id) {
             self.focused = id;
         }
     }
 
     pub fn open_or_focus(&mut self, view: ViewKind, area: Rect) {
-        if let Some(w) = self.windows.iter().find(|w| w.view == view) {
+        if let Some(w) = self
+            .windows
+            .iter()
+            .find(|w| w.view == view && self.is_visible(w.id))
+        {
             self.focused = w.id;
             return;
         }
+        if let Some(w) = self
+            .windows
+            .iter()
+            .find(|w| w.view == view && self.is_hidden(w.id))
+        {
+            self.show_window(w.id, area);
+            return;
+        }
         self.add_window(view, area);
+    }
+
+    pub fn hide_window(&mut self, win_id: WinId, area: Rect) {
+        if !self.can_close(win_id) {
+            return;
+        }
+
+        let old_rects = self.compute_rects(area);
+        if remove_leaf(&mut self.root, win_id).is_none() {
+            return;
+        }
+
+        self.hidden.insert(win_id);
+        self.drag = None;
+        self.drop_preview = None;
+
+        if !self.is_visible(self.focused) {
+            if let Some(w) = self.windows.iter().find(|w| self.is_visible(w.id)) {
+                self.focused = w.id;
+            }
+        }
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+        self.preview_alpha = 0.0;
+    }
+
+    pub fn show_window(&mut self, win_id: WinId, area: Rect) {
+        if !self.windows.iter().any(|w| w.id == win_id) {
+            return;
+        }
+        if self.is_visible(win_id) {
+            self.focused = win_id;
+            return;
+        }
+
+        let old_rects = self.compute_rects(area);
+        self.hidden.remove(&win_id);
+
+        match &self.root {
+            LayoutNode::Leaf(existing) => {
+                let existing_id = *existing;
+                self.root = LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    first: Box::new(LayoutNode::Leaf(existing_id)),
+                    second: Box::new(LayoutNode::Leaf(win_id)),
+                    ratio: 0.5,
+                };
+            }
+            LayoutNode::Split { .. } => {
+                let anchor = self.visible_anchor();
+                insert_at_target(
+                    &mut self.root,
+                    anchor,
+                    LayoutNode::Leaf(win_id),
+                    SplitDir::Horizontal,
+                    false,
+                );
+            }
+        }
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+        self.focused = win_id;
     }
 
     pub fn add_view_window(&mut self, view: ViewKind, area: Rect) -> WinId {
@@ -216,8 +323,8 @@ impl TilingManager {
                 };
             }
             LayoutNode::Split { .. } => {
-                let focused = self.focused;
-                self.insert_split_at(focused, id, SplitDir::Horizontal, false);
+                let anchor = self.visible_anchor();
+                self.insert_split_at(anchor, id, SplitDir::Horizontal, false);
             }
         }
 
@@ -441,7 +548,7 @@ impl TilingManager {
     }
 
     pub fn can_fullscreen(&self) -> bool {
-        self.windows.len() > 1
+        self.visible_window_count() > 1
     }
 
     pub fn fullscreen(&mut self, win_id: WinId, area: Rect) {
@@ -462,6 +569,7 @@ impl TilingManager {
             .collect();
 
         self.windows.retain(|w| w.id == win_id);
+        self.hidden.retain(|id| *id == win_id);
         self.root = LayoutNode::Leaf(win_id);
         self.focused = win_id;
         self.drag = None;
@@ -473,6 +581,25 @@ impl TilingManager {
         self.preview_alpha = 0.0;
     }
 
+    pub fn hit_close_button(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+    ) -> Option<WinId> {
+        let (cx, cy) = cursor;
+        for win in self.visible_windows().rev() {
+            let tb = self.title_bar_rect(self.visual_rect(win.id, rects));
+            if !self.can_close(win.id) {
+                continue;
+            }
+            let btn = close_button_rect(tb, self.can_fullscreen());
+            if btn.contains(cx, cy) {
+                return Some(win.id);
+            }
+        }
+        None
+    }
+
     pub fn hit_fullscreen_button(
         &self,
         cursor: (f32, f32),
@@ -482,7 +609,7 @@ impl TilingManager {
             return None;
         }
         let (cx, cy) = cursor;
-        for win in self.windows.iter().rev() {
+        for win in self.visible_windows().rev() {
             let tb = self.title_bar_rect(self.visual_rect(win.id, rects));
             let btn = fullscreen_button_rect(tb);
             if btn.contains(cx, cy) {
@@ -498,11 +625,18 @@ impl TilingManager {
         rects: &HashMap<WinId, Rect>,
     ) -> Option<WinId> {
         let (cx, cy) = cursor;
-        for win in self.windows.iter().rev() {
+        let show_fullscreen = self.can_fullscreen();
+        for win in self.visible_windows().rev() {
             let r = self.visual_rect(win.id, rects);
             let tb = self.title_bar_rect(r);
-            if self.can_fullscreen() {
+            if show_fullscreen {
                 let btn = fullscreen_button_rect(tb);
+                if btn.contains(cx, cy) {
+                    continue;
+                }
+            }
+            if self.can_close(win.id) {
+                let btn = close_button_rect(tb, show_fullscreen);
                 if btn.contains(cx, cy) {
                     continue;
                 }
@@ -520,7 +654,7 @@ impl TilingManager {
         rects: &HashMap<WinId, Rect>,
     ) -> Option<WinId> {
         let (cx, cy) = cursor;
-        for win in self.windows.iter().rev() {
+        for win in self.visible_windows().rev() {
             let r = self.content_rect(self.visual_rect(win.id, rects));
             if r.contains(cx, cy) {
                 return Some(win.id);
@@ -544,7 +678,7 @@ impl TilingManager {
         drag_id: WinId,
     ) -> Option<(WinId, DropZone)> {
         let (cx, cy) = cursor;
-        for win in &self.windows {
+        for win in self.visible_windows() {
             if win.id == drag_id {
                 continue;
             }
@@ -560,7 +694,8 @@ impl TilingManager {
     pub fn draw_chrome(&self, ui: &Ui, rects: &HashMap<WinId, Rect>) {
         let draw = ui.get_background_draw_list();
 
-        for win in &self.windows {
+        let show_fullscreen = self.can_fullscreen();
+        for win in self.visible_windows() {
             let visual = self.visual_rect(win.id, rects);
             let tb = self.title_bar_rect(visual);
             let focused = win.id == self.focused;
@@ -570,7 +705,8 @@ impl TilingManager {
                 &win.title,
                 focused,
                 self.is_dragging(),
-                self.can_fullscreen(),
+                self.can_close(win.id),
+                show_fullscreen,
             );
         }
 
@@ -610,6 +746,22 @@ impl TilingManager {
             self.windows[ib].title = self.windows[ia].title.clone();
             self.windows[ia].view = view_b;
             self.windows[ia].title = title_b;
+        }
+    }
+
+    fn visible_windows(&self) -> impl DoubleEndedIterator<Item = &TilingWindow> {
+        self.windows.iter().filter(|w| self.is_visible(w.id))
+    }
+
+    fn visible_anchor(&self) -> WinId {
+        if self.is_visible(self.focused) {
+            self.focused
+        } else {
+            self.windows
+                .iter()
+                .find(|w| self.is_visible(w.id))
+                .map(|w| w.id)
+                .unwrap_or(self.focused)
         }
     }
 
@@ -741,12 +893,27 @@ fn fullscreen_button_rect(title_bar: Rect) -> Rect {
     }
 }
 
+fn close_button_rect(title_bar: Rect, show_fullscreen: bool) -> Rect {
+    let size = CLOSE_BTN_SIZE.min(title_bar.h - 4.0);
+    let mut right = title_bar.x + title_bar.w - FULLSCREEN_BTN_MARGIN;
+    if show_fullscreen {
+        right -= FULLSCREEN_BTN_SIZE + TITLE_BAR_BTN_GAP;
+    }
+    Rect {
+        x: right - size,
+        y: title_bar.y + (title_bar.h - size) * 0.5,
+        w: size,
+        h: size,
+    }
+}
+
 fn draw_title_bar(
     draw: &DrawListMut<'_>,
     rect: Rect,
     title: &str,
     focused: bool,
     dragging: bool,
+    show_close: bool,
     show_fullscreen: bool,
 ) {
     let bg = if dragging {
@@ -779,9 +946,35 @@ fn draw_title_bar(
     let text_y = rect.y + (rect.h - 14.0) * 0.5;
     draw.add_text([text_x, text_y], text_color, title);
 
+    if show_close {
+        draw_close_button(draw, close_button_rect(rect, show_fullscreen), focused);
+    }
     if show_fullscreen {
         draw_fullscreen_button(draw, fullscreen_button_rect(rect), focused);
     }
+}
+
+fn draw_close_button(draw: &DrawListMut<'_>, btn: Rect, focused: bool) {
+    let hover_bg = [0.32, 0.18, 0.18, 1.0];
+    let icon_color = if focused {
+        [0.92, 0.55, 0.55, 1.0]
+    } else {
+        [0.62, 0.45, 0.45, 1.0]
+    };
+    draw.add_rect([btn.x, btn.y], [btn.x + btn.w, btn.y + btn.h], hover_bg)
+        .filled(true)
+        .rounding(3.0)
+        .build();
+
+    let cx = btn.x + btn.w * 0.5;
+    let cy = btn.y + btn.h * 0.5;
+    let half = btn.w * 0.18;
+    draw.add_line([cx - half, cy - half], [cx + half, cy + half], icon_color)
+        .thickness(1.5)
+        .build();
+    draw.add_line([cx + half, cy - half], [cx - half, cy + half], icon_color)
+        .thickness(1.5)
+        .build();
 }
 
 fn draw_fullscreen_button(draw: &DrawListMut<'_>, btn: Rect, focused: bool) {
@@ -870,6 +1063,54 @@ mod tests {
         assert_eq!(mgr.windows.len(), 2);
         let rects = mgr.compute_rects(area);
         assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn hide_window_preserves_entry() {
+        let mut mgr = TilingManager::new(28.0);
+        let area = Rect {
+            x: 0.0,
+            y: 32.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        mgr.add_window(ViewKind::GitClient, area);
+        let git_id = mgr
+            .windows
+            .iter()
+            .find(|w| w.view == ViewKind::GitClient)
+            .map(|w| w.id)
+            .unwrap();
+
+        mgr.hide_window(git_id, area);
+
+        assert!(mgr.is_hidden(git_id));
+        assert_eq!(mgr.windows.len(), 2);
+        assert_eq!(mgr.visible_window_count(), 1);
+        assert!(mgr.editor_win().is_some());
+    }
+
+    #[test]
+    fn show_window_restores_hidden() {
+        let mut mgr = TilingManager::new(28.0);
+        let area = Rect {
+            x: 0.0,
+            y: 32.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        mgr.add_window(ViewKind::GitClient, area);
+        let git_id = mgr
+            .windows
+            .iter()
+            .find(|w| w.view == ViewKind::GitClient)
+            .map(|w| w.id)
+            .unwrap();
+        mgr.hide_window(git_id, area);
+        mgr.show_window(git_id, area);
+
+        assert!(!mgr.is_hidden(git_id));
+        assert_eq!(mgr.visible_window_count(), 2);
     }
 
     #[test]

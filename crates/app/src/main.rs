@@ -277,16 +277,34 @@ impl App {
         };
         let area = editor_area(&self.settings, &state.renderer);
         if let Some((items, query)) = pin_file {
-            let panel = FileListPanel::new(items, query);
-            let win_id = self.tiling.add_view_window(ViewKind::FileList, area);
-            self.file_list_panels.push((win_id, panel));
+            if let Some(win_id) = self.tiling.find_hidden_by_view(ViewKind::FileList) {
+                self.tiling.show_window(win_id, area);
+                if let Some((_, panel)) =
+                    self.file_list_panels.iter_mut().find(|(id, _)| *id == win_id)
+                {
+                    panel.reload(items, query);
+                }
+            } else {
+                let panel = FileListPanel::new(items, query);
+                let win_id = self.tiling.add_view_window(ViewKind::FileList, area);
+                self.file_list_panels.push((win_id, panel));
+            }
             state.recompute_grid(&self.settings, &self.tiling);
             state.window.request_redraw();
         }
         if let Some((results, query, project_root)) = pin_grep {
-            let panel = GrepResultsPanel::new(results, query, project_root);
-            let win_id = self.tiling.add_view_window(ViewKind::GrepResults, area);
-            self.grep_result_panels.push((win_id, panel));
+            if let Some(win_id) = self.tiling.find_hidden_by_view(ViewKind::GrepResults) {
+                self.tiling.show_window(win_id, area);
+                if let Some((_, panel)) =
+                    self.grep_result_panels.iter_mut().find(|(id, _)| *id == win_id)
+                {
+                    panel.reload(results, query, project_root);
+                }
+            } else {
+                let panel = GrepResultsPanel::new(results, query, project_root);
+                let win_id = self.tiling.add_view_window(ViewKind::GrepResults, area);
+                self.grep_result_panels.push((win_id, panel));
+            }
             state.recompute_grid(&self.settings, &self.tiling);
             state.window.request_redraw();
         }
@@ -633,7 +651,7 @@ impl State {
         let git_windows: Vec<WinId> = tiling
             .windows
             .iter()
-            .filter(|w| w.view == ViewKind::GitClient)
+            .filter(|w| w.view == ViewKind::GitClient && tiling.is_visible(w.id))
             .map(|w| w.id)
             .collect();
         if let Err(e) = self.imgui.prepare_ui(
@@ -651,6 +669,9 @@ impl State {
                     git_wants_redraw |= git_client.draw(ui, *win_id, content);
                 }
                 for (win_id, panel) in file_list_panels.iter_mut() {
+                    if !tiling.is_visible(*win_id) {
+                        continue;
+                    }
                     let visual = tiling.visual_rect(*win_id, &window_rects);
                     let content = tiling.content_rect(visual);
                     if let Some(path) = panel.draw(ui, *win_id, content, dt) {
@@ -658,6 +679,9 @@ impl State {
                     }
                 }
                 for (win_id, panel) in grep_result_panels.iter_mut() {
+                    if !tiling.is_visible(*win_id) {
+                        continue;
+                    }
                     let visual = tiling.visual_rect(*win_id, &window_rects);
                     let content = tiling.content_rect(visual);
                     if let Some(m) = panel.draw(ui, *win_id, content) {
@@ -1168,6 +1192,13 @@ impl ApplicationHandler<UserEvent> for App {
                     let cursor = cursor_logical(state);
                     match btn_state {
                         ElementState::Pressed => {
+                            if let Some(win_id) = self.tiling.hit_close_button(cursor, &rects)
+                            {
+                                self.tiling.hide_window(win_id, area);
+                                state.recompute_grid(&self.settings, &self.tiling);
+                                state.window.request_redraw();
+                                return;
+                            }
                             if let Some(win_id) =
                                 self.tiling.hit_fullscreen_button(cursor, &rects)
                             {

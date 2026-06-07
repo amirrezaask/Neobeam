@@ -19,6 +19,10 @@ impl FileListPanel {
         Self { picker }
     }
 
+    pub fn reload(&mut self, items: Vec<(String, PathBuf)>, query: String) {
+        self.picker.load_pinned(items, query);
+    }
+
     pub fn draw(
         &mut self,
         ui: &Ui,
@@ -52,6 +56,20 @@ impl GrepResultsPanel {
         };
         panel.rebuild_filtered();
         panel
+    }
+
+    pub fn reload(
+        &mut self,
+        results: Vec<GrepMatch>,
+        query: String,
+        project_root: PathBuf,
+    ) {
+        self.results = results;
+        self.query = query;
+        self.project_root = project_root;
+        self.selected = 0;
+        self.scroll_anchor = None;
+        self.rebuild_filtered();
     }
 
     pub fn draw(&mut self, ui: &Ui, win_id: WinId, content_rect: Rect) -> Option<GrepMatch> {
