@@ -104,6 +104,7 @@ impl FrameBuilder {
         atlas: &mut GlyphAtlas,
         queue: &wgpu::Queue,
         float_cache: &FloatCache,
+        hide_cursor: bool,
     ) -> DrawLists {
         // `guibg=NONE` keeps the editor background transparent so the colorscheme
         // can show the desktop through; otherwise the background is fully opaque.
@@ -122,7 +123,7 @@ impl FrameBuilder {
         let thickness = (atlas.size_px / 12.0).max(1.0);
 
         let block_cursor = matches!(store.cursor_shape(), CursorShape::Block);
-        let cursor_visible = anim.cursor_visible() && !store.busy;
+        let cursor_visible = !hide_cursor && anim.cursor_visible() && !store.busy;
         let skip_cell = if block_cursor && cursor_visible {
             Some((store.cursor.grid, store.cursor.row, store.cursor.col))
         } else {

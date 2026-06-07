@@ -292,6 +292,19 @@ impl App {
         state.recompute_grid(&self.settings);
     }
 
+    fn adjust_font_size(&mut self, delta: f32) {
+        let new_size = (self.settings.font_size + delta).clamp(10.0, 32.0);
+        if new_size == self.settings.font_size {
+            return;
+        }
+        self.settings.font_size = new_size;
+        self.settings.save();
+        self.apply_font_and_zoom();
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
     fn handle_menu_action(&mut self, action: MenuBarAction) {
         match action {
             MenuBarAction::None => {}
@@ -458,11 +471,13 @@ impl State {
         let anim = &mut self.anim;
         let imgui = &mut self.imgui;
         let renderer = &mut self.renderer;
+        let hide_cursor = current_page == AppPage::GitClient;
         if let Err(e) = renderer.render(
             store,
             anim,
             overlay.as_deref(),
             layout.editor_y,
+            hide_cursor,
             |device, queue, pass| {
                 if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
                     tracing::warn!("imgui draw failed: {e:#}");
@@ -473,7 +488,7 @@ impl State {
         }
         self.frame_count += 1;
         let needs_anim = self.anim.is_animating()
-            || self.anim.is_blinking(&self.store)
+            || (!hide_cursor && self.anim.is_blinking(&self.store))
             || self.anim.render_deadline().is_some();
         if self.context_menu.open
             || project_picker.is_open()
@@ -718,12 +733,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if page == AppPage::GitClient {
-                    return;
-                }
                 let pressed = event.state == ElementState::Pressed;
                 let ime_active = self.state.as_ref().is_some_and(|s| s.ime_active);
                 if !pressed || ime_active {
+                    return;
+                }
+
+                if self.state.as_ref().is_some_and(|s| {
+                    is_font_increase_shortcut(&event.logical_key, s.mods)
+                }) {
+                    self.adjust_font_size(1.0);
+                    return;
+                }
+                if self.state.as_ref().is_some_and(|s| {
+                    is_font_decrease_shortcut(&event.logical_key, s.mods)
+                }) {
+                    self.adjust_font_size(-1.0);
+                    return;
+                }
+
+                if page == AppPage::GitClient {
                     return;
                 }
 
@@ -966,7 +995,7 @@ impl ApplicationHandler<UserEvent> for App {
             || (page == AppPage::Editor
                 && imgui_captures_input(state, &self.settings, page, picker_open))
             || state.anim.is_animating()
-            || state.anim.is_blinking(&state.store);
+            || (page == AppPage::Editor && state.anim.is_blinking(&state.store));
 
         if needs_continuous {
             state.window.request_redraw();
@@ -977,6 +1006,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
+}
+
+fn is_font_increase_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.ctrl {
+        return false;
+    }
+    mods.meta && matches!(key, Key::Character(c) if c == "=" || c == "+")
+}
+
+fn is_font_decrease_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.shift {
+        return false;
+    }
+    mods.meta && matches!(key, Key::Character(c) if c == "-")
 }
 
 fn is_paste_shortcut(key: &Key, mods: Mods) -> bool {

@@ -423,6 +423,7 @@ impl Renderer {
         anim: &mut AnimationState,
         overlay: Option<&str>,
         content_offset_y: f32,
+        hide_cursor: bool,
         mut ui_cb: impl FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) -> Result<()> {
         let shake = anim.shake_offset();
@@ -441,6 +442,7 @@ impl Renderer {
             &mut self.atlas,
             &self.queue,
             &self.float_cache,
+            hide_cursor,
         );
         for id in anim.fading_out_float_ids() {
             if anim.float_opacity(id) <= 0.01 {
