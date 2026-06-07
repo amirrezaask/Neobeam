@@ -159,10 +159,37 @@ pub struct ViewportState {
     pub scroll_delta: i64,
 }
 
+/// Non-scrollable chrome rows/cols on a window grid (winbar, float borders, …).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewportMargins {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
+impl ViewportMargins {
+    /// Clamp margins so at least one content row remains.
+    pub fn clamp_for_height(self, height: u32) -> Self {
+        if height == 0 {
+            return ViewportMargins::default();
+        }
+        let top = self.top.min(height.saturating_sub(1));
+        let bottom = self.bottom.min(height.saturating_sub(top).saturating_sub(1));
+        ViewportMargins {
+            top,
+            bottom,
+            left: self.left,
+            right: self.right,
+        }
+    }
+}
+
 pub struct GridStateStore {
     pub grids: HashMap<i64, Grid>,
     pub windows: HashMap<i64, WindowMeta>,
     viewports: HashMap<i64, ViewportState>,
+    viewport_margins: HashMap<i64, ViewportMargins>,
     pub default_colors: DefaultColors,
     pub highlights: HashMap<u32, HlAttr>,
     pub cursor: Cursor,
@@ -187,6 +214,7 @@ impl GridStateStore {
             grids: HashMap::new(),
             windows: HashMap::new(),
             viewports: HashMap::new(),
+            viewport_margins: HashMap::new(),
             default_colors: DefaultColors::default(),
             highlights: HashMap::new(),
             cursor: Cursor::default(),
@@ -206,6 +234,15 @@ impl GridStateStore {
 
     pub fn window(&self, id: i64) -> Option<&WindowMeta> {
         self.windows.get(&id)
+    }
+
+    pub fn viewport_margins(&self, grid_id: i64) -> ViewportMargins {
+        let height = self.grids.get(&grid_id).map(|g| g.height).unwrap_or(0);
+        self.viewport_margins
+            .get(&grid_id)
+            .copied()
+            .unwrap_or_default()
+            .clamp_for_height(height)
     }
 
     pub fn primary(&self) -> Option<&Grid> {
@@ -261,9 +298,11 @@ impl GridStateStore {
             UiEvent::GridDestroy { grid } => {
                 self.grids.remove(&grid);
                 self.windows.remove(&grid);
+                self.viewport_margins.remove(&grid);
             }
             UiEvent::WinClose { grid } | UiEvent::WinHide { grid } => {
                 self.windows.remove(&grid);
+                self.viewport_margins.remove(&grid);
             }
             UiEvent::WinPos { grid, row, col, width, height } => {
                 self.windows.insert(
@@ -344,6 +383,20 @@ impl GridStateStore {
                 self.mode_idx = mode_idx;
             }
             UiEvent::Busy(b) => self.busy = b,
+            UiEvent::WinViewportMargins { grid, top, bottom, left, right } => {
+                let target = if self.grids.contains_key(&grid) { grid } else { 1 };
+                let height = self.grids.get(&target).map(|g| g.height).unwrap_or(0);
+                self.viewport_margins.insert(
+                    target,
+                    ViewportMargins {
+                        top,
+                        bottom,
+                        left,
+                        right,
+                    }
+                    .clamp_for_height(height),
+                );
+            }
             UiEvent::WinViewport {
                 grid,
                 topline,

@@ -186,6 +186,17 @@ impl App {
         })
     }
 
+    /// Drop GPU/window state while the event loop is still running.
+    ///
+    /// macOS delivers window events after `exit()` if the `Window` outlives the
+    /// loop; winit then logs "no handler was set" (winit#3915).
+    fn teardown(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(mut state) = self.state.take() {
+            state.session.kill();
+        }
+        event_loop.exit();
+    }
+
     /// Coalesced async winbar refresh. Must not call nvim synchronously from
     /// the redraw hot path — that deadlocks when nvim is busy (e.g. fzf).
     fn schedule_winbar_refresh(&mut self) {
@@ -707,9 +718,14 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Exited => {
                 // nvim exited (e.g. `:q`); tear down and close the app.
                 tracing::info!("nvim exited; closing");
-                self.state = None;
-                event_loop.exit();
+                self.teardown(event_loop);
             }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(mut state) = self.state.take() {
+            state.session.kill();
         }
     }
 
@@ -734,11 +750,7 @@ impl ApplicationHandler<UserEvent> for App {
         let picker_open = self.project_picker.is_open();
         match event {
             WindowEvent::CloseRequested => {
-                let Some(state) = self.state.as_mut() else {
-                    return;
-                };
-                state.session.kill();
-                event_loop.exit();
+                self.teardown(event_loop);
             }
             WindowEvent::Resized(size) => {
                 let Some(state) = self.state.as_mut() else {

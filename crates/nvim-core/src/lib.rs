@@ -8,7 +8,10 @@ pub mod input;
 pub mod protocol;
 pub mod session;
 
-pub use grid::{resolve_float_position, Cell, Cursor, DefaultColors, Grid, GridStateStore, WindowMeta};
+pub use grid::{
+    resolve_float_position, Cell, Cursor, DefaultColors, Grid, GridStateStore, ViewportMargins,
+    WindowMeta,
+};
 pub use input::{encode_key, KeyInput, Mods, MouseAction, MouseButton, NamedKey};
 pub use protocol::{parse_redraw, CursorShape, HlAttr, ModeInfo, UiEvent};
 pub use session::{NvimSession, RedrawCallback, SessionConfig, WinbarInfo};

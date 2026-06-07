@@ -323,10 +323,149 @@ fn draw_grid(
         && anim.cfg.enable_smooth_scroll
         && win_state.is_some();
 
-    if use_scrollback {
+    let top_margin = win_state.map(|w| w.top_margin).unwrap_or(0);
+    let bottom_margin = win_state.map(|w| w.bottom_margin).unwrap_or(0);
+    let has_margins = top_margin + bottom_margin > 0;
+    let top_inset = top_margin as f32 * cell_h;
+    let bottom_inset = bottom_margin as f32 * cell_h;
+    let inner_h = grid
+        .height
+        .saturating_sub(top_margin + bottom_margin) as isize;
+
+    let inner_scissor = if opts.clip && has_margins {
+        Some(ScissorRect {
+            x: grid_x.max(0.0) as u32,
+            y: (grid_y + top_inset).max(0.0) as u32,
+            w: grid_w.max(0.0) as u32,
+            h: (grid_h - top_inset - bottom_inset).max(0.0) as u32,
+        })
+    } else {
+        scissor
+    };
+
+    if has_margins {
         if let Some(w) = win_state {
-            let inner_h = grid.height as isize;
-            for inner_row in 0..inner_h + 1 {
+            // ---- Pinned chrome rows (winbar / statusline / float borders) ----
+            for row in 0..top_margin {
+                if let Some(line) = w.border_line(row as usize) {
+                    draw_line(
+                        lists,
+                        store,
+                        grid_id,
+                        line,
+                        grid_x,
+                        grid_y + row as f32 * cell_h,
+                        cell_w,
+                        cell_h,
+                        thickness,
+                        opacity,
+                        skip_cell,
+                        row,
+                        cursor_glyph,
+                        atlas,
+                        queue,
+                    );
+                }
+            }
+            let bottom_start = grid.height.saturating_sub(bottom_margin);
+            for row in bottom_start..grid.height {
+                if let Some(line) = w.border_line(row as usize) {
+                    draw_line(
+                        lists,
+                        store,
+                        grid_id,
+                        line,
+                        grid_x,
+                        grid_y + row as f32 * cell_h,
+                        cell_w,
+                        cell_h,
+                        thickness,
+                        opacity,
+                        skip_cell,
+                        row,
+                        cursor_glyph,
+                        atlas,
+                        queue,
+                    );
+                }
+            }
+            // Chrome region: rects (incl. grid background) THEN glyphs.
+            push_rect_batch(lists, scissor, rect_start);
+            push_glyph_batch(lists, scissor, glyph_start);
+
+            // ---- Scrollable content (clipped to the inner region) ----
+            let content_rect_start = lists.rects.len();
+            let content_glyph_start = lists.glyphs.len();
+            if use_scrollback {
+                let scroll_offset_lines = w.scroll_animation.position.floor() as u32;
+                for inner_row in 0..inner_h + 1 {
+                    let Some(line) = w.line_at(inner_row) else { continue };
+                    let y = grid_y + top_inset + scroll_off + inner_row as f32 * cell_h;
+                    let inner_y0 = grid_y + top_inset;
+                    let inner_y1 = grid_y + grid_h - bottom_inset;
+                    if opts.clip && (y + cell_h <= inner_y0 || y >= inner_y1) {
+                        continue;
+                    }
+                    let grid_row = top_margin + scroll_offset_lines + inner_row as u32;
+                    draw_line(
+                        lists,
+                        store,
+                        grid_id,
+                        line,
+                        grid_x,
+                        y,
+                        cell_w,
+                        cell_h,
+                        thickness,
+                        opacity,
+                        skip_cell,
+                        grid_row,
+                        cursor_glyph,
+                        atlas,
+                        queue,
+                    );
+                }
+            } else {
+                for row in top_margin..bottom_start {
+                    let inner_row = row - top_margin;
+                    let y = grid_y + top_inset + inner_row as f32 * cell_h + scroll_off;
+                    for col in 0..grid.width {
+                        let cell = match grid.cell(row, col) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        draw_cell(
+                            lists,
+                            store,
+                            grid_id,
+                            row,
+                            col,
+                            cell,
+                            grid_x,
+                            y,
+                            cell_w,
+                            cell_h,
+                            thickness,
+                            opacity,
+                            opts.clip,
+                            grid_x,
+                            grid_y + top_inset,
+                            grid_w,
+                            grid_h - top_inset - bottom_inset,
+                            skip_cell,
+                            cursor_glyph,
+                            atlas,
+                            queue,
+                        );
+                    }
+                }
+            }
+            push_rect_batch(lists, inner_scissor, content_rect_start);
+            push_glyph_batch(lists, inner_scissor, content_glyph_start);
+        }
+    } else if use_scrollback {
+        if let Some(w) = win_state {
+            for inner_row in 0..grid.height as isize + 1 {
                 let Some(line) = w.line_at(inner_row) else { continue };
                 let y = grid_y + scroll_off + inner_row as f32 * cell_h;
                 if opts.clip && (y + cell_h <= grid_y || y >= grid_y + grid_h) {
@@ -351,6 +490,8 @@ fn draw_grid(
                 );
             }
         }
+        push_rect_batch(lists, scissor, rect_start);
+        push_glyph_batch(lists, scissor, glyph_start);
     } else {
         for row in 0..grid.height {
             for col in 0..grid.width {
@@ -383,10 +524,9 @@ fn draw_grid(
                 );
             }
         }
+        push_rect_batch(lists, scissor, rect_start);
+        push_glyph_batch(lists, scissor, glyph_start);
     }
-
-    push_rect_batch(lists, scissor, rect_start);
-    push_glyph_batch(lists, scissor, glyph_start);
 }
 
 fn draw_line(
