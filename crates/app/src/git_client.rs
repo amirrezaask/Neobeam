@@ -4,15 +4,16 @@ use std::path::PathBuf;
 
 use editor_surface::ChromeLayout;
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
-use similar::{ChangeTag, TextDiff};
+use similar::udiff::UnifiedDiffHunk;
+use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 
 use crate::git_diff::{
-    expand_tilde, fetch_file_content, list_changed_files, path_matches, repo_root, stage_file,
-    unstage_file, ChangedFile, DiffSide, FileContent,
+    expand_tilde, fetch_head_vs_worktree, hunk_is_staged, list_changed_files, repo_root,
+    restore_hunk_worktree, stage_file, stage_hunk, unstage_file, unstage_hunk, ChangedFile,
+    FileContent,
 };
 
 const MAX_DIFF_LINES: usize = 2000;
-const FILE_LIST_WIDTH: f32 = 220.0;
 
 #[derive(Clone, Debug)]
 pub struct DiffSegment {
@@ -30,9 +31,20 @@ pub struct DiffLine {
 }
 
 #[derive(Clone, Debug)]
+struct DiffHunkInfo {
+    index: usize,
+    start_line: usize,
+    end_line: usize,
+    header: String,
+    patch: String,
+    staged: bool,
+}
+
+#[derive(Clone, Debug)]
 struct DiffLines {
     lines: Vec<DiffLine>,
     hunk_starts: Vec<usize>,
+    hunks: Vec<DiffHunkInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,8 +56,8 @@ enum DiffContent {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ViewMode {
-    #[default]
     Inline,
+    #[default]
     SideBySide,
 }
 
@@ -74,23 +86,19 @@ impl ViewMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedEntry {
     path: String,
-    side: DiffSide,
 }
 
 struct CachedDiff {
     path: String,
-    side: DiffSide,
     generation: u64,
     content: DiffContent,
 }
 
+
 pub struct GitClient {
-    path_filter: String,
+    sidebar_width: f32,
     view_mode: ViewMode,
     files: Vec<ChangedFile>,
-    path_candidates: Vec<String>,
-    show_suggestions: bool,
-    suggestions_hovered: bool,
     selected: Option<SelectedEntry>,
     cached_diff: Option<CachedDiff>,
     error: Option<String>,
@@ -98,6 +106,7 @@ pub struct GitClient {
     generation: u64,
     cwd: String,
     filters_dirty: bool,
+    last_file_refresh: std::time::Instant,
     current_hunk: usize,
     scroll_to_hunk: Option<usize>,
 }
@@ -105,12 +114,9 @@ pub struct GitClient {
 impl GitClient {
     pub fn new() -> Self {
         GitClient {
-            path_filter: String::new(),
+            sidebar_width: 220.0,
             view_mode: ViewMode::default(),
             files: Vec::new(),
-            path_candidates: Vec::new(),
-            show_suggestions: false,
-            suggestions_hovered: false,
             selected: None,
             cached_diff: None,
             error: None,
@@ -118,6 +124,7 @@ impl GitClient {
             generation: 0,
             cwd: String::new(),
             filters_dirty: true,
+            last_file_refresh: std::time::Instant::now(),
             current_hunk: 0,
             scroll_to_hunk: None,
         }
@@ -129,9 +136,13 @@ impl GitClient {
             self.filters_dirty = true;
         }
 
-        if self.filters_dirty {
+        // Poll git status at most once per second so the sidebar always reflects
+        // the real repository state without relying solely on explicit dirty flags.
+        let poll_due = self.last_file_refresh.elapsed() >= std::time::Duration::from_secs(1);
+        if self.filters_dirty || poll_due {
             self.refresh_files();
             self.filters_dirty = false;
+            self.last_file_refresh = std::time::Instant::now();
         }
 
         let pos = [0.0, layout.editor_y];
@@ -161,24 +172,6 @@ impl GitClient {
     }
 
     fn draw_toolbar(&mut self, ui: &Ui) {
-        ui.text("Path:");
-        ui.same_line();
-        let mut filter = self.path_filter.clone();
-        ui.set_next_item_width(240.0);
-        if ui
-            .input_text("##path_filter", &mut filter)
-            .hint("crates/app or src/main.rs")
-            .build()
-        {
-            self.path_filter = filter;
-            self.filters_dirty = true;
-            self.show_suggestions = true;
-        }
-        let input_active = ui.is_item_active();
-        let input_min = ui.item_rect_min();
-        let input_max = ui.item_rect_max();
-
-        ui.same_line_with_spacing(0.0, 16.0);
         ui.text("View:");
         ui.same_line();
         let mut view_idx = self.view_mode.index();
@@ -216,101 +209,50 @@ impl GitClient {
         if ui.button("Refresh") {
             self.refresh_files();
         }
-
-        if self.show_suggestions {
-            self.draw_path_suggestions(ui, input_min, input_max, input_active);
-        } else {
-            self.suggestions_hovered = false;
-        }
-    }
-
-    fn draw_path_suggestions(
-        &mut self,
-        ui: &Ui,
-        input_min: [f32; 2],
-        input_max: [f32; 2],
-        input_active: bool,
-    ) {
-        let query = self.path_filter.trim().to_lowercase();
-        let matches: Vec<String> = if query.is_empty() {
-            self.path_candidates.iter().take(10).cloned().collect()
-        } else {
-            self.path_candidates
-                .iter()
-                .filter(|c| {
-                    let lc = c.to_lowercase();
-                    lc.contains(&query) && lc != query
-                })
-                .take(10)
-                .cloned()
-                .collect()
-        };
-
-        if matches.is_empty() {
-            self.suggestions_hovered = false;
-            if !input_active {
-                self.show_suggestions = false;
-            }
-            return;
-        }
-
-        let row_h = ui.text_line_height_with_spacing();
-        let height = (matches.len() as f32 * row_h + ui.text_line_height()).min(220.0);
-        let width = (input_max[0] - input_min[0]).max(240.0);
-
-        let flags = WindowFlags::NO_TITLE_BAR
-            | WindowFlags::NO_RESIZE
-            | WindowFlags::NO_MOVE
-            | WindowFlags::NO_COLLAPSE
-            | WindowFlags::NO_SAVED_SETTINGS
-            | WindowFlags::NO_FOCUS_ON_APPEARING
-            | WindowFlags::NO_NAV_FOCUS;
-
-        let mut chosen: Option<String> = None;
-        let mut hovered = false;
-        ui.window("##path_suggestions")
-            .position([input_min[0], input_max[1] + 2.0], Condition::Always)
-            .size([width, height], Condition::Always)
-            .flags(flags)
-            .build(|| {
-                for cand in &matches {
-                    if ui.selectable(cand) {
-                        chosen = Some(cand.clone());
-                    }
-                }
-                hovered =
-                    ui.is_window_hovered_with_flags(imgui::WindowHoveredFlags::CHILD_WINDOWS);
-            });
-
-        self.suggestions_hovered = hovered;
-
-        if let Some(cand) = chosen {
-            self.path_filter = cand;
-            self.filters_dirty = true;
-            self.show_suggestions = false;
-            self.suggestions_hovered = false;
-        } else if !input_active && !hovered {
-            self.show_suggestions = false;
-        }
     }
 
     fn draw_body(&mut self, ui: &Ui) {
         let avail = ui.content_region_avail();
         let list_h = avail[1];
+        let splitter_w = 4.0;
+        let min_side = 80.0;
 
         ui.child_window("##file_list")
-            .size([FILE_LIST_WIDTH, list_h])
+            .size([self.sidebar_width, list_h])
             .border(true)
             .build(|| {
                 self.draw_file_sidebar(ui);
             });
 
         ui.same_line();
-        let diff_w = unsafe {
-            avail[0] - FILE_LIST_WIDTH - ui.style().item_spacing[0]
-        };
+
+        // Invisible draggable splitter between sidebar and diff panel.
+        let splitter_id = ui.push_id("##splitter");
+        let cursor = ui.cursor_screen_pos();
+        let _ = ui.invisible_button("##splitter_btn", [splitter_w, list_h]);
+        if ui.is_item_active() {
+            let delta = ui.io().mouse_delta[0];
+            self.sidebar_width = (self.sidebar_width + delta)
+                .max(min_side)
+                .min(avail[0] - min_side - splitter_w);
+        }
+        if ui.is_item_hovered() || ui.is_item_active() {
+            // Draw a visible line while hovering/dragging.
+            let draw = ui.get_window_draw_list();
+            let col = ui.style_color(StyleColor::SeparatorActive);
+            draw.add_line(
+                cursor,
+                [cursor[0], cursor[1] + list_h],
+                col,
+            ).thickness(splitter_w).build();
+        }
+        drop(splitter_id);
+
+        ui.same_line();
+        let item_spacing = unsafe { ui.style().item_spacing[0] };
+        let diff_w = avail[0] - self.sidebar_width - splitter_w - item_spacing * 2.0;
         ui.child_window("##diff_view")
-            .size([diff_w, list_h])
+            .size([diff_w.max(min_side), list_h])
             .border(true)
             .horizontal_scrollbar(true)
             .build(|| {
@@ -319,58 +261,38 @@ impl GitClient {
     }
 
     fn draw_file_sidebar(&mut self, ui: &Ui) {
-        let staged: Vec<ChangedFile> = self
-            .files
-            .iter()
-            .filter(|f| f.staged)
-            .cloned()
-            .collect();
-        let unstaged: Vec<ChangedFile> = self
-            .files
-            .iter()
-            .filter(|f| f.unstaged)
-            .cloned()
-            .collect();
-
-        let has_staged = !staged.is_empty();
-        let has_unstaged = !unstaged.is_empty();
-
-        if !has_staged && !has_unstaged {
-            ui.text_disabled("No matching changes.");
+        let files = self.files.clone();
+        if files.is_empty() {
+            ui.text_disabled("No changes.");
             return;
         }
-
-        if has_staged {
-            ui.text("Staged");
-            ui.separator();
-            for file in &staged {
-                self.draw_file_entry(ui, file, DiffSide::Staged);
-            }
-        }
-
-        if has_staged && has_unstaged {
-            ui.spacing();
-        }
-
-        if has_unstaged {
-            ui.text("Unstaged");
-            ui.separator();
-            for file in &unstaged {
-                self.draw_file_entry(ui, file, DiffSide::Unstaged);
-            }
+        for file in &files {
+            self.draw_file_entry(ui, file);
         }
     }
 
-    fn draw_file_entry(&mut self, ui: &Ui, file: &ChangedFile, side: DiffSide) {
+    fn draw_file_entry(&mut self, ui: &Ui, file: &ChangedFile) {
+        // Checked when the file has any staged changes; unchecking unstages the whole file.
+        let has_staged = file.staged;
+        let mut checked = has_staged;
+        ui.checkbox(&format!("##file_cb_{}", file.path), &mut checked);
+        if checked != has_staged {
+            if checked {
+                self.stage_path(&file.path);
+            } else {
+                self.unstage_path(&file.path);
+            }
+        }
+
+        ui.same_line();
         let selected = self
             .selected
             .as_ref()
-            .is_some_and(|s| s.path == file.path && s.side == side);
-        let label = format!("{} {}", file.status, file.path);
+            .is_some_and(|s| s.path == file.path);
+        let label = format!("{} {}##file_sel_{}", file.status, file.path, file.path);
         if ui.selectable_config(&label).selected(selected).build() && !selected {
             self.selected = Some(SelectedEntry {
                 path: file.path.clone(),
-                side,
             });
             self.cached_diff = None;
             self.current_hunk = 0;
@@ -378,23 +300,21 @@ impl GitClient {
         }
 
         if let Some(_popup) = ui.begin_popup_context_item() {
-            self.draw_file_context_menu(ui, &file.path, side);
+            self.draw_file_context_menu(ui, file);
         }
     }
 
-    fn draw_file_context_menu(&mut self, ui: &Ui, path: &str, side: DiffSide) {
-        match side {
-            DiffSide::Unstaged => {
-                if ui.menu_item("Stage") {
-                    self.stage_path(path);
-                    ui.close_current_popup();
-                }
+    fn draw_file_context_menu(&mut self, ui: &Ui, file: &ChangedFile) {
+        if file.unstaged {
+            if ui.menu_item("Stage") {
+                self.stage_path(&file.path.clone());
+                ui.close_current_popup();
             }
-            DiffSide::Staged => {
-                if ui.menu_item("Unstage") {
-                    self.unstage_path(path);
-                    ui.close_current_popup();
-                }
+        }
+        if file.staged {
+            if ui.menu_item("Unstage") {
+                self.unstage_path(&file.path.clone());
+                ui.close_current_popup();
             }
         }
     }
@@ -406,7 +326,7 @@ impl GitClient {
         match stage_file(&repo, path) {
             Ok(()) => {
                 self.error = None;
-                self.filters_dirty = true;
+                self.after_file_git_op(path);
             }
             Err(e) => self.error = Some(e),
         }
@@ -419,7 +339,135 @@ impl GitClient {
         match unstage_file(&repo, path) {
             Ok(()) => {
                 self.error = None;
+                self.after_file_git_op(path);
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn after_file_git_op(&mut self, path: &str) {
+        self.refresh_files();
+        self.last_file_refresh = std::time::Instant::now();
+        if self.selected.as_ref().is_some_and(|s| s.path == path) {
+            self.cached_diff = None;
+        }
+    }
+
+    fn draw_hunked_diff(
+        &mut self,
+        ui: &Ui,
+        diff: &DiffLines,
+        path: &str,
+        colors: &DiffColors,
+    ) {
+        let scroll_to_line = self.scroll_to_hunk.and_then(|h| {
+            diff.hunks.get(h).map(|hk| hk.start_line)
+        });
+
+        for hunk in &diff.hunks {
+            if hunk.start_line >= MAX_DIFF_LINES {
+                break;
+            }
+
+            if scroll_to_line == Some(hunk.start_line) {
+                ui.set_scroll_here_y_with_ratio(0.0);
+                self.scroll_to_hunk = None;
+            }
+
+            self.draw_hunk_header(ui, path, hunk);
+
+            let end = hunk.end_line.min(MAX_DIFF_LINES);
+            let hunk_lines = &diff.lines[hunk.start_line..end];
+            match self.view_mode {
+                ViewMode::Inline => {
+                    for line in hunk_lines {
+                        draw_diff_line(ui, line, colors);
+                    }
+                }
+                ViewMode::SideBySide => {
+                    let mut noop_scroll = None;
+                    draw_side_by_side(ui, hunk_lines, colors, None, &mut noop_scroll);
+                }
+            }
+            ui.separator();
+        }
+    }
+
+    fn draw_hunk_header(&mut self, ui: &Ui, path: &str, hunk: &DiffHunkInfo) {
+        let mut staged = hunk.staged;
+        ui.checkbox(&format!("##hunk_cb_{}", hunk.index), &mut staged);
+        ui.same_line();
+
+        // Render header as a selectable so it carries an item ID.
+        // `text_colored` has no ID and causes `BeginPopupContextItem` to abort.
+        let hdr_color = ui.style_color(StyleColor::TextDisabled);
+        let hdr_label = format!("{}##hunk_hdr_{}", hunk.header.trim_end(), hunk.index);
+        let _col = ui.push_style_color(StyleColor::Text, hdr_color);
+        ui.selectable_config(&hdr_label)
+            .span_all_columns(false)
+            .build();
+
+        if let Some(_popup) = ui.begin_popup_context_item() {
+            self.draw_hunk_context_menu(ui, path, hunk);
+        }
+
+        if staged != hunk.staged {
+            self.apply_hunk_staged(path, &hunk.patch, staged);
+        }
+    }
+
+    fn draw_hunk_context_menu(&mut self, ui: &Ui, path: &str, hunk: &DiffHunkInfo) {
+        let mut acted = false;
+        if !hunk.staged && ui.menu_item("Stage") {
+            self.apply_hunk_staged(path, &hunk.patch, true);
+            acted = true;
+        }
+        if hunk.staged && ui.menu_item("Unstage") {
+            self.apply_hunk_staged(path, &hunk.patch, false);
+            acted = true;
+        }
+        if ui.menu_item("Restore") {
+            self.restore_hunk(path, &hunk.patch, hunk.staged);
+            acted = true;
+        }
+        if acted {
+            ui.close_current_popup();
+        }
+    }
+
+    fn apply_hunk_staged(&mut self, path: &str, patch: &str, staged: bool) {
+        let Some(repo) = self.repo_root.clone() else {
+            return;
+        };
+        let result = if staged {
+            stage_hunk(&repo, patch)
+        } else {
+            unstage_hunk(&repo, patch)
+        };
+        self.after_hunk_git_op(path, result);
+    }
+
+    fn restore_hunk(&mut self, path: &str, patch: &str, is_staged: bool) {
+        let Some(repo) = self.repo_root.clone() else {
+            return;
+        };
+        let result = if is_staged {
+            let _ = unstage_hunk(&repo, patch);
+            restore_hunk_worktree(&repo, patch)
+        } else {
+            restore_hunk_worktree(&repo, patch)
+        };
+        self.after_hunk_git_op(path, result);
+    }
+
+    fn after_hunk_git_op(&mut self, path: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.error = None;
                 self.filters_dirty = true;
+                if self.selected.as_ref().is_some_and(|s| s.path == path) {
+                    self.cached_diff = None;
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -434,27 +482,23 @@ impl GitClient {
             return;
         };
 
-        let side = sel.side;
         let needs_load = self.cached_diff.as_ref().is_none_or(|c| {
-            c.path != file.path || c.side != side || c.generation != self.generation
+            c.path != file.path || c.generation != self.generation
         });
         if needs_load {
-            self.load_diff(&file, side);
+            self.load_diff(&file);
         }
 
-        let side_label = match side {
-            DiffSide::Staged => "staged",
-            DiffSide::Unstaged => "unstaged",
-        };
-        ui.text(&format!("{}  [{side_label}]", file.path));
+        ui.text(&format!("{} {}", file.status, file.path));
         ui.separator();
 
-        let Some(cached) = &self.cached_diff else {
+        let content = self.cached_diff.as_ref().map(|c| c.content.clone());
+        let Some(content) = content else {
             ui.text_disabled("Loading…");
             return;
         };
 
-        match &cached.content {
+        match content {
             DiffContent::Binary => {
                 ui.text_disabled("Binary file changed.");
             }
@@ -470,32 +514,12 @@ impl GitClient {
                     ui.separator();
                 }
                 let colors = diff_colors(ui);
-                let shown = &diff.lines[..diff.lines.len().min(MAX_DIFF_LINES)];
-                let scroll_to = self.scroll_to_hunk.and_then(|h| {
-                    diff.hunk_starts.get(h).copied()
-                });
-                match self.view_mode {
-                    ViewMode::Inline => {
-                        for (i, line) in shown.iter().enumerate() {
-                            if scroll_to == Some(i) {
-                                ui.set_scroll_here_y_with_ratio(0.0);
-                                self.scroll_to_hunk = None;
-                            }
-                            draw_diff_line(ui, line, &colors);
-                        }
-                    }
-                    ViewMode::SideBySide => {
-                        draw_side_by_side(ui, shown, &colors, scroll_to, &mut self.scroll_to_hunk);
-                    }
-                }
+                self.draw_hunked_diff(ui, &diff, &file.path, &colors);
             }
         }
     }
 
     fn refresh_files(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.cached_diff = None;
-
         let cwd = expand_tilde(&self.cwd);
         self.repo_root = repo_root(&cwd);
         let Some(repo) = self.repo_root.clone() else {
@@ -506,77 +530,81 @@ impl GitClient {
         };
         self.error = None;
 
-        let all = list_changed_files(&repo);
-        self.path_candidates = build_path_candidates(&all);
-        self.files = all
-            .into_iter()
-            .filter(|f| path_matches(&self.path_filter, &f.path))
-            .collect();
+        self.files = list_changed_files(&repo);
 
         self.validate_selection();
     }
 
     fn validate_selection(&mut self) {
-        let still_valid = self.selected.as_ref().is_some_and(|s| {
-            self.files.iter().any(|f| {
-                f.path == s.path
-                    && match s.side {
-                        DiffSide::Staged => f.staged,
-                        DiffSide::Unstaged => f.unstaged,
-                    }
-            })
-        });
+        let still_valid = self
+            .selected
+            .as_ref()
+            .is_some_and(|s| self.files.iter().any(|f| f.path == s.path));
 
         if still_valid {
             return;
         }
 
-        self.selected = self
-            .files
-            .iter()
-            .find(|f| f.staged)
-            .map(|f| SelectedEntry {
-                path: f.path.clone(),
-                side: DiffSide::Staged,
-            })
-            .or_else(|| {
-                self.files.iter().find(|f| f.unstaged).map(|f| SelectedEntry {
-                    path: f.path.clone(),
-                    side: DiffSide::Unstaged,
-                })
-            });
         self.cached_diff = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.selected = self.files.first().map(|f| SelectedEntry {
+            path: f.path.clone(),
+        });
     }
 
-    fn load_diff(&mut self, file: &ChangedFile, side: DiffSide) {
+    fn load_diff(&mut self, file: &ChangedFile) {
         let Some(repo) = self.repo_root.clone() else {
             return;
         };
-        let content = match fetch_file_content(&repo, &file.path, side) {
+        let content = match fetch_head_vs_worktree(&repo, &file.path) {
             FileContent::Text { old, new } => {
                 if old == new {
                     DiffContent::Message("No textual changes.".into())
                 } else {
-                    DiffContent::Lines(build_diff_lines(&old, &new))
+                    let mut diff = build_diff_lines(&old, &new, &file.path);
+                    self.apply_hunk_staged_states(&repo, file, &mut diff);
+                    DiffContent::Lines(diff)
                 }
             }
-            FileContent::Added { new } => DiffContent::Lines(build_diff_lines("", &new)),
-            FileContent::Deleted { old } => DiffContent::Lines(build_diff_lines(&old, "")),
+            FileContent::Added { new } => {
+                let mut diff = build_diff_lines("", &new, &file.path);
+                self.apply_hunk_staged_states(&repo, file, &mut diff);
+                DiffContent::Lines(diff)
+            }
+            FileContent::Deleted { old } => {
+                let mut diff = build_diff_lines(&old, "", &file.path);
+                self.apply_hunk_staged_states(&repo, file, &mut diff);
+                DiffContent::Lines(diff)
+            }
             FileContent::Binary => DiffContent::Binary,
             FileContent::Error(msg) => DiffContent::Message(msg),
         };
-        self.current_hunk = 0;
-        self.scroll_to_hunk = if matches!(&content, DiffContent::Lines(d) if !d.hunk_starts.is_empty()) {
-            Some(0)
-        } else {
-            None
-        };
         self.cached_diff = Some(CachedDiff {
             path: file.path.clone(),
-            side,
             generation: self.generation,
             content,
         });
+    }
+
+    fn apply_hunk_staged_states(
+        &self,
+        repo: &std::path::Path,
+        file: &ChangedFile,
+        diff: &mut DiffLines,
+    ) {
+        if file.staged && !file.unstaged {
+            for h in &mut diff.hunks {
+                h.staged = true;
+            }
+        } else if !file.staged && file.unstaged {
+            for h in &mut diff.hunks {
+                h.staged = false;
+            }
+        } else {
+            for h in &mut diff.hunks {
+                h.staged = hunk_is_staged(repo, &h.patch);
+            }
+        }
     }
 
     fn hunk_count(&self) -> usize {
@@ -826,64 +854,67 @@ fn segment_color(seg: &DiffSegment, default: [f32; 4], colors: &DiffColors) -> [
     }
 }
 
-/// Collect file paths plus their directory prefixes as autocomplete candidates.
-fn build_path_candidates(files: &[ChangedFile]) -> Vec<String> {
-    let mut set = std::collections::BTreeSet::new();
-    for f in files {
-        set.insert(f.path.clone());
-        let mut acc = String::new();
-        let mut parts: Vec<&str> = f.path.split('/').collect();
-        parts.pop(); // drop the file name; keep directory prefixes only
-        for p in parts {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(p);
-            set.insert(acc.clone());
+fn build_diff_lines(old: &str, new: &str, path: &str) -> DiffLines {
+    let diff = TextDiff::from_lines(old, new);
+    let old_label = format!("a/{path}");
+    let new_label = format!("b/{path}");
+
+    let mut lines = Vec::new();
+    let mut hunks = Vec::new();
+
+    for (hunk_idx, ops) in diff.grouped_ops(3).into_iter().enumerate() {
+        if !ops_has_changes(&ops) {
+            continue;
         }
+
+        let start = lines.len();
+        let udiff_hunk = UnifiedDiffHunk::new(ops.clone(), &diff, true);
+        let hunk_lines = build_lines_for_ops(&diff, &ops);
+        lines.extend(hunk_lines);
+
+        let patch = format!("--- {old_label}\n+++ {new_label}\n{udiff_hunk}");
+        hunks.push(DiffHunkInfo {
+            index: hunk_idx,
+            start_line: start,
+            end_line: lines.len(),
+            header: udiff_hunk.header().to_string(),
+            patch,
+            staged: false,
+        });
     }
-    set.into_iter().collect()
+
+    let hunk_starts: Vec<usize> = hunks.iter().map(|h| h.start_line).collect();
+    DiffLines {
+        lines,
+        hunk_starts,
+        hunks,
+    }
 }
 
-fn build_diff_lines(old: &str, new: &str) -> DiffLines {
-    let diff = TextDiff::from_lines(old, new);
-    let lines: Vec<DiffLine> = diff
-        .iter_all_inline_changes()
-        .map(|change| {
-            let segments: Vec<DiffSegment> = change
-                .iter_strings_lossy()
-                .map(|(emphasized, text)| DiffSegment {
-                    emphasized,
-                    text: text.into_owned(),
-                    tag: change.tag(),
-                })
-                .collect();
-            DiffLine {
-                old_line: change.old_index().map(|i| (i + 1) as u32),
-                new_line: change.new_index().map(|i| (i + 1) as u32),
-                tag: change.tag(),
-                segments,
-            }
+fn ops_has_changes(ops: &[DiffOp]) -> bool {
+    ops.iter().any(|op| !matches!(op, DiffOp::Equal { .. }))
+}
+
+fn build_lines_for_ops(diff: &TextDiff<'_, '_, str>, ops: &[DiffOp]) -> Vec<DiffLine> {
+    ops.iter()
+        .flat_map(|op| diff.iter_inline_changes(op))
+        .map(inline_change_to_line)
+        .collect()
+}
+
+fn inline_change_to_line(change: InlineChange<'_, str>) -> DiffLine {
+    let segments: Vec<DiffSegment> = change
+        .iter_strings_lossy()
+        .map(|(emphasized, text)| DiffSegment {
+            emphasized,
+            text: text.into_owned(),
+            tag: change.tag(),
         })
         .collect();
-    DiffLines {
-        hunk_starts: find_hunk_starts(&lines),
-        lines,
+    DiffLine {
+        old_line: change.old_index().map(|i| (i + 1) as u32),
+        new_line: change.new_index().map(|i| (i + 1) as u32),
+        tag: change.tag(),
+        segments,
     }
-}
-
-/// Line indices where each contiguous changed region begins.
-fn find_hunk_starts(lines: &[DiffLine]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut in_hunk = false;
-    for (i, line) in lines.iter().enumerate() {
-        let changed = !matches!(line.tag, ChangeTag::Equal);
-        if changed && !in_hunk {
-            starts.push(i);
-            in_hunk = true;
-        } else if !changed {
-            in_hunk = false;
-        }
-    }
-    starts
 }
