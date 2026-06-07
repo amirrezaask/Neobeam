@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use directories::UserDirs;
 use imgui::Ui;
 
-use crate::fuzzy_picker::FuzzyPicker;
+use crate::fuzzy_picker::{FuzzyPicker, PickerOutcome};
 
 const PROJECTS_DIR_NAME: &str = "dev";
 const SCRATCH_LABEL: &str = "scratch  ~/scratch";
@@ -32,7 +32,10 @@ impl ProjectPicker {
     }
 
     pub fn draw(&mut self, ui: &Ui, dt: f32) -> Option<PathBuf> {
-        self.picker.draw(ui, "Session", dt)
+        match self.picker.draw(ui, "Session", dt) {
+            PickerOutcome::Selected(path) => Some(path),
+            PickerOutcome::None | PickerOutcome::Pinned { .. } => None,
+        }
     }
 
     /// True while a fade animation (in or out) is in progress.

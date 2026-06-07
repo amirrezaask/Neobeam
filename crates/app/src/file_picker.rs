@@ -5,10 +5,20 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use imgui::Ui;
 
-use crate::fuzzy_picker::FuzzyPicker;
+use crate::fuzzy_picker::{FuzzyPicker, PickerOutcome};
 
 /// Hard cap on the number of files collected to keep the picker responsive.
 const MAX_FILES: usize = 50_000;
+
+#[derive(Clone, Debug)]
+pub enum FilePickerOutcome {
+    None,
+    Opened(PathBuf),
+    Pinned {
+        items: Vec<(String, PathBuf)>,
+        query: String,
+    },
+}
 
 pub struct FilePicker {
     picker: FuzzyPicker<PathBuf>,
@@ -36,8 +46,12 @@ impl FilePicker {
         self.picker.open(items);
     }
 
-    pub fn draw(&mut self, ui: &Ui, dt: f32) -> Option<PathBuf> {
-        self.picker.draw(ui, "Open File", dt)
+    pub fn draw(&mut self, ui: &Ui, dt: f32) -> FilePickerOutcome {
+        match self.picker.draw(ui, "Open File", dt) {
+            PickerOutcome::None => FilePickerOutcome::None,
+            PickerOutcome::Selected(path) => FilePickerOutcome::Opened(path),
+            PickerOutcome::Pinned { items, query } => FilePickerOutcome::Pinned { items, query },
+        }
     }
 }
 

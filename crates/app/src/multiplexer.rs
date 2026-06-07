@@ -30,6 +30,8 @@ pub struct WinId(pub usize);
 pub enum ViewKind {
     Editor,
     GitClient,
+    FileList,
+    GrepResults,
 }
 
 impl ViewKind {
@@ -37,7 +39,16 @@ impl ViewKind {
         match self {
             ViewKind::Editor => "Editor",
             ViewKind::GitClient => "Git",
+            ViewKind::FileList => "Files",
+            ViewKind::GrepResults => "Search Results",
         }
+    }
+
+    pub fn captures_input(self) -> bool {
+        matches!(
+            self,
+            ViewKind::GitClient | ViewKind::FileList | ViewKind::GrepResults
+        )
     }
 }
 
@@ -104,6 +115,7 @@ pub struct TilingManager {
     pub title_bar_h: f32,
     pub focused: WinId,
     preview_alpha: f32,
+    last_removed: Vec<WinId>,
 }
 
 const LAYOUT_ANIM_LEN: f32 = 0.25;
@@ -127,6 +139,7 @@ impl TilingManager {
             title_bar_h,
             focused: id,
             preview_alpha: 0.0,
+            last_removed: Vec::new(),
         }
     }
 
@@ -167,10 +180,19 @@ impl TilingManager {
         self.add_window(view, area);
     }
 
-    pub fn add_window(&mut self, view: ViewKind, area: Rect) {
+    pub fn add_view_window(&mut self, view: ViewKind, area: Rect) -> WinId {
+        self.add_window(view, area)
+    }
+
+    pub fn take_removed_windows(&mut self) -> Vec<WinId> {
+        std::mem::take(&mut self.last_removed)
+    }
+
+    pub fn add_window(&mut self, view: ViewKind, area: Rect) -> WinId {
         if view == ViewKind::Editor && self.has_view(ViewKind::Editor) {
-            self.open_or_focus(ViewKind::Editor, area);
-            return;
+            let id = self.editor_win().expect("editor window");
+            self.focused = id;
+            return id;
         }
 
         let id = WinId(self.next_id);
@@ -202,6 +224,7 @@ impl TilingManager {
         let new_rects = self.compute_rects(area);
         self.begin_layout_anim(&old_rects, &new_rects);
         self.focused = id;
+        id
     }
 
     pub fn compute_rects(&self, area: Rect) -> HashMap<WinId, Rect> {
@@ -430,6 +453,13 @@ impl TilingManager {
         }
 
         let old_rects = self.compute_rects(area);
+
+        self.last_removed = self
+            .windows
+            .iter()
+            .filter(|w| w.id != win_id)
+            .map(|w| w.id)
+            .collect();
 
         self.windows.retain(|w| w.id == win_id);
         self.root = LayoutNode::Leaf(win_id);

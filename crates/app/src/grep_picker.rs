@@ -26,6 +26,17 @@ const MAX_RESULTS: usize = 500;
 const MAX_LINE_PREVIEW: usize = 120;
 
 #[derive(Clone, Debug)]
+pub enum GrepPickerOutcome {
+    None,
+    Selected(GrepMatch),
+    Pinned {
+        results: Vec<GrepMatch>,
+        query: String,
+        project_root: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct GrepMatch {
     pub path: PathBuf,
     pub line_number: u64,
@@ -94,9 +105,9 @@ impl GrepPicker {
         while self.result_rx.try_recv().is_ok() {}
     }
 
-    pub fn draw(&mut self, ui: &Ui, dt: f32) -> Option<GrepMatch> {
+    pub fn draw(&mut self, ui: &Ui, dt: f32) -> GrepPickerOutcome {
         if !self.open {
-            return None;
+            return GrepPickerOutcome::None;
         }
 
         self.poll_results();
@@ -106,7 +117,7 @@ impl GrepPicker {
             self.alpha = (self.alpha - dt * FADE_OUT_SPEED).max(0.0);
             if self.alpha <= 0.0 {
                 self.close_immediate();
-                return None;
+                return GrepPickerOutcome::None;
             }
         } else {
             self.alpha = (self.alpha + dt * FADE_IN_SPEED).min(1.0);
@@ -116,7 +127,7 @@ impl GrepPicker {
         let pos = picker_initial_position(ui);
         let size = picker_default_size(ui);
 
-        let mut confirmed = None;
+        let mut outcome = GrepPickerOutcome::None;
         let _alpha_token = ui.push_style_var(StyleVar::Alpha(self.alpha));
         ui.window(&window_name)
             .position(pos, Condition::FirstUseEver)
@@ -147,6 +158,17 @@ impl GrepPicker {
                     self.query = query;
                 }
 
+                ui.same_line();
+                if ui.button("Pin##pin") {
+                    outcome = GrepPickerOutcome::Pinned {
+                        results: self.results.clone(),
+                        query: self.query.clone(),
+                        project_root: self.project_root.clone(),
+                    };
+                    self.close_immediate();
+                    return;
+                }
+
                 if ui.is_key_pressed(Key::Escape) {
                     self.begin_close();
                     return;
@@ -163,8 +185,19 @@ impl GrepPicker {
                 if go_down && self.selected + 1 < self.results.len() {
                     self.selected += 1;
                 }
+                if ui.is_key_pressed(Key::Enter) && ui.io().key_ctrl {
+                    outcome = GrepPickerOutcome::Pinned {
+                        results: self.results.clone(),
+                        query: self.query.clone(),
+                        project_root: self.project_root.clone(),
+                    };
+                    self.close_immediate();
+                    return;
+                }
                 if ui.is_key_pressed(Key::Enter) && !self.results.is_empty() {
-                    confirmed = self.confirm_selection();
+                    if let Some(value) = self.confirm_selection() {
+                        outcome = GrepPickerOutcome::Selected(value);
+                    }
                     return;
                 }
 
@@ -203,14 +236,16 @@ impl GrepPicker {
                                 ui.selectable_config(&label).selected(selected).build();
                             if clicked {
                                 self.selected = idx;
-                                confirmed = self.confirm_selection();
+                                if let Some(value) = self.confirm_selection() {
+                                    outcome = GrepPickerOutcome::Selected(value);
+                                }
                                 return;
                             }
                         }
                     });
             });
 
-        confirmed
+        outcome
     }
 
     fn poll_results(&mut self) {
@@ -285,7 +320,7 @@ impl Default for GrepPicker {
     }
 }
 
-fn format_match_label(root: &Path, item: &GrepMatch) -> String {
+pub(crate) fn format_match_label(root: &Path, item: &GrepMatch) -> String {
     let rel = item
         .path
         .strip_prefix(root)

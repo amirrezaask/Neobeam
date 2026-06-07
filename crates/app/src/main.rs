@@ -15,6 +15,7 @@ mod menu_bar;
 mod multiplexer;
 mod project;
 mod project_picker;
+mod results_panel;
 mod settings;
 
 use std::io::IsTerminal;
@@ -28,14 +29,15 @@ use app_page::AppPage;
 use arboard::Clipboard;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use editor_surface::{AnimationState, ChromeLayout, Renderer};
-use file_picker::FilePicker;
-use grep_picker::GrepPicker;
+use file_picker::{FilePicker, FilePickerOutcome};
+use grep_picker::{GrepMatch, GrepPicker, GrepPickerOutcome};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
 use multiplexer::{Rect, TilingManager, ViewKind, WinId};
 use project::Project;
 use project_picker::ProjectPicker;
+use results_panel::{FileListPanel, GrepResultsPanel};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -98,6 +100,8 @@ struct App {
     winbar_refresh_pending: bool,
     /// Another flush arrived while a winbar RPC was in flight.
     winbar_refresh_dirty: bool,
+    file_list_panels: Vec<(WinId, FileListPanel)>,
+    grep_result_panels: Vec<(WinId, GrepResultsPanel)>,
     state: Option<State>,
 }
 
@@ -121,7 +125,7 @@ fn app_page_to_view(page: AppPage) -> ViewKind {
 
 fn view_to_app_page(view: ViewKind) -> AppPage {
     match view {
-        ViewKind::Editor => AppPage::Editor,
+        ViewKind::Editor | ViewKind::FileList | ViewKind::GrepResults => AppPage::Editor,
         ViewKind::GitClient => AppPage::GitClient,
     }
 }
@@ -140,7 +144,7 @@ fn cursor_logical(state: &State) -> (f32, f32) {
     )
 }
 
-fn cursor_in_git_content(state: &State, settings: &Settings, tiling: &TilingManager) -> bool {
+fn cursor_in_panel_content(state: &State, settings: &Settings, tiling: &TilingManager) -> bool {
     let area = editor_area(settings, &state.renderer);
     let rects = tiling.compute_rects(area);
     let cursor = cursor_logical(state);
@@ -151,7 +155,7 @@ fn cursor_in_git_content(state: &State, settings: &Settings, tiling: &TilingMana
         .windows
         .iter()
         .find(|w| w.id == win_id)
-        .is_some_and(|w| w.view == ViewKind::GitClient)
+        .is_some_and(|w| w.view.captures_input())
 }
 
 fn imgui_captures_input(
@@ -169,7 +173,7 @@ fn imgui_captures_input(
     if tiling.cursor_in_any_title_bar(cursor, &rects) {
         return true;
     }
-    if cursor_in_git_content(state, settings, tiling) {
+    if cursor_in_panel_content(state, settings, tiling) {
         return true;
     }
     project_picker_open
@@ -192,7 +196,7 @@ fn mouse_to_nvim_blocked(
     if tiling.cursor_in_any_title_bar(cursor, &rects) {
         return true;
     }
-    if cursor_in_git_content(state, settings, tiling) {
+    if cursor_in_panel_content(state, settings, tiling) {
         return true;
     }
     project_picker_open
@@ -206,7 +210,7 @@ fn keyboard_to_nvim_blocked(
     tiling: &TilingManager,
     project_picker_open: bool,
 ) -> bool {
-    if tiling.focused_view() == ViewKind::GitClient {
+    if tiling.focused_view().captures_input() {
         return true;
     }
     project_picker_open
@@ -247,8 +251,45 @@ impl App {
             project: initial_project,
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
+            file_list_panels: Vec::new(),
+            grep_result_panels: Vec::new(),
             state: None,
         })
+    }
+
+    fn cleanup_panels(&mut self) {
+        let alive: std::collections::HashSet<WinId> =
+            self.tiling.windows.iter().map(|w| w.id).collect();
+        self.file_list_panels
+            .retain(|(id, _)| alive.contains(id));
+        self.grep_result_panels
+            .retain(|(id, _)| alive.contains(id));
+        let _ = self.tiling.take_removed_windows();
+    }
+
+    fn handle_pin_outcomes(
+        &mut self,
+        pin_file: Option<(Vec<(String, PathBuf)>, String)>,
+        pin_grep: Option<(Vec<GrepMatch>, String, PathBuf)>,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let area = editor_area(&self.settings, &state.renderer);
+        if let Some((items, query)) = pin_file {
+            let panel = FileListPanel::new(items, query);
+            let win_id = self.tiling.add_view_window(ViewKind::FileList, area);
+            self.file_list_panels.push((win_id, panel));
+            state.recompute_grid(&self.settings, &self.tiling);
+            state.window.request_redraw();
+        }
+        if let Some((results, query, project_root)) = pin_grep {
+            let panel = GrepResultsPanel::new(results, query, project_root);
+            let win_id = self.tiling.add_view_window(ViewKind::GrepResults, area);
+            self.grep_result_panels.push((win_id, panel));
+            state.recompute_grid(&self.settings, &self.tiling);
+            state.window.request_redraw();
+        }
     }
 
     /// Coalesced async winbar refresh. Must not call nvim synchronously from
@@ -538,7 +579,16 @@ impl State {
         project_picker: &mut ProjectPicker,
         file_picker: &mut FilePicker,
         grep_picker: &mut GrepPicker,
-    ) -> (bool, MenuBarAction, ContextMenuAction, Option<PathBuf>) {
+        file_list_panels: &mut [(WinId, FileListPanel)],
+        grep_result_panels: &mut [(WinId, GrepResultsPanel)],
+    ) -> (
+        bool,
+        MenuBarAction,
+        ContextMenuAction,
+        Option<PathBuf>,
+        Option<(Vec<(String, PathBuf)>, String)>,
+        Option<(Vec<GrepMatch>, String, PathBuf)>,
+    ) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -571,6 +621,8 @@ impl State {
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let mut project_selection = None;
+        let mut pin_file_list = None;
+        let mut pin_grep_results = None;
         let mut git_wants_redraw = false;
         let window = self.window.clone();
         let session = &self.session;
@@ -598,15 +650,43 @@ impl State {
                     let content = tiling.content_rect(visual);
                     git_wants_redraw |= git_client.draw(ui, *win_id, content);
                 }
+                for (win_id, panel) in file_list_panels.iter_mut() {
+                    let visual = tiling.visual_rect(*win_id, &window_rects);
+                    let content = tiling.content_rect(visual);
+                    if let Some(path) = panel.draw(ui, *win_id, content, dt) {
+                        session.open_file(path);
+                    }
+                }
+                for (win_id, panel) in grep_result_panels.iter_mut() {
+                    let visual = tiling.visual_rect(*win_id, &window_rects);
+                    let content = tiling.content_rect(visual);
+                    if let Some(m) = panel.draw(ui, *win_id, content) {
+                        session.open_file_at_line(m.path, m.line_number);
+                    }
+                }
                 if tiling.focused_view() == ViewKind::Editor {
                     context_action = context_menu.draw(ui);
                 }
                 project_selection = project_picker.draw(ui, dt);
-                if let Some(path) = file_picker.draw(ui, dt) {
-                    session.open_file(path);
+                match file_picker.draw(ui, dt) {
+                    FilePickerOutcome::None => {}
+                    FilePickerOutcome::Opened(path) => session.open_file(path),
+                    FilePickerOutcome::Pinned { items, query } => {
+                        pin_file_list = Some((items, query));
+                    }
                 }
-                if let Some(m) = grep_picker.draw(ui, dt) {
-                    session.open_file_at_line(m.path, m.line_number);
+                match grep_picker.draw(ui, dt) {
+                    GrepPickerOutcome::None => {}
+                    GrepPickerOutcome::Selected(m) => {
+                        session.open_file_at_line(m.path, m.line_number);
+                    }
+                    GrepPickerOutcome::Pinned {
+                        results,
+                        query,
+                        project_root,
+                    } => {
+                        pin_grep_results = Some((results, query, project_root));
+                    }
                 }
             },
         ) {
@@ -629,7 +709,7 @@ impl State {
             let content = tiling.content_rect(visual);
             [content.x, content.y, content.w, content.h]
         });
-        let hide_cursor = !cursor_in_editor || tiling.focused_view() == ViewKind::GitClient;
+        let hide_cursor = !cursor_in_editor || tiling.focused_view().captures_input();
 
         self.anim.update(dt, &self.store, cw, ch);
 
@@ -682,7 +762,14 @@ impl State {
         {
             self.window.request_redraw();
         }
-        (needs_anim, menu_action, context_action, project_selection)
+        (
+            needs_anim,
+            menu_action,
+            context_action,
+            project_selection,
+            pin_file_list,
+            pin_grep_results,
+        )
     }
 }
 
@@ -904,8 +991,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(ime) => {
                 if self.state.as_ref().is_some_and(|s| {
-                    cursor_in_git_content(s, &self.settings, &self.tiling)
-                        || self.tiling.focused_view() == ViewKind::GitClient
+                    cursor_in_panel_content(s, &self.settings, &self.tiling)
+                        || self.tiling.focused_view().captures_input()
                 }) || picker_open
                 {
                     return;
@@ -943,7 +1030,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.tiling.focused_view() == ViewKind::GitClient {
+                if self.tiling.focused_view().captures_input() {
                     return;
                 }
 
@@ -1196,7 +1283,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (needs_anim, menu_action, context_action, project_selection) = {
+                let (
+                    needs_anim,
+                    menu_action,
+                    context_action,
+                    project_selection,
+                    pin_file_list,
+                    pin_grep_results,
+                ) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
@@ -1208,6 +1302,8 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.project_picker,
                         &mut self.file_picker,
                         &mut self.grep_picker,
+                        &mut self.file_list_panels,
+                        &mut self.grep_result_panels,
                     )
                 };
                 self.handle_menu_action(menu_action);
@@ -1215,6 +1311,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(path) = project_selection {
                     self.set_project(path);
                 }
+                self.handle_pin_outcomes(pin_file_list, pin_grep_results);
+                self.cleanup_panels();
                 let picker_open = self.project_picker.is_open()
                     || self.file_picker.is_open()
                     || self.grep_picker.is_open();
