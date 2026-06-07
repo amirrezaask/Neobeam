@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use arboard::Clipboard;
-use editor_surface::Renderer;
+use editor_surface::{Renderer, SYMBOLS_NERD_FONT};
 use imgui::ClipboardBackend;
-use imgui::{Context, FontConfig, FontSource, Ui};
+use imgui::{Context, FontConfig, FontGlyphRanges, FontSource, Ui};
 use nvim_core::grid::GridStateStore;
 
 use crate::imgui_theme::apply_nvim_theme;
@@ -188,15 +188,30 @@ impl ImguiLayer {
     }
 }
 
+/// Font Awesome gear (`\u{f013}`) in Symbols Nerd Font Mono.
+static NERD_ICON_GLYPH_RANGES: &[u32] = &[0xf000, 0xf2ff, 0];
+
 fn load_font(ctx: &mut Context, font_size_px: f32, hidpi: f32) {
-    ctx.fonts().add_font(&[FontSource::TtfData {
-        data: JETBRAINS_MONO,
-        size_pixels: font_size_px * hidpi,
-        config: Some(FontConfig {
-            oversample_h: 2,
-            oversample_v: 1,
-            pixel_snap_h: true,
-            ..Default::default()
-        }),
-    }]);
+    let size = font_size_px * hidpi;
+    let base = FontConfig {
+        oversample_h: 2,
+        oversample_v: 1,
+        pixel_snap_h: true,
+        ..Default::default()
+    };
+    ctx.fonts().add_font(&[
+        FontSource::TtfData {
+            data: JETBRAINS_MONO,
+            size_pixels: size,
+            config: Some(base.clone()),
+        },
+        FontSource::TtfData {
+            data: SYMBOLS_NERD_FONT,
+            size_pixels: size,
+            config: Some(FontConfig {
+                glyph_ranges: FontGlyphRanges::from_slice(NERD_ICON_GLYPH_RANGES),
+                ..base
+            }),
+        },
+    ]);
 }

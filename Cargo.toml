@@ -13,5 +13,7 @@ license = "MIT"
 authors = ["nvim-ui rust port"]
 
 [profile.release]
-opt-level = 3
+opt-level = 'z'
 lto = "thin"
+codegen-units=1
+strip=true

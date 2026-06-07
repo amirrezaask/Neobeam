@@ -20,7 +20,7 @@ pub use atlas::GlyphAtlas;
 pub use blink::ShouldRender;
 pub use chrome::{ChromeLayout, ChromeLayoutConfig};
 pub use cursor_vfx::{parse_vfx_modes, HighlightMode, TrailMode, VfxMode};
-pub use fonts::list_monospace_fonts;
+pub use fonts::{list_monospace_fonts, SYMBOLS_NERD_FONT};
 pub use frame::{
     DrawLists, FloatCache, FloatCacheEntry, FrameBuilder, GlyphInstance, QuadInstance,
     RectInstance, sync_float_cache,

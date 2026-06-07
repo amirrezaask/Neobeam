@@ -149,6 +149,7 @@ impl App {
         let (scroll, far) = session.fetch_neovide_scroll_globals();
         self.settings.apply_neovide_scroll_globals(scroll, far);
         self.menu_bar.init_theme(&session);
+        self.menu_bar.refresh_winbar(&session);
         tracing::info!(
             "nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}",
             renderer.scale()
@@ -460,6 +461,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let scroll = state.store.take_pending_scroll();
                     state.anim.on_flush(&state.store, &scroll);
                     state.anim.sync_floats(&state.store.active_floats());
+                    self.menu_bar.refresh_winbar(&state.session);
                     state.window.request_redraw();
                 }
             }

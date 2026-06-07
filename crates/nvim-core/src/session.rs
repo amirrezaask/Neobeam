@@ -39,6 +39,13 @@ impl Handler for NvimHandler {
     }
 }
 
+/// Current buffer and working directory shown in the host winbar.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WinbarInfo {
+    pub file_name: String,
+    pub project: String,
+}
+
 pub struct SessionConfig {
     pub cols: u32,
     pub rows: u32,
@@ -129,6 +136,7 @@ impl NvimSession {
                     .set_messages_externa(msgs);
                 nvim.ui_attach(cols, rows, &opts).await?;
                 let _ = nvim.command("set noswapfile nobackup nowritebackup").await;
+                configure_host_chrome(&nvim).await?;
                 Ok::<(), Box<nvim_rs::error::CallError>>(())
             })
             .context("nvim_ui_attach")?;
@@ -225,6 +233,36 @@ impl NvimSession {
         });
     }
 
+    /// Buffer file name and working directory for the host winbar.
+    pub fn fetch_winbar_info(&self) -> WinbarInfo {
+        let nvim = self.nvim.clone();
+        self.rt.block_on(async move {
+            let result = nvim
+                .exec_lua(
+                    r#"
+                    local name = vim.api.nvim_buf_get_name(0)
+                    if name == '' then
+                      name = '[No Name]'
+                    else
+                      name = vim.fn.fnamemodify(name, ':t')
+                    end
+                    local path = vim.fn.getcwd()
+                    local home = vim.env.HOME or vim.env.USERPROFILE
+                    if home and vim.startswith(path, home) then
+                      path = '~' .. path:sub(#home + 1)
+                    end
+                    return { name, path }
+                    "#,
+                    vec![],
+                )
+                .await;
+            result
+                .ok()
+                .and_then(|v| winbar_info_from_value(&v))
+                .unwrap_or_default()
+        })
+    }
+
     /// Read `g:neovide_scroll_animation_length` and `g:neovide_scroll_animation_far_lines` if set.
     pub fn fetch_neovide_scroll_globals(&self) -> (Option<f32>, Option<u32>) {
         let nvim = self.nvim.clone();
@@ -300,6 +338,32 @@ impl Drop for NvimSession {
         self.exit_guard.store(true, Ordering::SeqCst);
         let _ = self.child.start_kill();
     }
+}
+
+async fn configure_host_chrome(nvim: &Nvim) -> Result<(), Box<nvim_rs::error::CallError>> {
+    nvim.command("set laststatus=0 showtabline=0 winbar=")
+        .await?;
+    nvim.exec_lua(
+        r#"
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          pcall(vim.api.nvim_win_set_option, win, 'winbar', '')
+        end
+        "#,
+        vec![],
+    )
+    .await?;
+    Ok(())
+}
+
+fn winbar_info_from_value(v: &Value) -> Option<WinbarInfo> {
+    let arr = v.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    Some(WinbarInfo {
+        file_name: value_as_string(&arr[0]).unwrap_or_else(|| "[No Name]".into()),
+        project: value_as_string(&arr[1]).unwrap_or_default(),
+    })
 }
 
 fn value_as_f32(v: &Value) -> Option<f32> {

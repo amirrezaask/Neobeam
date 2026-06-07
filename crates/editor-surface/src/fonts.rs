@@ -2,6 +2,10 @@
 
 use std::collections::BTreeSet;
 
+/// Bundled Symbols Nerd Font Mono (icon fallback for UI chrome).
+pub const SYMBOLS_NERD_FONT: &[u8] =
+    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+
 /// Monospace font family names installed on this system, sorted alphabetically.
 pub fn list_monospace_fonts() -> Vec<String> {
     let mut db = fontdb::Database::new();

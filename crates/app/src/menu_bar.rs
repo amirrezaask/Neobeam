@@ -1,10 +1,13 @@
-//! Top menu bar (Dear ImGui): Settings menu with font, theme, and animations.
+//! Top menu bar (Dear ImGui): settings control, host winbar, font/theme/animations.
 
 use editor_surface::list_monospace_fonts;
 use imgui::{StyleColor, Ui};
-use nvim_core::session::NvimSession;
+use nvim_core::session::{NvimSession, WinbarInfo};
 
 use crate::settings::Settings;
+
+/// Font Awesome gear from Symbols Nerd Font Mono (merged in ImGui atlas).
+const SETTINGS_LABEL: &str = "\u{f013}";
 
 /// Pixel height reserved for the top menu bar for a given editor font size.
 pub fn menu_bar_height(font_size: f32) -> f32 {
@@ -16,6 +19,7 @@ pub struct MenuBar {
     colorschemes: Vec<String>,
     colorschemes_loaded: bool,
     pub selected_theme: Option<String>,
+    winbar: WinbarInfo,
 }
 
 impl MenuBar {
@@ -25,11 +29,16 @@ impl MenuBar {
             colorschemes: Vec::new(),
             colorschemes_loaded: false,
             selected_theme: None,
+            winbar: WinbarInfo::default(),
         }
     }
 
     pub fn init_theme(&mut self, session: &NvimSession) {
         self.selected_theme = session.current_colorscheme();
+    }
+
+    pub fn refresh_winbar(&mut self, session: &NvimSession) {
+        self.winbar = session.fetch_winbar_info();
     }
 
     pub fn draw(
@@ -42,7 +51,7 @@ impl MenuBar {
         let mut theme_changed = None;
 
         ui.main_menu_bar(|| {
-            ui.menu("Settings", || {
+            ui.menu(SETTINGS_LABEL, || {
                 ui.menu("Font", || {
                     settings_changed |= self.draw_font_menu(ui, settings);
                 });
@@ -58,6 +67,13 @@ impl MenuBar {
                     settings_changed |= self.draw_animations_menu(ui, settings);
                 });
             });
+
+            ui.same_line_with_spacing(0.0, 10.0);
+            ui.separator();
+            ui.same_line_with_spacing(0.0, 10.0);
+            ui.text(&self.winbar.file_name);
+            ui.same_line_with_spacing(0.0, 16.0);
+            ui.text_disabled(&self.winbar.project);
         });
 
         if let Some(name) = theme_changed {
