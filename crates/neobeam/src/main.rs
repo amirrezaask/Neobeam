@@ -13,6 +13,7 @@ mod menu_bar;
 mod project;
 mod project_picker;
 mod settings;
+mod shell_env;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -1164,6 +1165,21 @@ fn parse_cli_project_dir() -> Option<PathBuf> {
     None
 }
 
+/// Directory used when no `--project` flag is given.
+///
+/// macOS `.app` launches (Spotlight, Dock, Finder) start with cwd `/`; fall back to `~`.
+fn resolve_initial_project_dir() -> Option<PathBuf> {
+    if let Some(dir) = parse_cli_project_dir() {
+        return Some(dir);
+    }
+    if let Ok(dir) = std::env::current_dir() {
+        if dir.as_os_str() != "/" {
+            return Some(dir);
+        }
+    }
+    directories::UserDirs::new().map(|d| d.home_dir().to_path_buf())
+}
+
 fn read_clipboard_text() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     clipboard.get_text().ok().filter(|text| !text.is_empty())
@@ -1199,6 +1215,8 @@ fn try_detach_from_terminal() -> Result<bool> {
 }
 
 fn main() -> Result<()> {
+    shell_env::ensure_login_path();
+
     if try_detach_from_terminal()? {
         return Ok(());
     }
@@ -1209,9 +1227,10 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let initial_project = parse_cli_project_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .map(Project::new);
+    let initial_project = resolve_initial_project_dir().map(|dir| {
+        let _ = std::env::set_current_dir(&dir);
+        Project::new(dir)
+    });
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();

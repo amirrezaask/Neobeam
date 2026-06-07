@@ -10,6 +10,8 @@ if ! command -v cargo-bundle >/dev/null 2>&1; then
   exit 1
 fi
 
+"$root/scripts/generate-macos-icon.sh"
+
 cargo bundle --release -p neobeam --format osx
 
 app_path="$root/target/release/bundle/osx/Neobeam.app"

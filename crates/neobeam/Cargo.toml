@@ -11,6 +11,7 @@ path = "src/main.rs"
 [package.metadata.bundle]
 name = "Neobeam"
 identifier = "dev.neobeam.app"
+icon = ["icons/AppIcon.icns"]
 short_description = "GPU-accelerated Neovim GUI"
 category = "Developer Tool"
 osx_minimum_system_version = "11.0"

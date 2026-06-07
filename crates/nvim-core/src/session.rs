@@ -24,6 +24,25 @@ pub type RedrawCallback = Arc<dyn Fn(Vec<Value>) + Send + Sync + 'static>;
 /// (e.g. `:q` / `:qa`), so the host can close the window (§8).
 pub type CloseCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
+fn nvim_executable() -> PathBuf {
+    if let Ok(neovim) = std::env::var("NEOVIM") {
+        let path = PathBuf::from(&neovim);
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from("nvim")
+}
+
+fn nvim_embed_command(working_dir: Option<&PathBuf>) -> Command {
+    let mut cmd = Command::new(nvim_executable());
+    cmd.arg("--embed");
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 #[derive(Clone)]
 struct NvimHandler {
     redraw: RedrawCallback,
@@ -93,11 +112,7 @@ impl NvimSession {
         let working_dir = cfg.working_dir.clone();
         let (nvim, io, child) = rt
             .block_on(async move {
-                let mut cmd = Command::new("nvim");
-                cmd.arg("--embed");
-                if let Some(dir) = &working_dir {
-                    cmd.current_dir(dir);
-                }
+                let mut cmd = nvim_embed_command(working_dir.as_ref());
                 new_child_cmd(&mut cmd, handler).await
             })
             .context("spawn nvim --embed")?;
@@ -345,11 +360,7 @@ impl NvimSession {
         let (nvim, io, child) = self
             .rt
             .block_on(async move {
-                let mut cmd = Command::new("nvim");
-                cmd.arg("--embed");
-                if let Some(dir) = &working_dir {
-                    cmd.current_dir(dir);
-                }
+                let mut cmd = nvim_embed_command(working_dir.as_ref());
                 new_child_cmd(&mut cmd, handler).await
             })
             .context("respawn nvim --embed")?;
