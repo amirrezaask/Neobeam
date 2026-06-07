@@ -34,7 +34,7 @@ impl ProjectPicker {
     pub fn draw(&mut self, ui: &Ui, dt: f32) -> Option<PathBuf> {
         match self.picker.draw(ui, "Session", dt) {
             PickerOutcome::Selected(path) => Some(path),
-            PickerOutcome::None | PickerOutcome::Pinned { .. } => None,
+            PickerOutcome::None => None,
         }
     }
 

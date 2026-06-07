@@ -1,13 +1,9 @@
 //! winit shell: owns the window, GPU renderer, embedded nvim session, grid
-//! state and animation engine, and wires input/resize/redraw together
-//! (AGENT_RUST_PORT.md §3, §7, §8).
+//! state and animation engine, and wires input/resize/redraw together.
 
-mod activity_icons;
 mod app_page;
 mod context_menu;
-mod file_picker;
 mod fuzzy_picker;
-mod grep_picker;
 mod git_client;
 mod git_diff;
 mod imgui_layer;
@@ -16,7 +12,6 @@ mod layout;
 mod menu_bar;
 mod project;
 mod project_picker;
-mod results_panel;
 mod settings;
 
 use std::io::IsTerminal;
@@ -30,15 +25,12 @@ use app_page::AppPage;
 use arboard::Clipboard;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use editor_surface::{AnimationState, ChromeLayout, Renderer};
-use file_picker::{FilePicker, FilePickerOutcome};
-use grep_picker::{GrepMatch, GrepPicker, GrepPickerOutcome};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use layout::{Rect, SimpleLayout};
 use menu_bar::{MenuBar, MenuBarAction};
 use project::Project;
 use project_picker::ProjectPicker;
-use results_panel::{Sidebar, SidebarAction};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -92,11 +84,8 @@ struct App {
     menu_bar: MenuBar,
     layout: SimpleLayout,
     current_page: AppPage,
-    sidebar: Sidebar,
     git_client: GitClient,
     project_picker: ProjectPicker,
-    file_picker: FilePicker,
-    grep_picker: GrepPicker,
     /// Single source of truth for the current project used by all views.
     project: Option<Project>,
     /// True while a winbar RPC is in flight.
@@ -108,12 +97,6 @@ struct App {
 
 fn imgui_active(state: &State) -> bool {
     state.imgui.wants_mouse() || state.imgui.wants_keyboard()
-}
-
-fn cursor_in_activity_bar(state: &State, settings: &Settings) -> bool {
-    let scale = state.renderer.scale() as f64;
-    let width = menu_bar::activity_bar_width(settings.font_size) as f64;
-    state.cursor_pos.0 / scale < width
 }
 
 fn editor_area(settings: &Settings, renderer: &Renderer) -> Rect {
@@ -130,96 +113,41 @@ fn cursor_logical(state: &State) -> (f32, f32) {
     )
 }
 
-fn cursor_in_sidebar(
-    state: &State,
-    settings: &Settings,
-    layout: &SimpleLayout,
-    sidebar: &Sidebar,
-) -> bool {
-    if !sidebar.visible {
-        return false;
-    }
-    let area = editor_area(settings, &state.renderer);
-    let (_, sidebar_rect) = layout.compute(area);
-    let cursor = cursor_logical(state);
-    sidebar_rect.is_some_and(|rect| rect.contains(cursor.0, cursor.1))
-}
-
 fn imgui_captures_input(
     state: &State,
-    settings: &Settings,
-    layout: &SimpleLayout,
-    sidebar: &Sidebar,
     current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
-    if layout.resizing {
-        return true;
-    }
     if current_page == AppPage::GitClient {
         return true;
     }
-    if cursor_in_sidebar(state, settings, layout, sidebar) {
-        return true;
-    }
-    project_picker_open
-        || imgui_active(state)
-        || cursor_in_activity_bar(state, settings)
+    project_picker_open || imgui_active(state)
 }
 
 fn mouse_to_nvim_blocked(
     state: &State,
-    settings: &Settings,
-    layout: &SimpleLayout,
-    sidebar: &Sidebar,
     current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
     if current_page != AppPage::Editor {
-        return true;
-    }
-    if layout.resizing {
-        return true;
-    }
-    if cursor_in_sidebar(state, settings, layout, sidebar) {
         return true;
     }
     project_picker_open
         || state.context_menu.open
-        || imgui_captures_input(
-            state,
-            settings,
-            layout,
-            sidebar,
-            current_page,
-            project_picker_open,
-        )
+        || imgui_captures_input(state, current_page, project_picker_open)
 }
 
 fn keyboard_to_nvim_blocked(
     state: &State,
-    settings: &Settings,
-    layout: &SimpleLayout,
-    sidebar: &Sidebar,
     current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
     if current_page != AppPage::Editor {
         return true;
     }
-    if cursor_in_sidebar(state, settings, layout, sidebar) {
-        return true;
-    }
     project_picker_open
         || state.imgui.wants_keyboard()
-        || imgui_captures_input(
-            state,
-            settings,
-            layout,
-            sidebar,
-            current_page,
-            project_picker_open,
-        )
+        || imgui_captures_input(state, current_page, project_picker_open)
 }
 
 impl App {
@@ -249,39 +177,13 @@ impl App {
             menu_bar,
             layout: SimpleLayout::new(),
             current_page: AppPage::Editor,
-            sidebar: Sidebar::new(),
             git_client,
             project_picker: ProjectPicker::new(),
-            file_picker: FilePicker::new(),
-            grep_picker: GrepPicker::new(),
             project: initial_project,
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
             state: None,
         })
-    }
-
-    fn handle_pin_outcomes(
-        &mut self,
-        pin_file: Option<(Vec<(String, PathBuf)>, String)>,
-        pin_grep: Option<(Vec<GrepMatch>, String, PathBuf)>,
-    ) {
-        let mut needs_redraw = false;
-        if let Some((items, query)) = pin_file {
-            self.layout.show_sidebar();
-            self.sidebar.pin_files(items, query);
-            needs_redraw = true;
-        }
-        if let Some((results, query, project_root)) = pin_grep {
-            self.layout.show_sidebar();
-            self.sidebar.pin_grep(results, query, project_root);
-            needs_redraw = true;
-        }
-        if needs_redraw {
-            if let Some(state) = self.state.as_ref() {
-                state.window.request_redraw();
-            }
-        }
     }
 
     /// Coalesced async winbar refresh. Must not call nvim synchronously from
@@ -320,7 +222,7 @@ impl App {
         let chrome_cfg = self.settings.chrome_layout_config();
         let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
         let area = Rect::from_array(layout.editor_rect);
-        let (main_rect, _) = self.layout.compute(area);
+        let main_rect = self.layout.compute(area);
         let cols = ((main_rect.w / cw).floor() as u32).max(1);
         let rows = ((main_rect.h / ch).floor() as u32).max(1);
 
@@ -435,15 +337,6 @@ impl App {
                     state.window.request_redraw();
                 }
             }
-            MenuBarAction::PageChanged(page) => {
-                self.current_page = page;
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
-                }
-                if page == AppPage::GitClient {
-                    self.schedule_winbar_refresh();
-                }
-            }
         }
     }
 
@@ -507,7 +400,7 @@ impl State {
 
     fn editor_content_rect(&self, settings: &Settings, layout: &SimpleLayout) -> Rect {
         let area = editor_area(settings, &self.renderer);
-        layout.compute(area).0
+        layout.compute(area)
     }
 
     fn hit_test(&self, settings: &Settings, layout: &SimpleLayout) -> (i64, i64) {
@@ -543,18 +436,13 @@ impl State {
         menu_bar: &mut MenuBar,
         layout: &mut SimpleLayout,
         current_page: AppPage,
-        sidebar: &mut Sidebar,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
-        file_picker: &mut FilePicker,
-        grep_picker: &mut GrepPicker,
     ) -> (
         bool,
         MenuBarAction,
         ContextMenuAction,
         Option<PathBuf>,
-        Option<(Vec<(String, PathBuf)>, String)>,
-        Option<(Vec<GrepMatch>, String, PathBuf)>,
     ) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -580,14 +468,12 @@ impl State {
             &chrome_cfg,
         );
         let editor_area_rect = Rect::from_array(chrome_layout.editor_rect);
-        let (main_rect, sidebar_rect) = layout.compute(editor_area_rect);
+        let main_rect = layout.compute(editor_area_rect);
         self.recompute_grid(settings, layout);
 
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let mut project_selection = None;
-        let mut pin_file_list = None;
-        let mut pin_grep_results = None;
         let mut git_wants_redraw = false;
         let window = self.window.clone();
         let session = &self.session;
@@ -602,17 +488,6 @@ impl State {
             device,
             queue,
             |ui| {
-                let window_h = self.renderer.logical_size().1;
-                menu_action = menu_bar.draw(ui, settings, session, current_page, window_h);
-                if let Some(sidebar_rect) = sidebar_rect {
-                    match sidebar.draw(ui, sidebar_rect, dt) {
-                        SidebarAction::None => {}
-                        SidebarAction::OpenFile(path) => session.open_file(path),
-                        SidebarAction::OpenGrepMatch(m) => {
-                            session.open_file_at_line(m.path, m.line_number);
-                        }
-                    }
-                }
                 if current_page == AppPage::GitClient {
                     git_wants_redraw |= git_client.draw(ui, main_rect);
                 }
@@ -627,26 +502,6 @@ impl State {
                     context_action = context_menu.draw(ui);
                 }
                 project_selection = project_picker.draw(ui, dt);
-                match file_picker.draw(ui, dt) {
-                    FilePickerOutcome::None => {}
-                    FilePickerOutcome::Opened(path) => session.open_file(path),
-                    FilePickerOutcome::Pinned { items, query } => {
-                        pin_file_list = Some((items, query));
-                    }
-                }
-                match grep_picker.draw(ui, dt) {
-                    GrepPickerOutcome::None => {}
-                    GrepPickerOutcome::Selected(m) => {
-                        session.open_file_at_line(m.path, m.line_number);
-                    }
-                    GrepPickerOutcome::Pinned {
-                        results,
-                        query,
-                        project_root,
-                    } => {
-                        pin_grep_results = Some((results, query, project_root));
-                    }
-                }
             },
         ) {
             tracing::warn!("imgui frame failed: {e:#}");
@@ -654,8 +509,7 @@ impl State {
 
         let cursor = cursor_logical(self);
         let cursor_in_editor = current_page == AppPage::Editor
-            && main_rect.contains(cursor.0, cursor.1)
-            && !cursor_in_sidebar(self, settings, layout, sidebar);
+            && main_rect.contains(cursor.0, cursor.1);
         let editor_render_rect = if current_page == AppPage::Editor {
             Some([main_rect.x, main_rect.y, main_rect.w, main_rect.h])
         } else {
@@ -703,22 +557,13 @@ impl State {
             || self.anim.render_deadline().is_some();
         if self.context_menu.open
             || project_picker.is_open()
-            || file_picker.is_open()
-            || grep_picker.is_open()
             || needs_anim
             || imgui_active(self)
             || git_wants_redraw
         {
             self.window.request_redraw();
         }
-        (
-            needs_anim,
-            menu_action,
-            context_action,
-            project_selection,
-            pin_file_list,
-            pin_grep_results,
-        )
+        (needs_anim, menu_action, context_action, project_selection)
     }
 }
 
@@ -878,27 +723,15 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
-            let picker_open = self.project_picker.is_open()
-                || self.file_picker.is_open()
-                || self.grep_picker.is_open();
+            let picker_open = self.project_picker.is_open();
             let redraw = state.context_menu.open
                 || picker_open
-                || self.layout.resizing
-                || imgui_captures_input(
-                    state,
-                    &self.settings,
-                    &self.layout,
-                    &self.sidebar,
-                    self.current_page,
-                    picker_open,
-                );
+                || imgui_captures_input(state, self.current_page, picker_open);
             if redraw {
                 state.window.request_redraw();
             }
         }
-        let picker_open = self.project_picker.is_open()
-            || self.file_picker.is_open()
-            || self.grep_picker.is_open();
+        let picker_open = self.project_picker.is_open();
         match event {
             WindowEvent::CloseRequested => {
                 let Some(state) = self.state.as_mut() else {
@@ -947,14 +780,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(ime) => {
                 if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(
-                        s,
-                        &self.settings,
-                        &self.layout,
-                        &self.sidebar,
-                        self.current_page,
-                        picker_open,
-                    )
+                    keyboard_to_nvim_blocked(s, self.current_page, picker_open)
                 }) {
                     return;
                 }
@@ -1003,31 +829,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if self.state.as_ref().is_some_and(|s| {
-                    is_file_picker_shortcut(&event.logical_key, s.mods)
+                    is_page_shortcut(&event.logical_key, s.mods).is_some()
                 }) {
-                    let root = self
-                        .project
+                    let page = self
+                        .state
                         .as_ref()
-                        .map(|p| p.path.clone())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    self.file_picker.open(&root);
-                    if let Some(state) = self.state.as_mut() {
-                        state.window.request_redraw();
-                    }
-                    return;
-                }
-
-                if self.state.as_ref().is_some_and(|s| {
-                    is_grep_picker_shortcut(&event.logical_key, s.mods)
-                }) {
-                    let root = self
-                        .project
-                        .as_ref()
-                        .map(|p| p.path.clone())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    self.grep_picker.open(&root);
-                    if let Some(state) = self.state.as_mut() {
-                        state.window.request_redraw();
+                        .and_then(|s| is_page_shortcut(&event.logical_key, s.mods));
+                    if let Some(page) = page {
+                        self.current_page = page;
+                        if let Some(state) = self.state.as_ref() {
+                            state.window.request_redraw();
+                        }
+                        if page == AppPage::GitClient {
+                            self.schedule_winbar_refresh();
+                        }
                     }
                     return;
                 }
@@ -1038,14 +853,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        keyboard_to_nvim_blocked(
-                            s,
-                            &self.settings,
-                            &self.layout,
-                            &self.sidebar,
-                            self.current_page,
-                            picker_open,
-                        )
+                        keyboard_to_nvim_blocked(s, self.current_page, picker_open)
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -1061,14 +869,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(
-                        s,
-                        &self.settings,
-                        &self.layout,
-                        &self.sidebar,
-                        self.current_page,
-                        picker_open,
-                    )
+                    keyboard_to_nvim_blocked(s, self.current_page, picker_open)
                 }) {
                     return;
                 }
@@ -1094,24 +895,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 state.cursor_pos = (position.x, position.y);
-                if cursor_in_activity_bar(state, &self.settings) || self.layout.resizing {
-                    state.window.request_redraw();
-                }
-                if self.layout.resizing {
-                    let area = editor_area(&self.settings, &state.renderer);
-                    let cursor = cursor_logical(state);
-                    self.layout.update_resize(cursor.0, area);
-                    state.window.request_redraw();
-                    return;
-                }
-                if mouse_to_nvim_blocked(
-                    state,
-                    &self.settings,
-                    &self.layout,
-                    &self.sidebar,
-                    self.current_page,
-                    picker_open,
-                ) {
+                if mouse_to_nvim_blocked(state, self.current_page, picker_open) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -1135,38 +919,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
 
-                if button == MouseButton::Left {
-                    let area = editor_area(&self.settings, &state.renderer);
-                    let cursor = cursor_logical(state);
-                    match btn_state {
-                        ElementState::Pressed => {
-                            if let Some(handle) = self.layout.resize_handle_rect(area) {
-                                if handle.contains(cursor.0, cursor.1) {
-                                    self.layout.resizing = true;
-                                    state.window.request_redraw();
-                                    return;
-                                }
-                            }
-                        }
-                        ElementState::Released => {
-                            if self.layout.resizing {
-                                self.layout.resizing = false;
-                                state.recompute_grid(&self.settings, &self.layout);
-                                state.window.request_redraw();
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                if mouse_to_nvim_blocked(
-                    state,
-                    &self.settings,
-                    &self.layout,
-                    &self.sidebar,
-                    self.current_page,
-                    picker_open,
-                ) {
+                if mouse_to_nvim_blocked(state, self.current_page, picker_open) {
                     state.window.request_redraw();
                     return;
                 }
@@ -1213,14 +966,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(
-                        s,
-                        &self.settings,
-                        &self.layout,
-                        &self.sidebar,
-                        self.current_page,
-                        picker_open,
-                    )
+                    mouse_to_nvim_blocked(s, self.current_page, picker_open)
                 }) {
                     return;
                 }
@@ -1264,8 +1010,6 @@ impl ApplicationHandler<UserEvent> for App {
                     menu_action,
                     context_action,
                     project_selection,
-                    pin_file_list,
-                    pin_grep_results,
                 ) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
@@ -1275,25 +1019,16 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.menu_bar,
                         &mut self.layout,
                         self.current_page,
-                        &mut self.sidebar,
                         &mut self.git_client,
                         &mut self.project_picker,
-                        &mut self.file_picker,
-                        &mut self.grep_picker,
                     )
                 };
-                if !self.sidebar.visible {
-                    self.layout.hide_sidebar();
-                }
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
                 if let Some(path) = project_selection {
                     self.set_project(path);
                 }
-                self.handle_pin_outcomes(pin_file_list, pin_grep_results);
-                let picker_open = self.project_picker.is_open()
-                    || self.file_picker.is_open()
-                    || self.grep_picker.is_open();
+                let picker_open = self.project_picker.is_open();
                 if needs_anim {
                     if let Some(deadline) =
                         self.state.as_ref().and_then(|s| s.anim.render_deadline())
@@ -1309,16 +1044,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // and must not force a continuous Poll loop.
                     s.context_menu.open
                         || picker_open
-                        || self.layout.resizing
                         || (self.current_page == AppPage::Editor
-                            && imgui_captures_input(
-                                s,
-                                &self.settings,
-                                &self.layout,
-                                &self.sidebar,
-                                self.current_page,
-                                picker_open,
-                            ))
+                            && imgui_captures_input(s, self.current_page, picker_open))
                 }) {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
@@ -1333,9 +1060,7 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let picker_open = self.project_picker.is_open()
-            || self.file_picker.is_open()
-            || self.grep_picker.is_open();
+        let picker_open = self.project_picker.is_open();
 
         // For git windows the event loop should stay in Wait mode when idle.
         // Redraws are triggered by the GitRefreshed user-event that the
@@ -1345,18 +1070,8 @@ impl ApplicationHandler<UserEvent> for App {
         let needs_continuous = state.context_menu.open
             || picker_open
             || self.project_picker.is_animating()
-            || self.file_picker.is_animating()
-            || self.grep_picker.is_animating()
-            || self.layout.resizing
             || (self.current_page == AppPage::Editor
-                && imgui_captures_input(
-                    state,
-                    &self.settings,
-                    &self.layout,
-                    &self.sidebar,
-                    self.current_page,
-                    picker_open,
-                ))
+                && imgui_captures_input(state, self.current_page, picker_open))
             || state.anim.is_animating()
             || (self.current_page == AppPage::Editor
                 && state.anim.is_blinking(&state.store));
@@ -1400,18 +1115,19 @@ fn is_project_picker_shortcut(key: &Key, mods: Mods) -> bool {
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p")) && mods.meta
 }
 
-fn is_file_picker_shortcut(key: &Key, mods: Mods) -> bool {
+fn is_page_shortcut(key: &Key, mods: Mods) -> Option<AppPage> {
     if mods.alt || mods.shift || mods.ctrl {
-        return false;
+        return None;
     }
-    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("o")) && mods.meta
-}
-
-fn is_grep_picker_shortcut(key: &Key, mods: Mods) -> bool {
-    if mods.alt || mods.ctrl {
-        return false;
+    if !mods.meta {
+        return None;
     }
-    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("f")) && mods.meta && mods.shift
+    match key {
+        Key::Character(c) if c.as_str() == "1" => Some(AppPage::Editor),
+        Key::Character(c) if c.as_str() == "3" => Some(AppPage::GitClient),
+        Key::Character(c) if c.as_str() == "," => Some(AppPage::Settings),
+        _ => None,
+    }
 }
 
 fn parse_cli_project_dir() -> Option<PathBuf> {

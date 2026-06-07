@@ -1,6 +1,4 @@
-//! Top-level application pages (extensible shell).
-
-use crate::activity_icons;
+//! Top-level application pages.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AppPage {
@@ -10,21 +8,3 @@ pub enum AppPage {
     Settings,
 }
 
-impl AppPage {
-    pub fn label(self) -> &'static str {
-        match self {
-            AppPage::Editor => "Editor",
-            AppPage::GitClient => "Git",
-            AppPage::Settings => "Settings",
-        }
-    }
-
-    /// VS Code codicon for the activity bar (Symbols Nerd Font Mono).
-    pub fn icon(self) -> &'static str {
-        match self {
-            AppPage::Editor => activity_icons::EDITOR,
-            AppPage::GitClient => activity_icons::GIT,
-            AppPage::Settings => activity_icons::SETTINGS,
-        }
-    }
-}
