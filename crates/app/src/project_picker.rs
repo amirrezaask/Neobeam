@@ -1,4 +1,4 @@
-//! Project picker: scans ~/dev for git repos and opens selection in a new nvim-ui process.
+//! Project picker: scans ~/dev for git repos and switches the session working directory.
 
 use std::path::{Path, PathBuf};
 

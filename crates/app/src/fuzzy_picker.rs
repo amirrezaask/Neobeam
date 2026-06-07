@@ -208,9 +208,6 @@ impl<T: Clone> FuzzyPicker<T> {
                     });
             });
 
-        if !self.open {
-            return None;
-        }
         confirmed
     }
 }

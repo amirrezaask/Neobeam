@@ -22,19 +22,6 @@ pub enum FileContent {
     Error(String),
 }
 
-pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from(path)
-}
 
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
     let cwd = cwd.to_str()?;

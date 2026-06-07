@@ -10,6 +10,7 @@ mod git_diff;
 mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
+mod project;
 mod project_picker;
 mod settings;
 
@@ -27,6 +28,7 @@ use editor_surface::{AnimationState, ChromeLayout, Renderer};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
+use project::Project;
 use project_picker::ProjectPicker;
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
@@ -82,7 +84,8 @@ struct App {
     current_page: AppPage,
     git_client: GitClient,
     project_picker: ProjectPicker,
-    project_dir: Option<PathBuf>,
+    /// Single source of truth for the current project used by all views.
+    project: Option<Project>,
     /// True while a winbar RPC is in flight.
     winbar_refresh_pending: bool,
     /// Another flush arrived while a winbar RPC was in flight.
@@ -146,28 +149,34 @@ fn keyboard_to_nvim_blocked(
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>, project_dir: Option<PathBuf>) -> Result<Self> {
+    fn new(proxy: EventLoopProxy<UserEvent>, initial_project: Option<Project>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
         let settings = Settings::load();
-        settings.save(); // ensure a settings.json exists for the user to edit (§9)
+        settings.save();
         let reload_proxy = proxy.clone();
         spawn_watcher(move || {
             let _ = reload_proxy.send_event(UserEvent::SettingsReloaded);
         });
         let git_proxy = proxy.clone();
+        let mut git_client = GitClient::new(move || {
+            let _ = git_proxy.send_event(UserEvent::GitRefreshed);
+        });
+        let mut menu_bar = MenuBar::new();
+        if let Some(p) = &initial_project {
+            git_client.set_project(Some(p.path.clone()));
+            menu_bar.set_project_display(p.display());
+        }
         Ok(App {
             proxy,
             rt,
             settings,
-            menu_bar: MenuBar::new(),
+            menu_bar,
             current_page: AppPage::Editor,
-            git_client: GitClient::new(move || {
-                let _ = git_proxy.send_event(UserEvent::GitRefreshed);
-            }),
+            git_client,
             project_picker: ProjectPicker::new(),
-            project_dir,
+            project: initial_project,
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
             state: None,
@@ -225,7 +234,7 @@ impl App {
             SessionConfig {
                 cols,
                 rows,
-                working_dir: self.project_dir.clone(),
+                working_dir: self.project.as_ref().map(|p| p.path.clone()),
                 ..Default::default()
             },
             redraw,
@@ -346,14 +355,33 @@ impl App {
         state.window.request_redraw();
     }
 
-    fn handle_project_selection(&mut self, path: PathBuf) {
+    /// Switch all views to a new project. This is the single place that
+    /// updates the session cwd, git client, and menu bar together.
+    fn set_project(&mut self, path: PathBuf) {
         if let Err(e) = std::fs::create_dir_all(&path) {
             tracing::warn!("failed to create project dir {}: {e:#}", path.display());
         }
-        match spawn_project_instance(&path) {
-            Ok(()) => tracing::info!("opened project session: {}", path.display()),
-            Err(e) => tracing::warn!("failed to open project session: {e:#}"),
+        let project = Project::new(path);
+
+        // Update the nvim session cwd.
+        let cd_result = self
+            .state
+            .as_mut()
+            .map(|s| s.session.change_working_directory(project.path.clone()));
+        if let Some(Err(e)) = cd_result {
+            tracing::warn!("nvim_set_current_dir failed: {e:#}");
         }
+
+        // Update git client and menu bar synchronously — no async roundtrip.
+        self.git_client.set_project(Some(project.path.clone()));
+        self.menu_bar.set_project_display(project.display());
+        self.project = Some(project);
+
+        tracing::info!(
+            "project: {}",
+            self.project.as_ref().map(|p| p.display()).unwrap_or_default()
+        );
+        self.schedule_winbar_refresh();
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
@@ -443,7 +471,6 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
-        let project_path = menu_bar.project_path().to_string();
         if let Err(e) = self.imgui.prepare_ui(
             &window,
             store,
@@ -457,7 +484,7 @@ impl State {
                         context_action = context_menu.draw(ui);
                     }
                     AppPage::GitClient => {
-                        git_wants_redraw = git_client.draw(ui, &project_path, &layout);
+                        git_wants_redraw = git_client.draw(ui, &layout);
                     }
                 }
                 project_selection = project_picker.draw(ui);
@@ -948,7 +975,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
                 if let Some(path) = project_selection {
-                    self.handle_project_selection(path);
+                    self.set_project(path);
                 }
                 let picker_open = self.project_picker.is_open();
                 if needs_anim {
@@ -1046,18 +1073,6 @@ fn parse_cli_project_dir() -> Option<PathBuf> {
     None
 }
 
-fn spawn_project_instance(path: &PathBuf) -> Result<()> {
-    Command::new(std::env::current_exe()?)
-        .arg("--project")
-        .arg(path)
-        .env(DETACHED_ENV, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-
 fn read_clipboard_text() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     clipboard.get_text().ok().filter(|text| !text.is_empty())
@@ -1103,11 +1118,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let project_dir = parse_cli_project_dir();
+    let initial_project = parse_cli_project_dir().map(Project::new);
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy, project_dir)?;
+    let mut app = App::new(proxy, initial_project)?;
     event_loop.run_app(&mut app)?;
     Ok(())
 }

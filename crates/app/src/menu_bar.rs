@@ -21,6 +21,9 @@ pub struct MenuBar {
     colorschemes_loaded: bool,
     pub selected_theme: Option<String>,
     winbar: WinbarInfo,
+    /// Authoritative project display string, set directly by the app when the
+    /// project changes (not derived from nvim's async getcwd).
+    project_display: String,
 }
 
 impl MenuBar {
@@ -31,6 +34,7 @@ impl MenuBar {
             colorschemes_loaded: false,
             selected_theme: None,
             winbar: WinbarInfo::default(),
+            project_display: String::new(),
         }
     }
 
@@ -48,8 +52,9 @@ impl MenuBar {
         }
     }
 
-    pub fn project_path(&self) -> &str {
-        &self.winbar.project
+    /// Set the project display string (e.g. `~/dev/my-project`).
+    pub fn set_project_display(&mut self, display: String) {
+        self.project_display = display;
     }
 
     pub fn draw(
@@ -103,7 +108,7 @@ impl MenuBar {
             ui.same_line_with_spacing(0.0, 10.0);
             ui.text(&self.winbar.file_name);
             ui.same_line_with_spacing(0.0, 16.0);
-            ui.text_disabled(&self.winbar.project);
+            ui.text_disabled(&self.project_display);
         });
 
         if let Some(page) = page_changed {

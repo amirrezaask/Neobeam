@@ -241,6 +241,18 @@ impl NvimSession {
         });
     }
 
+    /// Change the embedded nvim working directory (`nvim_set_current_dir`).
+    pub fn change_working_directory(&mut self, path: PathBuf) -> Result<()> {
+        let dir = path.canonicalize().unwrap_or(path);
+        let dir_str = dir.to_string_lossy().into_owned();
+        let nvim = self.nvim.clone();
+        self.rt
+            .block_on(async move { nvim.set_current_dir(&dir_str).await })
+            .context("nvim_set_current_dir")?;
+        self.cfg.working_dir = Some(dir);
+        Ok(())
+    }
+
     /// Buffer file name and working directory for the host winbar.
     pub fn fetch_winbar_info(&self) -> WinbarInfo {
         let nvim = self.nvim.clone();
@@ -297,11 +309,15 @@ impl NvimSession {
         self.kill();
 
         let handler = NvimHandler { redraw: self.redraw.clone() };
+        let working_dir = self.cfg.working_dir.clone();
         let (nvim, io, child) = self
             .rt
             .block_on(async move {
                 let mut cmd = Command::new("nvim");
                 cmd.arg("--embed");
+                if let Some(dir) = &working_dir {
+                    cmd.current_dir(dir);
+                }
                 new_child_cmd(&mut cmd, handler).await
             })
             .context("respawn nvim --embed")?;

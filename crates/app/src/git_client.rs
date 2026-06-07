@@ -22,7 +22,7 @@ use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 
 use crate::git_diff::{
-    commit_staged, expand_tilde, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
+    commit_staged, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
     push as git_push, repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file,
     unstage_hunk, ChangedFile, FileContent,
 };
@@ -145,12 +145,13 @@ pub struct GitClient {
     error: Option<String>,
     repo_root: Option<PathBuf>,
     generation: u64,
-    cwd: String,
+    /// Current project path (absolute). Kept in sync with `shared_project`.
+    project: Option<PathBuf>,
     current_hunk: usize,
     scroll_to_hunk: Option<usize>,
 
-    // Shared cwd so the refresh thread always uses the latest project path.
-    shared_cwd: Arc<Mutex<Option<String>>>,
+    /// Shared absolute project path for the background refresh thread.
+    shared_project: Arc<Mutex<Option<PathBuf>>>,
     // Send () to wake the refresh thread early (e.g. after a git op).
     refresh_wake: mpsc::SyncSender<()>,
     // Receive file-list updates from the refresh thread.
@@ -171,12 +172,12 @@ impl GitClient {
         let on_change = Arc::new(on_change);
 
         // ── Refresh thread ────────────────────────────────────────────────
-        let shared_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let shared_project: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
         let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
         let (refresh_tx, refresh_rx) = mpsc::sync_channel::<RefreshResult>(1);
 
-        let cwd_ref = shared_cwd.clone();
+        let project_ref = shared_project.clone();
         let on_change_refresh = on_change.clone();
         std::thread::Builder::new()
             .name("git-refresh".into())
@@ -186,11 +187,10 @@ impl GitClient {
                     // refresh regardless.
                     let _ = wake_rx.recv_timeout(Duration::from_secs(1));
 
-                    let cwd_opt = cwd_ref.lock().unwrap().clone();
-                    let Some(cwd) = cwd_opt else {
+                    let path = project_ref.lock().unwrap().clone();
+                    let Some(path) = path else {
                         continue;
                     };
-                    let path = expand_tilde(&cwd);
                     let repo = repo_root(&path);
                     let files = repo
                         .as_ref()
@@ -234,10 +234,10 @@ impl GitClient {
             error: None,
             repo_root: None,
             generation: 0,
-            cwd: String::new(),
+            project: None,
             current_hunk: 0,
             scroll_to_hunk: None,
-            shared_cwd,
+            shared_project,
             refresh_wake: wake_tx,
             refresh_rx,
             diff_tx,
@@ -246,15 +246,24 @@ impl GitClient {
         }
     }
 
+    /// Update the current project. Immediately wakes the refresh thread.
+    pub fn set_project(&mut self, path: Option<PathBuf>) {
+        if self.project == path {
+            return;
+        }
+        self.project = path.clone();
+        *self.shared_project.lock().unwrap() = path;
+        self.files.clear();
+        self.selected = None;
+        self.cached_diff = None;
+        self.repo_root = None;
+        self.error = None;
+        let _ = self.refresh_wake.try_send(());
+    }
+
     /// Draw the git client UI.  Returns `true` when new data arrived from a
     /// background thread and a redraw should be scheduled.
-    pub fn draw(&mut self, ui: &Ui, project_path: &str, layout: &ChromeLayout) -> bool {
-        if project_path != self.cwd {
-            self.cwd = project_path.to_string();
-            *self.shared_cwd.lock().unwrap() = Some(self.cwd.clone());
-            // Trigger an immediate refresh for the new project.
-            let _ = self.refresh_wake.try_send(());
-        }
+    pub fn draw(&mut self, ui: &Ui, layout: &ChromeLayout) -> bool {
 
         let mut wants_redraw = false;
 
