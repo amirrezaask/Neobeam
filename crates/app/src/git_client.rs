@@ -9,8 +9,8 @@ use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 
 use crate::git_diff::{
     commit_staged, expand_tilde, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
-    repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file, unstage_hunk,
-    ChangedFile, FileContent,
+    push as git_push, repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file,
+    unstage_hunk, ChangedFile, FileContent,
 };
 
 const MAX_DIFF_LINES: usize = 2000;
@@ -211,6 +211,20 @@ impl GitClient {
         ui.same_line_with_spacing(0.0, 16.0);
         if ui.button("Refresh") {
             self.refresh_files();
+        }
+        ui.same_line();
+        if ui.button("Push") {
+            self.push_changes();
+        }
+    }
+
+    fn push_changes(&mut self) {
+        let Some(repo) = self.repo_root.clone() else {
+            return;
+        };
+        match git_push(&repo) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(e),
         }
     }
 

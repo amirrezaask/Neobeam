@@ -61,6 +61,11 @@ pub fn unstage_file(repo: &Path, path: &str) -> Result<(), String> {
     git_file_op(repo, &["restore", "--staged", "--", path], "unstage file")
 }
 
+/// Push the current branch to its configured upstream.
+pub fn push(repo: &Path) -> Result<(), String> {
+    git_file_op(repo, &["push"], "push")
+}
+
 /// Commit all staged changes with the given message.
 pub fn commit_staged(repo: &Path, message: &str) -> Result<(), String> {
     let repo_str = repo
