@@ -66,6 +66,7 @@ struct State {
     anim: AnimationState,
     last_frame: Instant,
     frame_count: u64,
+    #[cfg(debug_assertions)]
     fps: f32,
     mods: Mods,
     ime_active: bool,
@@ -278,6 +279,7 @@ impl App {
             anim,
             last_frame: Instant::now(),
             frame_count: 0,
+            #[cfg(debug_assertions)]
             fps: 0.0,
             mods: Mods::default(),
             ime_active: false,
@@ -461,6 +463,7 @@ impl State {
 
         // Only update from "active" frames; a huge dt means we woke from idle
         // (the gate stopped requesting frames), which isn't a real frame time.
+        #[cfg(debug_assertions)]
         if dt > 0.0 && dt < 0.1 {
             let inst = 1.0 / dt;
             self.fps = if self.fps == 0.0 {
@@ -469,7 +472,16 @@ impl State {
                 self.fps * 0.9 + inst * 0.1
             };
         }
-        let overlay = Some(format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0));
+        let overlay: Option<String> = {
+            #[cfg(debug_assertions)]
+            {
+                Some(format!("{:>3.0} FPS  {:>4.1} ms", self.fps, dt * 1000.0))
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                None
+            }
+        };
 
         let (cw, ch) = self.renderer.cell_size();
         let chrome_cfg = settings.chrome_layout_config();
