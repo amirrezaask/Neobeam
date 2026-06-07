@@ -20,7 +20,8 @@ impl BarPlacement {
 
 #[derive(Debug, Clone)]
 pub struct ChromeLayoutConfig {
-    pub menu_bar_height: f32,
+    /// Width of the vertical activity bar on the left (VS Code-style).
+    pub activity_bar_width: f32,
     pub custom_cmdline_enabled: bool,
     pub custom_bar_enabled: bool,
     pub bar_placement: BarPlacement,
@@ -34,7 +35,7 @@ pub struct ChromeLayoutConfig {
 impl Default for ChromeLayoutConfig {
     fn default() -> Self {
         ChromeLayoutConfig {
-            menu_bar_height: 28.0,
+            activity_bar_width: 0.0,
             custom_cmdline_enabled: false,
             custom_bar_enabled: false,
             bar_placement: BarPlacement::Bottom,
@@ -61,6 +62,7 @@ pub struct ChromeLayout {
     pub editor_h: f32,
     /// Editor region as `[x, y, w, h]` in logical pixels.
     pub editor_rect: [f32; 4],
+    pub activity_bar_width: f32,
     pub top_stack_h: f32,
     pub statusbar_y: f32,
     pub cmdline_y: f32,
@@ -76,16 +78,18 @@ impl ChromeLayout {
         let cmdline_h = if cmdline { cfg.cmdline_height } else { 0.0 };
         let msg_h = 0.0;
         let bottom_stack = bar_h + cmdline_h + msg_h;
-        let top_stack = cfg.menu_bar_height;
-        let editor_h = (window_h - top_stack - bottom_stack).max(1.0);
+        let left_stack = cfg.activity_bar_width;
+        let editor_w = (window_w - left_stack).max(1.0);
+        let editor_h = (window_h - bottom_stack).max(1.0);
 
         ChromeLayout {
             window_w,
             window_h,
-            editor_y: top_stack,
+            editor_y: 0.0,
             editor_h,
-            editor_rect: [0.0, top_stack, window_w, editor_h],
-            top_stack_h: top_stack,
+            editor_rect: [left_stack, 0.0, editor_w, editor_h],
+            activity_bar_width: left_stack,
+            top_stack_h: 0.0,
             statusbar_y: window_h - bar_h - cmdline_h - msg_h,
             cmdline_y: window_h - cmdline_h - msg_h,
             bottom_stack_h: bottom_stack,
@@ -93,7 +97,7 @@ impl ChromeLayout {
     }
 
     pub fn editor_grid_size(&self, cell_w: f32, cell_h: f32) -> (u32, u32) {
-        let cols = ((self.window_w / cell_w).floor() as u32).max(1);
+        let cols = ((self.editor_rect[2] / cell_w).floor() as u32).max(1);
         let rows = ((self.editor_h / cell_h).floor() as u32).max(1);
         (cols, rows)
     }

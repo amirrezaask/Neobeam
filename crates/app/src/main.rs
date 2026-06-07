@@ -2,6 +2,7 @@
 //! state and animation engine, and wires input/resize/redraw together
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
+mod activity_icons;
 mod app_page;
 mod context_menu;
 mod file_picker;
@@ -109,11 +110,10 @@ fn imgui_active(state: &State) -> bool {
     state.imgui.wants_mouse() || state.imgui.wants_keyboard()
 }
 
-fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
+fn cursor_in_activity_bar(state: &State, settings: &Settings) -> bool {
     let scale = state.renderer.scale() as f64;
-    let (lw, lh) = state.renderer.logical_size();
-    let layout = ChromeLayout::compute(lw, lh, &settings.chrome_layout_config());
-    state.cursor_pos.1 / scale < layout.editor_y as f64
+    let width = menu_bar::activity_bar_width(settings.font_size) as f64;
+    state.cursor_pos.0 / scale < width
 }
 
 fn app_page_to_view(page: AppPage) -> ViewKind {
@@ -178,7 +178,7 @@ fn imgui_captures_input(
     }
     project_picker_open
         || imgui_active(state)
-        || cursor_in_menu_bar(state, settings)
+        || cursor_in_activity_bar(state, settings)
 }
 
 fn mouse_to_nvim_blocked(
@@ -289,7 +289,6 @@ impl App {
                 let win_id = self.tiling.add_view_window(ViewKind::FileList, area);
                 self.file_list_panels.push((win_id, panel));
             }
-            state.recompute_grid(&self.settings, &self.tiling);
             state.window.request_redraw();
         }
         if let Some((results, query, project_root)) = pin_grep {
@@ -305,7 +304,6 @@ impl App {
                 let win_id = self.tiling.add_view_window(ViewKind::GrepResults, area);
                 self.grep_result_panels.push((win_id, panel));
             }
-            state.recompute_grid(&self.settings, &self.tiling);
             state.window.request_redraw();
         }
     }
@@ -469,7 +467,6 @@ impl App {
                 if let Some(state) = self.state.as_mut() {
                     let area = editor_area(&self.settings, &state.renderer);
                     self.tiling.open_or_focus(app_page_to_view(page), area);
-                    state.recompute_grid(&self.settings, &self.tiling);
                     state.window.request_redraw();
                 }
                 if page == AppPage::GitClient {
@@ -576,8 +573,15 @@ impl State {
         let Some(editor_id) = tiling.editor_win() else {
             return;
         };
-        let visual = tiling.visual_rect(editor_id, &rects);
-        let content = tiling.content_rect(visual);
+        // Use the settled layout rect, not the spring-animated visual rect.
+        // Resizing nvim every animation frame clears the grid and leaves a blank pane.
+        let target = rects.get(&editor_id).copied().unwrap_or(Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        });
+        let content = tiling.content_rect(target);
         let (cw, ch) = self.renderer.cell_size();
         let cols = ((content.w / cw).floor() as u32).max(1);
         let rows = ((content.h / ch).floor() as u32).max(1);
@@ -633,7 +637,15 @@ impl State {
         let editor_area_rect = Rect::from_array(layout.editor_rect);
         let window_rects = tiling.compute_rects(editor_area_rect);
         let tiling_animating = tiling.update_anim(dt);
-        self.recompute_grid(settings, tiling);
+        // Only resize nvim when the layout has fully settled.  Calling
+        // session.resize during animation puts the render loop in Poll mode
+        // while nvim processes the resize; if nvim sends grid_clear in a
+        // separate notification before flush, a poll frame renders a blank
+        // grid.  Deferring until !tiling_animating means exactly one resize
+        // fires on the first stable frame, with no intermediate blank frames.
+        if !tiling_animating {
+            self.recompute_grid(settings, tiling);
+        }
         let focused_page = view_to_app_page(tiling.focused_view());
 
         let mut menu_action = MenuBarAction::None;
@@ -661,8 +673,13 @@ impl State {
             device,
             queue,
             |ui| {
-                menu_action = menu_bar.draw(ui, settings, session, focused_page);
-                tiling.draw_chrome(ui, &window_rects);
+                let window_h = self.renderer.logical_size().1;
+                menu_action = menu_bar.draw(ui, settings, session, focused_page, window_h);
+                let editor_winbar = Some((
+                    menu_bar.winbar_file_name(),
+                    menu_bar.project_display(),
+                ));
+                tiling.draw_chrome(ui, &window_rects, editor_winbar);
                 for win_id in &git_windows {
                     let visual = tiling.visual_rect(*win_id, &window_rects);
                     let content = tiling.content_rect(visual);
@@ -759,7 +776,7 @@ impl State {
             store,
             anim,
             overlay.as_deref(),
-            [0.0, layout.editor_y, 0.0, 0.0],
+            [layout.editor_rect[0], layout.editor_rect[1], 0.0, 0.0],
             true,
             |device, queue, pass| {
                 if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
@@ -1153,7 +1170,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 state.cursor_pos = (position.x, position.y);
-                if cursor_in_menu_bar(state, &self.settings) || self.tiling.is_dragging() {
+                if cursor_in_activity_bar(state, &self.settings) || self.tiling.is_dragging() {
                     state.window.request_redraw();
                 }
                 if self.tiling.is_dragging() {
@@ -1196,7 +1213,6 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(win_id) = self.tiling.hit_close_button(cursor, &rects)
                             {
                                 self.tiling.hide_window(win_id, area);
-                                state.recompute_grid(&self.settings, &self.tiling);
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1204,7 +1220,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.tiling.hit_fullscreen_button(cursor, &rects)
                             {
                                 self.tiling.fullscreen(win_id, area);
-                                state.recompute_grid(&self.settings, &self.tiling);
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1221,7 +1236,6 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Released => {
                             if self.tiling.is_dragging() {
                                 self.tiling.commit_drop(area);
-                                state.recompute_grid(&self.settings, &self.tiling);
                                 state.window.request_redraw();
                                 return;
                             }

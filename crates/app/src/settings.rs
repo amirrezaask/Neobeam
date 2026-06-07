@@ -65,7 +65,7 @@ impl Default for Settings {
 impl Settings {
     pub fn chrome_layout_config(&self) -> ChromeLayoutConfig {
         ChromeLayoutConfig {
-            menu_bar_height: crate::menu_bar::menu_bar_height(self.font_size),
+            activity_bar_width: crate::menu_bar::activity_bar_width(self.font_size),
             ..ChromeLayoutConfig::default()
         }
     }

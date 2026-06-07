@@ -691,7 +691,12 @@ impl TilingManager {
         None
     }
 
-    pub fn draw_chrome(&self, ui: &Ui, rects: &HashMap<WinId, Rect>) {
+    pub fn draw_chrome(
+        &self,
+        ui: &Ui,
+        rects: &HashMap<WinId, Rect>,
+        editor_winbar: Option<(&str, &str)>,
+    ) {
         let draw = ui.get_background_draw_list();
 
         let show_fullscreen = self.can_fullscreen();
@@ -699,10 +704,29 @@ impl TilingManager {
             let visual = self.visual_rect(win.id, rects);
             let tb = self.title_bar_rect(visual);
             let focused = win.id == self.focused;
+            let title = if win.view == ViewKind::Editor {
+                match editor_winbar {
+                    Some((file, project)) => {
+                        let file_w = if project.is_empty() {
+                            0.0
+                        } else {
+                            ui.calc_text_size(file)[0]
+                        };
+                        TitleBarText::Winbar {
+                            file,
+                            project,
+                            file_w,
+                        }
+                    }
+                    None => TitleBarText::Plain(&win.title),
+                }
+            } else {
+                TitleBarText::Plain(&win.title)
+            };
             draw_title_bar(
                 &draw,
                 tb,
-                &win.title,
+                title,
                 focused,
                 self.is_dragging(),
                 self.can_close(win.id),
@@ -907,10 +931,19 @@ fn close_button_rect(title_bar: Rect, show_fullscreen: bool) -> Rect {
     }
 }
 
+enum TitleBarText<'a> {
+    Plain(&'a str),
+    Winbar {
+        file: &'a str,
+        project: &'a str,
+        file_w: f32,
+    },
+}
+
 fn draw_title_bar(
     draw: &DrawListMut<'_>,
     rect: Rect,
-    title: &str,
+    title: TitleBarText<'_>,
     focused: bool,
     dragging: bool,
     show_close: bool,
@@ -942,9 +975,29 @@ fn draw_title_bar(
     } else {
         [0.65, 0.67, 0.72, 1.0]
     };
+    let muted_color = if focused {
+        [0.55, 0.57, 0.62, 1.0]
+    } else {
+        [0.45, 0.47, 0.52, 1.0]
+    };
     let text_x = rect.x + 10.0;
     let text_y = rect.y + (rect.h - 14.0) * 0.5;
-    draw.add_text([text_x, text_y], text_color, title);
+    match title {
+        TitleBarText::Plain(label) => {
+            draw.add_text([text_x, text_y], text_color, label);
+        }
+        TitleBarText::Winbar {
+            file,
+            project,
+            file_w,
+        } => {
+            draw.add_text([text_x, text_y], text_color, file);
+            if !project.is_empty() {
+                let project_x = text_x + file_w + 16.0;
+                draw.add_text([project_x, text_y], muted_color, project);
+            }
+        }
+    }
 
     if show_close {
         draw_close_button(draw, close_button_rect(rect, show_fullscreen), focused);

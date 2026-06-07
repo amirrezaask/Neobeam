@@ -1,18 +1,84 @@
-//! Top menu bar (Dear ImGui): settings control, host winbar, font/theme/animations.
+//! Left activity bar (Dear ImGui): settings, page icons; winbar lives in the editor title bar.
 
 use editor_surface::list_monospace_fonts;
-use imgui::{StyleColor, Ui};
+use imgui::{Condition, StyleColor, StyleVar, Ui, WindowFlags};
 use nvim_core::session::{NvimSession, WinbarInfo};
 
+use crate::activity_icons;
 use crate::app_page::AppPage;
 use crate::settings::Settings;
 
-/// Font Awesome gear from Symbols Nerd Font Mono (merged in ImGui atlas).
-const SETTINGS_LABEL: &str = "\u{f013}";
+const SETTINGS_POPUP: &str = "##settings_popup";
 
-/// Pixel height reserved for the top menu bar for a given editor font size.
-pub fn menu_bar_height(font_size: f32) -> f32 {
-    (font_size * 1.4 + 10.0).round().max(32.0)
+/// Pixel width of the vertical activity bar for a given editor font size.
+pub fn activity_bar_width(font_size: f32) -> f32 {
+    (font_size * 2.5 + 8.0).round().max(40.0)
+}
+
+fn activity_bar_bg_from_theme(theme_bg: [f32; 4]) -> [f32; 4] {
+    [
+        theme_bg[0] * 0.88,
+        theme_bg[1] * 0.88,
+        theme_bg[2] * 0.88,
+        1.0,
+    ]
+}
+
+fn blend_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let u = 1.0 - t;
+    [
+        a[0] * u + b[0] * t,
+        a[1] * u + b[1] * t,
+        a[2] * u + b[2] * t,
+        a[3] * u + b[3] * t,
+    ]
+}
+
+/// Full-width activity bar item: bar-colored by default, highlight on hover/active.
+fn draw_activity_item(
+    ui: &Ui,
+    id: &str,
+    icon: &str,
+    width: f32,
+    height: f32,
+    selected: bool,
+) -> bool {
+    let bar_bg = ui.style_color(StyleColor::WindowBg);
+    let hover_bg = blend_rgba(bar_bg, ui.style_color(StyleColor::Text), 0.08);
+    let active_bg = blend_rgba(bar_bg, ui.style_color(StyleColor::CheckMark), 0.14);
+
+    let pos = ui.cursor_screen_pos();
+    let clicked = ui.invisible_button(id, [width, height]);
+    let hovered = ui.is_item_hovered();
+
+    let bg = if selected {
+        active_bg
+    } else if hovered {
+        hover_bg
+    } else {
+        bar_bg
+    };
+
+    let draw = ui.get_window_draw_list();
+    let min = pos;
+    let max = [pos[0] + width, pos[1] + height];
+    draw.add_rect(min, max, bg).filled(true).rounding(0.0).build();
+
+    if selected {
+        let accent = ui.style_color(StyleColor::CheckMark);
+        draw.add_rect([min[0], min[1]], [min[0] + 2.0, max[1]], accent)
+            .filled(true)
+            .rounding(0.0)
+            .build();
+    }
+
+    let icon_size = ui.calc_text_size(icon);
+    let text_x = min[0] + (width - icon_size[0]) * 0.5;
+    let text_y = min[1] + (height - icon_size[1]) * 0.5;
+    draw.add_text([text_x, text_y], ui.style_color(StyleColor::Text), icon);
+
+    clicked
 }
 
 pub struct MenuBar {
@@ -57,59 +123,84 @@ impl MenuBar {
         self.project_display = display;
     }
 
+    pub fn winbar_file_name(&self) -> &str {
+        &self.winbar.file_name
+    }
+
+    pub fn project_display(&self) -> &str {
+        &self.project_display
+    }
+
     pub fn draw(
         &mut self,
         ui: &Ui,
         settings: &mut Settings,
         session: &NvimSession,
         focused_page: AppPage,
+        window_h: f32,
     ) -> MenuBarAction {
         let mut settings_changed = false;
         let mut theme_changed = None;
         let mut page_changed = None;
 
-        ui.main_menu_bar(|| {
-            ui.menu(SETTINGS_LABEL, || {
-                ui.menu("Font", || {
-                    settings_changed |= self.draw_font_menu(ui, settings);
-                });
+        let width = activity_bar_width(settings.font_size);
+        let item_h = width;
 
-                ui.menu("Theme", || {
-                    if let Some(name) = self.draw_theme_menu(ui, session) {
-                        self.selected_theme = Some(name.clone());
-                        theme_changed = Some(name);
-                    }
-                });
+        let flags = WindowFlags::NO_TITLE_BAR
+            | WindowFlags::NO_RESIZE
+            | WindowFlags::NO_MOVE
+            | WindowFlags::NO_COLLAPSE
+            | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+            | WindowFlags::NO_NAV_FOCUS;
 
-                ui.menu("Animations", || {
-                    settings_changed |= self.draw_animations_menu(ui, settings);
-                });
-            });
+        let bar_bg = activity_bar_bg_from_theme(ui.style_color(StyleColor::WindowBg));
+        let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+        let _space = ui.push_style_var(StyleVar::ItemSpacing([0.0, 0.0]));
+        let _bg = ui.push_style_color(StyleColor::WindowBg, bar_bg);
 
-            ui.same_line_with_spacing(0.0, 10.0);
-            ui.separator();
-            ui.same_line_with_spacing(0.0, 10.0);
-
-            // Use buttons for page tabs: a Selectable with default size fills the
-            // remaining width of the menu bar and swallows hover/clicks for the
-            // rest of the row. Buttons size to their label instead.
-            for page in [AppPage::Editor, AppPage::GitClient] {
-                let selected = focused_page == page;
-                let _color = selected.then(|| {
-                    ui.push_style_color(StyleColor::Button, ui.style_color(StyleColor::ButtonActive))
-                });
-                if ui.button(page.label()) && !selected {
-                    page_changed = Some(page);
+        ui.window("##activity_bar")
+            .position([0.0, 0.0], Condition::Always)
+            .size([width, window_h], Condition::Always)
+            .flags(flags)
+            .movable(false)
+            .resizable(false)
+            .build(|| {
+                if draw_activity_item(
+                    ui,
+                    "##settings",
+                    activity_icons::SETTINGS,
+                    width,
+                    item_h,
+                    false,
+                ) {
+                    ui.open_popup(SETTINGS_POPUP);
                 }
-                ui.same_line_with_spacing(0.0, 6.0);
-            }
+                if let Some(_popup) = ui.begin_popup(SETTINGS_POPUP) {
+                    ui.menu("Font", || {
+                        settings_changed |= self.draw_font_menu(ui, settings);
+                    });
 
-            ui.separator();
-            ui.same_line_with_spacing(0.0, 10.0);
-            ui.text(&self.winbar.file_name);
-            ui.same_line_with_spacing(0.0, 16.0);
-            ui.text_disabled(&self.project_display);
-        });
+                    ui.menu("Theme", || {
+                        if let Some(name) = self.draw_theme_menu(ui, session) {
+                            self.selected_theme = Some(name.clone());
+                            theme_changed = Some(name);
+                        }
+                    });
+
+                    ui.menu("Animations", || {
+                        settings_changed |= self.draw_animations_menu(ui, settings);
+                    });
+                }
+
+                for page in [AppPage::Editor, AppPage::GitClient] {
+                    let selected = focused_page == page;
+                    if draw_activity_item(ui, page.label(), page.icon(), width, item_h, selected)
+                        && !selected
+                    {
+                        page_changed = Some(page);
+                    }
+                }
+            });
 
         if let Some(page) = page_changed {
             MenuBarAction::PageChanged(page)

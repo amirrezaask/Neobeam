@@ -297,6 +297,10 @@ mod tests {
         let symbols = load_symbols_font().expect("symbols font should parse");
         assert!(font_has_glyph(&symbols, '\u{E0B0}')); // powerline separator
         assert!(font_has_glyph(&symbols, '\u{E7A8}')); // devicon
+        // VS Code codicons used in the host activity bar
+        assert!(font_has_glyph(&symbols, '\u{EA68}')); // source-control
+        assert!(font_has_glyph(&symbols, '\u{EAE9}')); // file-code
+        assert!(font_has_glyph(&symbols, '\u{EB51}')); // settings-gear
     }
 
     #[test]

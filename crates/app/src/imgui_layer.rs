@@ -188,8 +188,13 @@ impl ImguiLayer {
     }
 }
 
-/// Font Awesome gear (`\u{f013}`) in Symbols Nerd Font Mono.
-static NERD_ICON_GLYPH_RANGES: &[u32] = &[0xf000, 0xf2ff, 0];
+/// Symbols Nerd Font Mono ranges merged into the ImGui atlas for UI chrome icons.
+/// Codicons (activity bar) + Font Awesome (legacy pickers/menus).
+static NERD_ICON_GLYPH_RANGES: &[u32] = &[
+    0xea60, 0xec1e, // codicons (VS Code activity bar)
+    0xf000, 0xf2ff, // font awesome
+    0,
+];
 
 fn load_font(ctx: &mut Context, font_size_px: f32, hidpi: f32) {
     let size = font_size_px * hidpi;
