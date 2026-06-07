@@ -144,7 +144,6 @@ impl NvimSession {
                     .set_messages_externa(msgs);
                 nvim.ui_attach(cols, rows, &opts).await?;
                 let _ = nvim.command("set noswapfile nobackup nowritebackup").await;
-                configure_host_chrome(&nvim).await?;
                 Ok::<(), Box<nvim_rs::error::CallError>>(())
             })
             .context("nvim_ui_attach")?;
@@ -407,21 +406,6 @@ async fn fetch_winbar_info_async(nvim: &Nvim) -> WinbarInfo {
         .ok()
         .and_then(|v| winbar_info_from_value(&v))
         .unwrap_or_default()
-}
-
-async fn configure_host_chrome(nvim: &Nvim) -> Result<(), Box<nvim_rs::error::CallError>> {
-    nvim.command("set laststatus=0 showtabline=0 winbar=")
-        .await?;
-    nvim.exec_lua(
-        r#"
-        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-          pcall(vim.api.nvim_win_set_option, win, 'winbar', '')
-        end
-        "#,
-        vec![],
-    )
-    .await?;
-    Ok(())
 }
 
 fn winbar_info_from_value(v: &Value) -> Option<WinbarInfo> {
