@@ -2,8 +2,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-icon_src="$root/icons/1.png"
-icon_dst="$root/icons/AppIcon.icns"
+icon_src="$root/assets/icons/1.png"
+icon_dst="$root/assets/icons/AppIcon.icns"
 iconset_dir="$(mktemp -d)"
 iconset_path="$iconset_dir/AppIcon.iconset"
 
