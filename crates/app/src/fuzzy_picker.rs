@@ -4,8 +4,8 @@ use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
 
 const WINDOW_ID_SUFFIX: &str = "##fuzzy_picker";
 const INPUT_ID: &str = "##fuzzy_query";
-pub(crate) const PICKER_DEFAULT_WIDTH: f32 = 720.0;
-pub(crate) const PICKER_DEFAULT_HEIGHT: f32 = 500.0;
+const PICKER_WIDTH_FRACTION: f32 = 0.9;
+const PICKER_HEIGHT_FRACTION: f32 = 0.6;
 pub(crate) const PICKER_MIN_WIDTH: f32 = 400.0;
 pub(crate) const PICKER_MIN_HEIGHT: f32 = 200.0;
 
@@ -79,10 +79,19 @@ pub struct FuzzyPicker<T: Clone> {
     focus_input: bool,
 }
 
-pub(crate) fn picker_initial_position(ui: &Ui) -> [f32; 2] {
+pub(crate) fn picker_default_size(ui: &Ui) -> [f32; 2] {
     let display = ui.io().display_size;
     [
-        (display[0] - PICKER_DEFAULT_WIDTH) * 0.5,
+        display[0] * PICKER_WIDTH_FRACTION,
+        display[1] * PICKER_HEIGHT_FRACTION,
+    ]
+}
+
+pub(crate) fn picker_initial_position(ui: &Ui) -> [f32; 2] {
+    let display = ui.io().display_size;
+    let [width, _] = picker_default_size(ui);
+    [
+        (display[0] - width) * 0.5,
         display[1] * 0.2,
     ]
 }
@@ -207,16 +216,14 @@ impl<T: Clone> FuzzyPicker<T> {
 
         let window_name = format!("{title}{WINDOW_ID_SUFFIX}");
         let pos = picker_initial_position(ui);
+        let size = picker_default_size(ui);
 
         let mut confirmed = None;
         // Apply fade alpha to the entire popup.
         let _alpha_token = ui.push_style_var(StyleVar::Alpha(self.alpha));
         ui.window(&window_name)
             .position(pos, Condition::FirstUseEver)
-            .size(
-                [PICKER_DEFAULT_WIDTH, PICKER_DEFAULT_HEIGHT],
-                Condition::FirstUseEver,
-            )
+            .size(size, Condition::FirstUseEver)
             .size_constraints(
                 [PICKER_MIN_WIDTH, PICKER_MIN_HEIGHT],
                 [f32::MAX, f32::MAX],

@@ -11,8 +11,8 @@ use ignore::WalkState;
 use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
 
 use crate::fuzzy_picker::{
-    picker_initial_position, scroll_list_to_selection, visible_row_count, PICKER_DEFAULT_HEIGHT,
-    PICKER_DEFAULT_WIDTH, PICKER_MIN_HEIGHT, PICKER_MIN_WIDTH,
+    picker_default_size, picker_initial_position, scroll_list_to_selection, visible_row_count,
+    PICKER_MIN_HEIGHT, PICKER_MIN_WIDTH,
 };
 
 const WINDOW_TITLE: &str = "Search in Project";
@@ -114,15 +114,13 @@ impl GrepPicker {
 
         let window_name = format!("{WINDOW_TITLE}{WINDOW_ID_SUFFIX}");
         let pos = picker_initial_position(ui);
+        let size = picker_default_size(ui);
 
         let mut confirmed = None;
         let _alpha_token = ui.push_style_var(StyleVar::Alpha(self.alpha));
         ui.window(&window_name)
             .position(pos, Condition::FirstUseEver)
-            .size(
-                [PICKER_DEFAULT_WIDTH, PICKER_DEFAULT_HEIGHT],
-                Condition::FirstUseEver,
-            )
+            .size(size, Condition::FirstUseEver)
             .size_constraints(
                 [PICKER_MIN_WIDTH, PICKER_MIN_HEIGHT],
                 [f32::MAX, f32::MAX],
