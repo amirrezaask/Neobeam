@@ -2,7 +2,7 @@
 
 use imgui::{Condition, Key, MouseButton, StyleVar, Ui, WindowFlags};
 
-use crate::multiplexer::Rect;
+use crate::layout::Rect;
 
 const WINDOW_ID_SUFFIX: &str = "##fuzzy_picker";
 const INPUT_ID: &str = "##fuzzy_query";

@@ -12,8 +12,8 @@ mod git_client;
 mod git_diff;
 mod imgui_layer;
 mod imgui_theme;
+mod layout;
 mod menu_bar;
-mod multiplexer;
 mod project;
 mod project_picker;
 mod results_panel;
@@ -34,11 +34,11 @@ use file_picker::{FilePicker, FilePickerOutcome};
 use grep_picker::{GrepMatch, GrepPicker, GrepPickerOutcome};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
+use layout::{Rect, SimpleLayout};
 use menu_bar::{MenuBar, MenuBarAction};
-use multiplexer::{Rect, TilingManager, ViewKind, WinId};
 use project::Project;
 use project_picker::ProjectPicker;
-use results_panel::{FileListPanel, GrepResultsPanel};
+use results_panel::{Sidebar, SidebarAction};
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -90,7 +90,9 @@ struct App {
     rt: tokio::runtime::Runtime,
     settings: Settings,
     menu_bar: MenuBar,
-    tiling: TilingManager,
+    layout: SimpleLayout,
+    current_page: AppPage,
+    sidebar: Sidebar,
     git_client: GitClient,
     project_picker: ProjectPicker,
     file_picker: FilePicker,
@@ -101,8 +103,6 @@ struct App {
     winbar_refresh_pending: bool,
     /// Another flush arrived while a winbar RPC was in flight.
     winbar_refresh_dirty: bool,
-    file_list_panels: Vec<(WinId, FileListPanel)>,
-    grep_result_panels: Vec<(WinId, GrepResultsPanel)>,
     state: Option<State>,
 }
 
@@ -114,20 +114,6 @@ fn cursor_in_activity_bar(state: &State, settings: &Settings) -> bool {
     let scale = state.renderer.scale() as f64;
     let width = menu_bar::activity_bar_width(settings.font_size) as f64;
     state.cursor_pos.0 / scale < width
-}
-
-fn app_page_to_view(page: AppPage) -> ViewKind {
-    match page {
-        AppPage::Editor => ViewKind::Editor,
-        AppPage::GitClient => ViewKind::GitClient,
-    }
-}
-
-fn view_to_app_page(view: ViewKind) -> AppPage {
-    match view {
-        ViewKind::Editor | ViewKind::FileList | ViewKind::GrepResults => AppPage::Editor,
-        ViewKind::GitClient => AppPage::GitClient,
-    }
 }
 
 fn editor_area(settings: &Settings, renderer: &Renderer) -> Rect {
@@ -144,36 +130,36 @@ fn cursor_logical(state: &State) -> (f32, f32) {
     )
 }
 
-fn cursor_in_panel_content(state: &State, settings: &Settings, tiling: &TilingManager) -> bool {
-    let area = editor_area(settings, &state.renderer);
-    let rects = tiling.compute_rects(area);
-    let cursor = cursor_logical(state);
-    let Some(win_id) = tiling.hit_window_content(cursor, &rects) else {
+fn cursor_in_sidebar(
+    state: &State,
+    settings: &Settings,
+    layout: &SimpleLayout,
+    sidebar: &Sidebar,
+) -> bool {
+    if !sidebar.visible {
         return false;
-    };
-    tiling
-        .windows
-        .iter()
-        .find(|w| w.id == win_id)
-        .is_some_and(|w| w.view.captures_input())
+    }
+    let area = editor_area(settings, &state.renderer);
+    let (_, sidebar_rect) = layout.compute(area);
+    let cursor = cursor_logical(state);
+    sidebar_rect.is_some_and(|rect| rect.contains(cursor.0, cursor.1))
 }
 
 fn imgui_captures_input(
     state: &State,
     settings: &Settings,
-    tiling: &TilingManager,
+    layout: &SimpleLayout,
+    sidebar: &Sidebar,
+    current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
-    if tiling.is_dragging() {
+    if layout.resizing {
         return true;
     }
-    let area = editor_area(settings, &state.renderer);
-    let rects = tiling.compute_rects(area);
-    let cursor = cursor_logical(state);
-    if tiling.cursor_in_any_title_bar(cursor, &rects) {
+    if current_page == AppPage::GitClient {
         return true;
     }
-    if cursor_in_panel_content(state, settings, tiling) {
+    if cursor_in_sidebar(state, settings, layout, sidebar) {
         return true;
     }
     project_picker_open
@@ -184,38 +170,56 @@ fn imgui_captures_input(
 fn mouse_to_nvim_blocked(
     state: &State,
     settings: &Settings,
-    tiling: &TilingManager,
+    layout: &SimpleLayout,
+    sidebar: &Sidebar,
+    current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
-    if tiling.is_dragging() {
+    if current_page != AppPage::Editor {
         return true;
     }
-    let area = editor_area(settings, &state.renderer);
-    let rects = tiling.compute_rects(area);
-    let cursor = cursor_logical(state);
-    if tiling.cursor_in_any_title_bar(cursor, &rects) {
+    if layout.resizing {
         return true;
     }
-    if cursor_in_panel_content(state, settings, tiling) {
+    if cursor_in_sidebar(state, settings, layout, sidebar) {
         return true;
     }
     project_picker_open
         || state.context_menu.open
-        || imgui_captures_input(state, settings, tiling, project_picker_open)
+        || imgui_captures_input(
+            state,
+            settings,
+            layout,
+            sidebar,
+            current_page,
+            project_picker_open,
+        )
 }
 
 fn keyboard_to_nvim_blocked(
     state: &State,
     settings: &Settings,
-    tiling: &TilingManager,
+    layout: &SimpleLayout,
+    sidebar: &Sidebar,
+    current_page: AppPage,
     project_picker_open: bool,
 ) -> bool {
-    if tiling.focused_view().captures_input() {
+    if current_page != AppPage::Editor {
+        return true;
+    }
+    if cursor_in_sidebar(state, settings, layout, sidebar) {
         return true;
     }
     project_picker_open
         || state.imgui.wants_keyboard()
-        || imgui_captures_input(state, settings, tiling, project_picker_open)
+        || imgui_captures_input(
+            state,
+            settings,
+            layout,
+            sidebar,
+            current_page,
+            project_picker_open,
+        )
 }
 
 impl App {
@@ -243,7 +247,9 @@ impl App {
             rt,
             settings,
             menu_bar,
-            tiling: TilingManager::new(28.0),
+            layout: SimpleLayout::new(),
+            current_page: AppPage::Editor,
+            sidebar: Sidebar::new(),
             git_client,
             project_picker: ProjectPicker::new(),
             file_picker: FilePicker::new(),
@@ -251,20 +257,8 @@ impl App {
             project: initial_project,
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
-            file_list_panels: Vec::new(),
-            grep_result_panels: Vec::new(),
             state: None,
         })
-    }
-
-    fn cleanup_panels(&mut self) {
-        let alive: std::collections::HashSet<WinId> =
-            self.tiling.windows.iter().map(|w| w.id).collect();
-        self.file_list_panels
-            .retain(|(id, _)| alive.contains(id));
-        self.grep_result_panels
-            .retain(|(id, _)| alive.contains(id));
-        let _ = self.tiling.take_removed_windows();
     }
 
     fn handle_pin_outcomes(
@@ -272,39 +266,21 @@ impl App {
         pin_file: Option<(Vec<(String, PathBuf)>, String)>,
         pin_grep: Option<(Vec<GrepMatch>, String, PathBuf)>,
     ) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let area = editor_area(&self.settings, &state.renderer);
+        let mut needs_redraw = false;
         if let Some((items, query)) = pin_file {
-            if let Some(win_id) = self.tiling.find_hidden_by_view(ViewKind::FileList) {
-                self.tiling.show_window(win_id, area);
-                if let Some((_, panel)) =
-                    self.file_list_panels.iter_mut().find(|(id, _)| *id == win_id)
-                {
-                    panel.reload(items, query);
-                }
-            } else {
-                let panel = FileListPanel::new(items, query);
-                let win_id = self.tiling.add_view_window(ViewKind::FileList, area);
-                self.file_list_panels.push((win_id, panel));
-            }
-            state.window.request_redraw();
+            self.layout.show_sidebar();
+            self.sidebar.pin_files(items, query);
+            needs_redraw = true;
         }
         if let Some((results, query, project_root)) = pin_grep {
-            if let Some(win_id) = self.tiling.find_hidden_by_view(ViewKind::GrepResults) {
-                self.tiling.show_window(win_id, area);
-                if let Some((_, panel)) =
-                    self.grep_result_panels.iter_mut().find(|(id, _)| *id == win_id)
-                {
-                    panel.reload(results, query, project_root);
-                }
-            } else {
-                let panel = GrepResultsPanel::new(results, query, project_root);
-                let win_id = self.tiling.add_view_window(ViewKind::GrepResults, area);
-                self.grep_result_panels.push((win_id, panel));
+            self.layout.show_sidebar();
+            self.sidebar.pin_grep(results, query, project_root);
+            needs_redraw = true;
+        }
+        if needs_redraw {
+            if let Some(state) = self.state.as_ref() {
+                state.window.request_redraw();
             }
-            state.window.request_redraw();
         }
     }
 
@@ -344,13 +320,9 @@ impl App {
         let chrome_cfg = self.settings.chrome_layout_config();
         let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
         let area = Rect::from_array(layout.editor_rect);
-        let rects = self.tiling.compute_rects(area);
-        let editor_id = self.tiling.editor_win().expect("default editor window");
-        let content = self
-            .tiling
-            .content_rect(self.tiling.visual_rect(editor_id, &rects));
-        let cols = ((content.w / cw).floor() as u32).max(1);
-        let rows = ((content.h / ch).floor() as u32).max(1);
+        let (main_rect, _) = self.layout.compute(area);
+        let cols = ((main_rect.w / cw).floor() as u32).max(1);
+        let rows = ((main_rect.h / ch).floor() as u32).max(1);
 
         let proxy = self.proxy.clone();
         let redraw = Arc::new(move |args: Vec<Value>| {
@@ -430,7 +402,7 @@ impl App {
             tracing::warn!("font apply failed: {e:#}");
         }
         state.anim.cfg = self.settings.animation_config();
-        state.recompute_grid(&self.settings, &self.tiling);
+        state.recompute_grid(&self.settings, &self.layout);
     }
 
     fn adjust_font_size(&mut self, delta: f32) {
@@ -464,9 +436,8 @@ impl App {
                 }
             }
             MenuBarAction::PageChanged(page) => {
-                if let Some(state) = self.state.as_mut() {
-                    let area = editor_area(&self.settings, &state.renderer);
-                    self.tiling.switch_to_page(app_page_to_view(page), area);
+                self.current_page = page;
+                if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
                 }
                 if page == AppPage::GitClient {
@@ -534,32 +505,19 @@ impl State {
         (row.max(0).min(max_row), col.max(0))
     }
 
-    fn hit_test(&self, settings: &Settings, tiling: &TilingManager) -> (i64, i64) {
+    fn editor_content_rect(&self, settings: &Settings, layout: &SimpleLayout) -> Rect {
         let area = editor_area(settings, &self.renderer);
-        let rects = tiling.compute_rects(area);
-        let Some(editor_id) = tiling.editor_win() else {
-            return (0, 0);
-        };
-        let visual = tiling.visual_rect(editor_id, &rects);
-        let content = tiling.content_rect(visual);
+        layout.compute(area).0
+    }
+
+    fn hit_test(&self, settings: &Settings, layout: &SimpleLayout) -> (i64, i64) {
+        let content = self.editor_content_rect(settings, layout);
         self.hit_test_in_rect(content)
     }
 
-    fn hit_test_editor(&self, settings: &Settings, tiling: &TilingManager) -> Option<(i64, i64)> {
-        let area = editor_area(settings, &self.renderer);
-        let rects = tiling.compute_rects(area);
+    fn hit_test_editor(&self, settings: &Settings, layout: &SimpleLayout) -> Option<(i64, i64)> {
+        let content = self.editor_content_rect(settings, layout);
         let cursor = cursor_logical(self);
-        let win_id = tiling.hit_window_content(cursor, &rects)?;
-        let view = tiling
-            .windows
-            .iter()
-            .find(|w| w.id == win_id)
-            .map(|w| w.view)?;
-        if view != ViewKind::Editor {
-            return None;
-        }
-        let visual = tiling.visual_rect(win_id, &rects);
-        let content = tiling.content_rect(visual);
         if content.contains(cursor.0, cursor.1) {
             Some(self.hit_test_in_rect(content))
         } else {
@@ -567,21 +525,8 @@ impl State {
         }
     }
 
-    fn recompute_grid(&mut self, settings: &Settings, tiling: &TilingManager) {
-        let area = editor_area(settings, &self.renderer);
-        let rects = tiling.compute_rects(area);
-        let Some(editor_id) = tiling.editor_win() else {
-            return;
-        };
-        // Use the settled layout rect, not the spring-animated visual rect.
-        // Resizing nvim every animation frame clears the grid and leaves a blank pane.
-        let target = rects.get(&editor_id).copied().unwrap_or(Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 0.0,
-            h: 0.0,
-        });
-        let content = tiling.content_rect(target);
+    fn recompute_grid(&mut self, settings: &Settings, layout: &SimpleLayout) {
+        let content = self.editor_content_rect(settings, layout);
         let (cw, ch) = self.renderer.cell_size();
         let cols = ((content.w / cw).floor() as u32).max(1);
         let rows = ((content.h / ch).floor() as u32).max(1);
@@ -596,13 +541,13 @@ impl State {
         &mut self,
         settings: &mut Settings,
         menu_bar: &mut MenuBar,
-        tiling: &mut TilingManager,
+        layout: &mut SimpleLayout,
+        current_page: AppPage,
+        sidebar: &mut Sidebar,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
         file_picker: &mut FilePicker,
         grep_picker: &mut GrepPicker,
-        file_list_panels: &mut [(WinId, FileListPanel)],
-        grep_result_panels: &mut [(WinId, GrepResultsPanel)],
     ) -> (
         bool,
         MenuBarAction,
@@ -629,24 +574,14 @@ impl State {
 
         let (cw, ch) = self.renderer.cell_size();
         let chrome_cfg = settings.chrome_layout_config();
-        let layout = ChromeLayout::compute(
+        let chrome_layout = ChromeLayout::compute(
             self.renderer.logical_size().0,
             self.renderer.logical_size().1,
             &chrome_cfg,
         );
-        let editor_area_rect = Rect::from_array(layout.editor_rect);
-        let window_rects = tiling.compute_rects(editor_area_rect);
-        let tiling_animating = tiling.update_anim(dt);
-        // Only resize nvim when the layout has fully settled.  Calling
-        // session.resize during animation puts the render loop in Poll mode
-        // while nvim processes the resize; if nvim sends grid_clear in a
-        // separate notification before flush, a poll frame renders a blank
-        // grid.  Deferring until !tiling_animating means exactly one resize
-        // fires on the first stable frame, with no intermediate blank frames.
-        if !tiling_animating {
-            self.recompute_grid(settings, tiling);
-        }
-        let focused_page = view_to_app_page(tiling.focused_view());
+        let editor_area_rect = Rect::from_array(chrome_layout.editor_rect);
+        let (main_rect, sidebar_rect) = layout.compute(editor_area_rect);
+        self.recompute_grid(settings, layout);
 
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
@@ -660,12 +595,6 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
-        let git_windows: Vec<WinId> = tiling
-            .windows
-            .iter()
-            .filter(|w| w.view == ViewKind::GitClient && tiling.is_visible(w.id))
-            .map(|w| w.id)
-            .collect();
         if let Err(e) = self.imgui.prepare_ui(
             &window,
             store,
@@ -674,38 +603,20 @@ impl State {
             queue,
             |ui| {
                 let window_h = self.renderer.logical_size().1;
-                menu_action = menu_bar.draw(ui, settings, session, focused_page, window_h);
-                let editor_winbar = Some((
-                    menu_bar.winbar_file_name(),
-                    menu_bar.project_display(),
-                ));
-                tiling.draw_chrome(ui, &window_rects, editor_winbar);
-                for win_id in &git_windows {
-                    let visual = tiling.visual_rect(*win_id, &window_rects);
-                    let content = tiling.content_rect(visual);
-                    git_wants_redraw |= git_client.draw(ui, *win_id, content);
-                }
-                for (win_id, panel) in file_list_panels.iter_mut() {
-                    if !tiling.is_visible(*win_id) {
-                        continue;
-                    }
-                    let visual = tiling.visual_rect(*win_id, &window_rects);
-                    let content = tiling.content_rect(visual);
-                    if let Some(path) = panel.draw(ui, *win_id, content, dt) {
-                        session.open_file(path);
+                menu_action = menu_bar.draw(ui, settings, session, current_page, window_h);
+                if let Some(sidebar_rect) = sidebar_rect {
+                    match sidebar.draw(ui, sidebar_rect, dt) {
+                        SidebarAction::None => {}
+                        SidebarAction::OpenFile(path) => session.open_file(path),
+                        SidebarAction::OpenGrepMatch(m) => {
+                            session.open_file_at_line(m.path, m.line_number);
+                        }
                     }
                 }
-                for (win_id, panel) in grep_result_panels.iter_mut() {
-                    if !tiling.is_visible(*win_id) {
-                        continue;
-                    }
-                    let visual = tiling.visual_rect(*win_id, &window_rects);
-                    let content = tiling.content_rect(visual);
-                    if let Some(m) = panel.draw(ui, *win_id, content) {
-                        session.open_file_at_line(m.path, m.line_number);
-                    }
+                if current_page == AppPage::GitClient {
+                    git_wants_redraw |= git_client.draw(ui, main_rect);
                 }
-                if tiling.focused_view() == ViewKind::Editor {
+                if current_page == AppPage::Editor {
                     context_action = context_menu.draw(ui);
                 }
                 project_selection = project_picker.draw(ui, dt);
@@ -735,22 +646,15 @@ impl State {
         }
 
         let cursor = cursor_logical(self);
-        let cursor_in_editor = tiling
-            .hit_window_content(cursor, &window_rects)
-            .and_then(|id| {
-                tiling
-                    .windows
-                    .iter()
-                    .find(|w| w.id == id)
-                    .map(|w| w.view == ViewKind::Editor)
-            })
-            .unwrap_or(false);
-        let editor_render_rect = tiling.editor_win().map(|editor_id| {
-            let visual = tiling.visual_rect(editor_id, &window_rects);
-            let content = tiling.content_rect(visual);
-            [content.x, content.y, content.w, content.h]
-        });
-        let hide_cursor = !cursor_in_editor || tiling.focused_view().captures_input();
+        let cursor_in_editor = current_page == AppPage::Editor
+            && main_rect.contains(cursor.0, cursor.1)
+            && !cursor_in_sidebar(self, settings, layout, sidebar);
+        let editor_render_rect = if current_page == AppPage::Editor {
+            Some([main_rect.x, main_rect.y, main_rect.w, main_rect.h])
+        } else {
+            None
+        };
+        let hide_cursor = !cursor_in_editor;
 
         self.anim.update(dt, &self.store, cw, ch);
 
@@ -776,7 +680,7 @@ impl State {
             store,
             anim,
             overlay.as_deref(),
-            [layout.editor_rect[0], layout.editor_rect[1], 0.0, 0.0],
+            [chrome_layout.editor_rect[0], chrome_layout.editor_rect[1], 0.0, 0.0],
             true,
             |device, queue, pass| {
                 if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
@@ -787,12 +691,9 @@ impl State {
             tracing::error!("render error: {e}");
         }
         self.frame_count += 1;
-        let needs_anim = tiling_animating
-            || self.anim.is_animating()
+        let needs_anim = self.anim.is_animating()
             || (!hide_cursor && self.anim.is_blinking(&self.store))
-            || self.anim.render_deadline().is_some()
-            || tiling.preview_alpha() > 0.01
-            || tiling.is_dragging();
+            || self.anim.render_deadline().is_some();
         if self.context_menu.open
             || project_picker.is_open()
             || file_picker.is_open()
@@ -975,8 +876,15 @@ impl ApplicationHandler<UserEvent> for App {
                 || self.grep_picker.is_open();
             let redraw = state.context_menu.open
                 || picker_open
-                || self.tiling.is_dragging()
-                || imgui_captures_input(state, &self.settings, &self.tiling, picker_open);
+                || self.layout.resizing
+                || imgui_captures_input(
+                    state,
+                    &self.settings,
+                    &self.layout,
+                    &self.sidebar,
+                    self.current_page,
+                    picker_open,
+                );
             if redraw {
                 state.window.request_redraw();
             }
@@ -998,7 +906,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid(&self.settings, &self.tiling);
+                state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -1008,7 +916,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = state.window.inner_size();
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid(&self.settings, &self.tiling);
+                state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }
             WindowEvent::Focused(focused) => {
@@ -1032,10 +940,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(ime) => {
                 if self.state.as_ref().is_some_and(|s| {
-                    cursor_in_panel_content(s, &self.settings, &self.tiling)
-                        || self.tiling.focused_view().captures_input()
-                }) || picker_open
-                {
+                    keyboard_to_nvim_blocked(
+                        s,
+                        &self.settings,
+                        &self.layout,
+                        &self.sidebar,
+                        self.current_page,
+                        picker_open,
+                    )
+                }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -1112,23 +1025,20 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.tiling.focused_view().captures_input() {
-                    return;
-                }
-
                 let paste_shortcut = self
                     .state
                     .as_ref()
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        imgui_captures_input(s, &self.settings, &self.tiling, picker_open)
-                            || keyboard_to_nvim_blocked(
-                                s,
-                                &self.settings,
-                                &self.tiling,
-                                picker_open,
-                            )
+                        keyboard_to_nvim_blocked(
+                            s,
+                            &self.settings,
+                            &self.layout,
+                            &self.sidebar,
+                            self.current_page,
+                            picker_open,
+                        )
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -1144,7 +1054,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(s, &self.settings, &self.tiling, picker_open)
+                    keyboard_to_nvim_blocked(
+                        s,
+                        &self.settings,
+                        &self.layout,
+                        &self.sidebar,
+                        self.current_page,
+                        picker_open,
+                    )
                 }) {
                     return;
                 }
@@ -1170,21 +1087,28 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 state.cursor_pos = (position.x, position.y);
-                if cursor_in_activity_bar(state, &self.settings) || self.tiling.is_dragging() {
+                if cursor_in_activity_bar(state, &self.settings) || self.layout.resizing {
                     state.window.request_redraw();
                 }
-                if self.tiling.is_dragging() {
+                if self.layout.resizing {
                     let area = editor_area(&self.settings, &state.renderer);
                     let cursor = cursor_logical(state);
-                    self.tiling.update_drag(cursor, area);
+                    self.layout.update_resize(cursor.0, area);
                     state.window.request_redraw();
                     return;
                 }
-                if mouse_to_nvim_blocked(state, &self.settings, &self.tiling, picker_open) {
+                if mouse_to_nvim_blocked(
+                    state,
+                    &self.settings,
+                    &self.layout,
+                    &self.sidebar,
+                    self.current_page,
+                    picker_open,
+                ) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
-                    let (row, col) = state.hit_test(&self.settings, &self.tiling);
+                    let (row, col) = state.hit_test(&self.settings, &self.layout);
                     state.session.mouse(
                         btn,
                         MouseAction::Drag,
@@ -1206,36 +1130,21 @@ impl ApplicationHandler<UserEvent> for App {
 
                 if button == MouseButton::Left {
                     let area = editor_area(&self.settings, &state.renderer);
-                    let rects = self.tiling.compute_rects(area);
                     let cursor = cursor_logical(state);
                     match btn_state {
                         ElementState::Pressed => {
-                            if let Some(win_id) = self.tiling.hit_close_button(cursor, &rects)
-                            {
-                                self.tiling.hide_window(win_id, area);
-                                state.window.request_redraw();
-                                return;
-                            }
-                            if let Some(win_id) =
-                                self.tiling.hit_fullscreen_button(cursor, &rects)
-                            {
-                                self.tiling.fullscreen(win_id, area);
-                                state.window.request_redraw();
-                                return;
-                            }
-                            if let Some(win_id) = self.tiling.hit_title_bar(cursor, &rects) {
-                                self.tiling.begin_drag(win_id, cursor);
-                                state.window.request_redraw();
-                                return;
-                            }
-                            if let Some(win_id) = self.tiling.hit_window_content(cursor, &rects)
-                            {
-                                self.tiling.set_focus(win_id);
+                            if let Some(handle) = self.layout.resize_handle_rect(area) {
+                                if handle.contains(cursor.0, cursor.1) {
+                                    self.layout.resizing = true;
+                                    state.window.request_redraw();
+                                    return;
+                                }
                             }
                         }
                         ElementState::Released => {
-                            if self.tiling.is_dragging() {
-                                self.tiling.commit_drop(area);
+                            if self.layout.resizing {
+                                self.layout.resizing = false;
+                                state.recompute_grid(&self.settings, &self.layout);
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1243,14 +1152,21 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if mouse_to_nvim_blocked(state, &self.settings, &self.tiling, picker_open) {
+                if mouse_to_nvim_blocked(
+                    state,
+                    &self.settings,
+                    &self.layout,
+                    &self.sidebar,
+                    self.current_page,
+                    picker_open,
+                ) {
                     state.window.request_redraw();
                     return;
                 }
 
                 if button == MouseButton::Right && btn_state == ElementState::Pressed {
                     if let Some(grid_pos) =
-                        state.hit_test_editor(&self.settings, &self.tiling)
+                        state.hit_test_editor(&self.settings, &self.layout)
                     {
                         let screen_pos = state.imgui.mouse_pos();
                         state.context_menu.open_at(screen_pos, grid_pos);
@@ -1262,7 +1178,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(btn) = map_button(button) else {
                     return;
                 };
-                let (row, col) = state.hit_test(&self.settings, &self.tiling);
+                let (row, col) = state.hit_test(&self.settings, &self.layout);
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_down = Some(btn);
@@ -1290,14 +1206,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, &self.settings, &self.tiling, picker_open)
+                    mouse_to_nvim_blocked(
+                        s,
+                        &self.settings,
+                        &self.layout,
+                        &self.sidebar,
+                        self.current_page,
+                        picker_open,
+                    )
                 }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
                     return;
                 };
-                let (row, col) = state.hit_test(&self.settings, &self.tiling);
+                let (row, col) = state.hit_test(&self.settings, &self.layout);
                 let (_, ch) = state.renderer.cell_size();
                 let scale = self.settings.mouse_scroll_sensitivity;
                 let lines = match delta {
@@ -1343,22 +1266,24 @@ impl ApplicationHandler<UserEvent> for App {
                     state.render(
                         &mut self.settings,
                         &mut self.menu_bar,
-                        &mut self.tiling,
+                        &mut self.layout,
+                        self.current_page,
+                        &mut self.sidebar,
                         &mut self.git_client,
                         &mut self.project_picker,
                         &mut self.file_picker,
                         &mut self.grep_picker,
-                        &mut self.file_list_panels,
-                        &mut self.grep_result_panels,
                     )
                 };
+                if !self.sidebar.visible {
+                    self.layout.hide_sidebar();
+                }
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
                 if let Some(path) = project_selection {
                     self.set_project(path);
                 }
                 self.handle_pin_outcomes(pin_file_list, pin_grep_results);
-                self.cleanup_panels();
                 let picker_open = self.project_picker.is_open()
                     || self.file_picker.is_open()
                     || self.grep_picker.is_open();
@@ -1377,12 +1302,14 @@ impl ApplicationHandler<UserEvent> for App {
                     // and must not force a continuous Poll loop.
                     s.context_menu.open
                         || picker_open
-                        || self.tiling.is_dragging()
-                        || (self.tiling.focused_view() == ViewKind::Editor
+                        || self.layout.resizing
+                        || (self.current_page == AppPage::Editor
                             && imgui_captures_input(
                                 s,
                                 &self.settings,
-                                &self.tiling,
+                                &self.layout,
+                                &self.sidebar,
+                                self.current_page,
                                 picker_open,
                             ))
                 }) {
@@ -1413,12 +1340,18 @@ impl ApplicationHandler<UserEvent> for App {
             || self.project_picker.is_animating()
             || self.file_picker.is_animating()
             || self.grep_picker.is_animating()
-            || self.tiling.is_dragging()
-            || self.tiling.preview_alpha() > 0.01
-            || (self.tiling.focused_view() == ViewKind::Editor
-                && imgui_captures_input(state, &self.settings, &self.tiling, picker_open))
+            || self.layout.resizing
+            || (self.current_page == AppPage::Editor
+                && imgui_captures_input(
+                    state,
+                    &self.settings,
+                    &self.layout,
+                    &self.sidebar,
+                    self.current_page,
+                    picker_open,
+                ))
             || state.anim.is_animating()
-            || (self.tiling.focused_view() == ViewKind::Editor
+            || (self.current_page == AppPage::Editor
                 && state.anim.is_blinking(&state.store));
 
         if needs_continuous {

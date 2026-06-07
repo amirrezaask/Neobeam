@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::multiplexer::{Rect, WinId};
+use crate::layout::Rect;
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
 use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
@@ -265,7 +265,7 @@ impl GitClient {
 
     /// Draw the git client UI.  Returns `true` when new data arrived from a
     /// background thread and a redraw should be scheduled.
-    pub fn draw(&mut self, ui: &Ui, win_id: WinId, content_rect: Rect) -> bool {
+    pub fn draw(&mut self, ui: &Ui, content_rect: Rect) -> bool {
         let mut wants_redraw = false;
 
         let size_changed = self.last_content_rect.is_none_or(|r| {
@@ -323,7 +323,7 @@ impl GitClient {
             | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
             | WindowFlags::NO_NAV_FOCUS;
 
-        let window_id = format!("##git_client_{}", win_id.0);
+        let window_id = "##git_client";
         ui.window(&window_id)
             .position(pos, Condition::Always)
             .size(size, Condition::Always)
