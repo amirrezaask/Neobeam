@@ -59,6 +59,8 @@ pub struct ChromeLayout {
     pub window_h: f32,
     pub editor_y: f32,
     pub editor_h: f32,
+    /// Editor region as `[x, y, w, h]` in logical pixels.
+    pub editor_rect: [f32; 4],
     pub top_stack_h: f32,
     pub statusbar_y: f32,
     pub cmdline_y: f32,
@@ -82,6 +84,7 @@ impl ChromeLayout {
             window_h,
             editor_y: top_stack,
             editor_h,
+            editor_rect: [0.0, top_stack, window_w, editor_h],
             top_stack_h: top_stack,
             statusbar_y: window_h - bar_h - cmdline_h - msg_h,
             cmdline_y: window_h - cmdline_h - msg_h,

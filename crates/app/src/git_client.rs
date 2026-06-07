@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use editor_surface::ChromeLayout;
+use crate::multiplexer::Rect;
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
 use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
@@ -263,7 +263,7 @@ impl GitClient {
 
     /// Draw the git client UI.  Returns `true` when new data arrived from a
     /// background thread and a redraw should be scheduled.
-    pub fn draw(&mut self, ui: &Ui, layout: &ChromeLayout) -> bool {
+    pub fn draw(&mut self, ui: &Ui, content_rect: Rect) -> bool {
 
         let mut wants_redraw = false;
 
@@ -303,8 +303,8 @@ impl GitClient {
 
         // ── Draw UI ───────────────────────────────────────────────────────
 
-        let pos = [0.0, layout.editor_y];
-        let size = [layout.window_w, layout.editor_h];
+        let pos = [content_rect.x, content_rect.y];
+        let size = [content_rect.w, content_rect.h];
         let flags = WindowFlags::NO_TITLE_BAR
             | WindowFlags::NO_RESIZE
             | WindowFlags::NO_MOVE

@@ -1,0 +1,748 @@
+//! In-app tiling window manager: splits, draggable title bars, drop previews.
+
+use std::collections::HashMap;
+
+use editor_surface::Spring;
+use imgui::{DrawListMut, Ui};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn from_array([x, y, w, h]: [f32; 4]) -> Self {
+        Self { x, y, w, h }
+    }
+
+    pub fn contains(&self, cx: f32, cy: f32) -> bool {
+        cx >= self.x && cx < self.x + self.w && cy >= self.y && cy < self.y + self.h
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WinId(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewKind {
+    Editor,
+    GitClient,
+}
+
+impl ViewKind {
+    pub fn default_title(self) -> &'static str {
+        match self {
+            ViewKind::Editor => "Editor",
+            ViewKind::GitClient => "Git",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TilingWindow {
+    pub id: WinId,
+    pub view: ViewKind,
+    pub title: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SplitDir {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Debug)]
+pub enum LayoutNode {
+    Leaf(WinId),
+    Split {
+        dir: SplitDir,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+        ratio: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DragState {
+    pub win_id: WinId,
+    pub start: (f32, f32),
+    pub current: (f32, f32),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DropPreview {
+    pub target_win: WinId,
+    pub zone: DropZone,
+    pub rect: Rect,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnimRect {
+    pub springs: [Spring; 4],
+    pub target: Rect,
+}
+
+pub struct TilingManager {
+    pub root: LayoutNode,
+    pub windows: Vec<TilingWindow>,
+    next_id: usize,
+    pub drag: Option<DragState>,
+    pub drop_preview: Option<DropPreview>,
+    anim: HashMap<WinId, AnimRect>,
+    pub title_bar_h: f32,
+    pub focused: WinId,
+    preview_alpha: f32,
+}
+
+const LAYOUT_ANIM_LEN: f32 = 0.25;
+
+impl TilingManager {
+    pub fn new(title_bar_h: f32) -> Self {
+        let id = WinId(0);
+        Self {
+            root: LayoutNode::Leaf(id),
+            windows: vec![TilingWindow {
+                id,
+                view: ViewKind::Editor,
+                title: ViewKind::Editor.default_title().into(),
+            }],
+            next_id: 1,
+            drag: None,
+            drop_preview: None,
+            anim: HashMap::new(),
+            title_bar_h,
+            focused: id,
+            preview_alpha: 0.0,
+        }
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub fn focused_view(&self) -> ViewKind {
+        self.windows
+            .iter()
+            .find(|w| w.id == self.focused)
+            .map(|w| w.view)
+            .unwrap_or(ViewKind::Editor)
+    }
+
+    pub fn has_view(&self, view: ViewKind) -> bool {
+        self.windows.iter().any(|w| w.view == view)
+    }
+
+    pub fn editor_win(&self) -> Option<WinId> {
+        self.windows
+            .iter()
+            .find(|w| w.view == ViewKind::Editor)
+            .map(|w| w.id)
+    }
+
+    pub fn set_focus(&mut self, id: WinId) {
+        if self.windows.iter().any(|w| w.id == id) {
+            self.focused = id;
+        }
+    }
+
+    pub fn open_or_focus(&mut self, view: ViewKind, area: Rect) {
+        if let Some(w) = self.windows.iter().find(|w| w.view == view) {
+            self.focused = w.id;
+            return;
+        }
+        self.add_window(view, area);
+    }
+
+    pub fn add_window(&mut self, view: ViewKind, area: Rect) {
+        if view == ViewKind::Editor && self.has_view(ViewKind::Editor) {
+            self.open_or_focus(ViewKind::Editor, area);
+            return;
+        }
+
+        let id = WinId(self.next_id);
+        self.next_id += 1;
+        self.windows.push(TilingWindow {
+            id,
+            view,
+            title: view.default_title().into(),
+        });
+
+        let old_rects = self.compute_rects(area);
+
+        match &self.root {
+            LayoutNode::Leaf(existing) => {
+                let existing_id = *existing;
+                self.root = LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    first: Box::new(LayoutNode::Leaf(existing_id)),
+                    second: Box::new(LayoutNode::Leaf(id)),
+                    ratio: 0.5,
+                };
+            }
+            LayoutNode::Split { .. } => {
+                let focused = self.focused;
+                self.insert_split_at(focused, id, SplitDir::Horizontal, false);
+            }
+        }
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+        self.focused = id;
+    }
+
+    pub fn compute_rects(&self, area: Rect) -> HashMap<WinId, Rect> {
+        let mut out = HashMap::new();
+        self.compute_node(&self.root, area, &mut out);
+        out
+    }
+
+    fn compute_node(&self, node: &LayoutNode, area: Rect, out: &mut HashMap<WinId, Rect>) {
+        match node {
+            LayoutNode::Leaf(id) => {
+                out.insert(*id, area);
+            }
+            LayoutNode::Split {
+                dir,
+                first,
+                second,
+                ratio,
+            } => {
+                match dir {
+                    SplitDir::Horizontal => {
+                        let w1 = area.w * ratio;
+                        let w2 = area.w - w1;
+                        self.compute_node(
+                            first,
+                            Rect {
+                                x: area.x,
+                                y: area.y,
+                                w: w1,
+                                h: area.h,
+                            },
+                            out,
+                        );
+                        self.compute_node(
+                            second,
+                            Rect {
+                                x: area.x + w1,
+                                y: area.y,
+                                w: w2,
+                                h: area.h,
+                            },
+                            out,
+                        );
+                    }
+                    SplitDir::Vertical => {
+                        let h1 = area.h * ratio;
+                        let h2 = area.h - h1;
+                        self.compute_node(
+                            first,
+                            Rect {
+                                x: area.x,
+                                y: area.y,
+                                w: area.w,
+                                h: h1,
+                            },
+                            out,
+                        );
+                        self.compute_node(
+                            second,
+                            Rect {
+                                x: area.x,
+                                y: area.y + h1,
+                                w: area.w,
+                                h: h2,
+                            },
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn visual_rect(&self, id: WinId, computed: &HashMap<WinId, Rect>) -> Rect {
+        let target = computed
+            .get(&id)
+            .copied()
+            .unwrap_or(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
+        if let Some(anim) = self.anim.get(&id) {
+            Rect {
+                x: target.x + anim.springs[0].position,
+                y: target.y + anim.springs[1].position,
+                w: (target.w + anim.springs[2].position).max(1.0),
+                h: (target.h + anim.springs[3].position).max(1.0),
+            }
+        } else {
+            target
+        }
+    }
+
+    pub fn title_bar_rect(&self, win_rect: Rect) -> Rect {
+        Rect {
+            x: win_rect.x,
+            y: win_rect.y,
+            w: win_rect.w,
+            h: self.title_bar_h.min(win_rect.h),
+        }
+    }
+
+    pub fn content_rect(&self, win_rect: Rect) -> Rect {
+        let tb = self.title_bar_h.min(win_rect.h);
+        Rect {
+            x: win_rect.x,
+            y: win_rect.y + tb,
+            w: win_rect.w,
+            h: (win_rect.h - tb).max(1.0),
+        }
+    }
+
+    pub fn update_anim(&mut self, dt: f32) -> bool {
+        let mut animating = false;
+        for anim in self.anim.values_mut() {
+            for spring in &mut anim.springs {
+                if spring.update(dt, LAYOUT_ANIM_LEN) {
+                    animating = true;
+                }
+            }
+        }
+
+        let target_alpha = if self.drop_preview.is_some() { 1.0 } else { 0.0 };
+        let rate = 8.0;
+        if self.preview_alpha < target_alpha {
+            self.preview_alpha = (self.preview_alpha + rate * dt).min(target_alpha);
+        } else if self.preview_alpha > target_alpha {
+            self.preview_alpha = (self.preview_alpha - rate * dt).max(target_alpha);
+        }
+        if (self.preview_alpha - target_alpha).abs() > 0.01 {
+            animating = true;
+        }
+
+        animating
+    }
+
+    pub fn preview_alpha(&self) -> f32 {
+        self.preview_alpha
+    }
+
+    pub fn begin_drag(&mut self, win_id: WinId, cursor: (f32, f32)) {
+        self.drag = Some(DragState {
+            win_id,
+            start: cursor,
+            current: cursor,
+        });
+        self.drop_preview = None;
+    }
+
+    pub fn update_drag(&mut self, cursor: (f32, f32), area: Rect) {
+        let drag_id = self.drag.as_ref().map(|d| d.win_id);
+        let Some(drag_id) = drag_id else {
+            return;
+        };
+        if let Some(drag) = &mut self.drag {
+            drag.current = cursor;
+        }
+
+        let rects = self.compute_rects(area);
+        if let Some((target, zone)) = self.find_drop_zone(cursor, &rects, drag_id) {
+            let target_rect = self.visual_rect(target, &rects);
+            let preview_rect = preview_rect_for_zone(target_rect, zone);
+            self.drop_preview = Some(DropPreview {
+                target_win: target,
+                zone,
+                rect: preview_rect,
+            });
+        } else {
+            self.drop_preview = None;
+        }
+    }
+
+    pub fn cancel_drag(&mut self) {
+        self.drag = None;
+        self.drop_preview = None;
+    }
+
+    pub fn commit_drop(&mut self, area: Rect) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        let Some(preview) = self.drop_preview.take() else {
+            return;
+        };
+
+        if drag.win_id == preview.target_win {
+            self.preview_alpha = 0.0;
+            return;
+        }
+
+        let old_rects = self.compute_rects(area);
+
+        match preview.zone {
+            DropZone::Center => self.swap_views(drag.win_id, preview.target_win),
+            zone => {
+                let dir = match zone {
+                    DropZone::Left | DropZone::Right => SplitDir::Horizontal,
+                    DropZone::Top | DropZone::Bottom => SplitDir::Vertical,
+                    DropZone::Center => unreachable!(),
+                };
+                let new_first = matches!(zone, DropZone::Left | DropZone::Top);
+                if let Some(extracted) = remove_leaf(&mut self.root, drag.win_id) {
+                    insert_at_target(
+                        &mut self.root,
+                        preview.target_win,
+                        extracted,
+                        dir,
+                        new_first,
+                    );
+                }
+            }
+        }
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+        self.preview_alpha = 0.0;
+    }
+
+    pub fn hit_title_bar(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+    ) -> Option<WinId> {
+        let (cx, cy) = cursor;
+        for win in self.windows.iter().rev() {
+            let r = self.visual_rect(win.id, rects);
+            let tb = self.title_bar_rect(r);
+            if cx >= tb.x && cx < tb.x + tb.w && cy >= tb.y && cy < tb.y + tb.h {
+                return Some(win.id);
+            }
+        }
+        None
+    }
+
+    pub fn hit_window_content(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+    ) -> Option<WinId> {
+        let (cx, cy) = cursor;
+        for win in self.windows.iter().rev() {
+            let r = self.content_rect(self.visual_rect(win.id, rects));
+            if r.contains(cx, cy) {
+                return Some(win.id);
+            }
+        }
+        None
+    }
+
+    pub fn cursor_in_any_title_bar(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+    ) -> bool {
+        self.hit_title_bar(cursor, rects).is_some()
+    }
+
+    pub fn find_drop_zone(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+        drag_id: WinId,
+    ) -> Option<(WinId, DropZone)> {
+        let (cx, cy) = cursor;
+        for win in &self.windows {
+            if win.id == drag_id {
+                continue;
+            }
+            let r = self.visual_rect(win.id, rects);
+            if !r.contains(cx, cy) {
+                continue;
+            }
+            return Some((win.id, classify_zone(cx, cy, r)));
+        }
+        None
+    }
+
+    pub fn draw_chrome(&self, ui: &Ui, rects: &HashMap<WinId, Rect>) {
+        let draw = ui.get_background_draw_list();
+
+        for win in &self.windows {
+            let visual = self.visual_rect(win.id, rects);
+            let tb = self.title_bar_rect(visual);
+            let focused = win.id == self.focused;
+            draw_title_bar(&draw, tb, &win.title, focused, self.is_dragging());
+        }
+
+        if let Some(preview) = &self.drop_preview {
+            let alpha = self.preview_alpha;
+            if alpha > 0.01 {
+                draw_drop_preview(&draw, preview.rect, alpha);
+            }
+        }
+    }
+
+    fn begin_layout_anim(&mut self, old_rects: &HashMap<WinId, Rect>, new_rects: &HashMap<WinId, Rect>) {
+        for (id, new_rect) in new_rects {
+            let old = old_rects.get(id).copied().unwrap_or(*new_rect);
+            let entry = self.anim.entry(*id).or_insert_with(|| AnimRect {
+                springs: [Spring::new(), Spring::new(), Spring::new(), Spring::new()],
+                target: *new_rect,
+            });
+            entry.target = *new_rect;
+            entry.springs[0].position += old.x - new_rect.x;
+            entry.springs[1].position += old.y - new_rect.y;
+            entry.springs[2].position += old.w - new_rect.w;
+            entry.springs[3].position += old.h - new_rect.h;
+        }
+    }
+
+    fn swap_views(&mut self, a: WinId, b: WinId) {
+        let ia = self.windows.iter().position(|w| w.id == a);
+        let ib = self.windows.iter().position(|w| w.id == b);
+        if let (Some(ia), Some(ib)) = (ia, ib) {
+            if ia == ib {
+                return;
+            }
+            let view_b = self.windows[ib].view;
+            let title_b = self.windows[ib].title.clone();
+            self.windows[ib].view = self.windows[ia].view;
+            self.windows[ib].title = self.windows[ia].title.clone();
+            self.windows[ia].view = view_b;
+            self.windows[ia].title = title_b;
+        }
+    }
+
+    fn insert_split_at(&mut self, target: WinId, new_id: WinId, dir: SplitDir, new_first: bool) {
+        insert_at_target(
+            &mut self.root,
+            target,
+            LayoutNode::Leaf(new_id),
+            dir,
+            new_first,
+        );
+    }
+}
+
+fn classify_zone(cx: f32, cy: f32, r: Rect) -> DropZone {
+    if cx < r.x + r.w * 0.25 {
+        DropZone::Left
+    } else if cx > r.x + r.w * 0.75 {
+        DropZone::Right
+    } else if cy < r.y + r.h * 0.25 {
+        DropZone::Top
+    } else if cy > r.y + r.h * 0.75 {
+        DropZone::Bottom
+    } else {
+        DropZone::Center
+    }
+}
+
+pub fn preview_rect_for_zone(target: Rect, zone: DropZone) -> Rect {
+    match zone {
+        DropZone::Left => Rect {
+            x: target.x,
+            y: target.y,
+            w: target.w * 0.5,
+            h: target.h,
+        },
+        DropZone::Right => Rect {
+            x: target.x + target.w * 0.5,
+            y: target.y,
+            w: target.w * 0.5,
+            h: target.h,
+        },
+        DropZone::Top => Rect {
+            x: target.x,
+            y: target.y,
+            w: target.w,
+            h: target.h * 0.5,
+        },
+        DropZone::Bottom => Rect {
+            x: target.x,
+            y: target.y + target.h * 0.5,
+            w: target.w,
+            h: target.h * 0.5,
+        },
+        DropZone::Center => target,
+    }
+}
+
+fn is_leaf_with_id(node: &LayoutNode, id: WinId) -> bool {
+    matches!(node, LayoutNode::Leaf(wid) if *wid == id)
+}
+
+fn remove_leaf(node: &mut LayoutNode, id: WinId) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Leaf(_) => None,
+        LayoutNode::Split { first, second, .. } => {
+            if is_leaf_with_id(first, id) {
+                let extracted = match first.as_ref() {
+                    LayoutNode::Leaf(w) => LayoutNode::Leaf(*w),
+                    _ => unreachable!(),
+                };
+                *node = *second.clone();
+                return Some(extracted);
+            }
+            if let Some(extracted) = remove_leaf(first, id) {
+                return Some(extracted);
+            }
+            if is_leaf_with_id(second, id) {
+                let extracted = match second.as_ref() {
+                    LayoutNode::Leaf(w) => LayoutNode::Leaf(*w),
+                    _ => unreachable!(),
+                };
+                *node = *first.clone();
+                return Some(extracted);
+            }
+            remove_leaf(second, id)
+        }
+    }
+}
+
+fn insert_at_target(
+    node: &mut LayoutNode,
+    target: WinId,
+    new_leaf: LayoutNode,
+    dir: SplitDir,
+    new_first: bool,
+) -> bool {
+    match node {
+        LayoutNode::Leaf(wid) if *wid == target => {
+            let existing = std::mem::replace(node, LayoutNode::Leaf(WinId(usize::MAX)));
+            let (first, second) = if new_first {
+                (new_leaf, existing)
+            } else {
+                (existing, new_leaf)
+            };
+            *node = LayoutNode::Split {
+                dir,
+                first: Box::new(first),
+                second: Box::new(second),
+                ratio: 0.5,
+            };
+            true
+        }
+        LayoutNode::Leaf(_) => false,
+        LayoutNode::Split { first, second, .. } => {
+            insert_at_target(first, target, new_leaf.clone(), dir, new_first)
+                || insert_at_target(second, target, new_leaf, dir, new_first)
+        }
+    }
+}
+
+fn draw_title_bar(draw: &DrawListMut<'_>, rect: Rect, title: &str, focused: bool, dragging: bool) {
+    let bg = if dragging {
+        [0.22, 0.24, 0.30, 1.0]
+    } else if focused {
+        [0.18, 0.20, 0.26, 1.0]
+    } else {
+        [0.14, 0.15, 0.19, 1.0]
+    };
+    let min = [rect.x, rect.y];
+    let max = [rect.x + rect.w, rect.y + rect.h];
+    draw.add_rect(min, max, bg).filled(true).rounding(0.0).build();
+
+    let sep_y = rect.y + rect.h - 1.0;
+    draw.add_rect(
+        [rect.x, sep_y],
+        [rect.x + rect.w, sep_y + 1.0],
+        [0.35, 0.38, 0.45, 1.0],
+    )
+    .filled(true)
+    .rounding(0.0)
+    .build();
+
+    let text_color = if focused {
+        [0.92, 0.93, 0.96, 1.0]
+    } else {
+        [0.65, 0.67, 0.72, 1.0]
+    };
+    let text_x = rect.x + 10.0;
+    let text_y = rect.y + (rect.h - 14.0) * 0.5;
+    draw.add_text([text_x, text_y], text_color, title);
+}
+
+fn draw_drop_preview(draw: &DrawListMut<'_>, rect: Rect, alpha: f32) {
+    let fill = [0.20, 0.45, 0.85, 0.25 * alpha];
+    let border = [0.35, 0.60, 1.0, 0.85 * alpha];
+    let min = [rect.x, rect.y];
+    let max = [rect.x + rect.w, rect.y + rect.h];
+    draw.add_rect(min, max, fill)
+        .filled(true)
+        .rounding(2.0)
+        .build();
+    draw.add_rect(min, max, border)
+        .filled(false)
+        .thickness(2.0)
+        .rounding(2.0)
+        .build();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_single_editor_window() {
+        let mgr = TilingManager::new(28.0);
+        assert_eq!(mgr.windows.len(), 1);
+        assert_eq!(mgr.windows[0].view, ViewKind::Editor);
+    }
+
+    #[test]
+    fn compute_rects_single_fills_area() {
+        let mgr = TilingManager::new(28.0);
+        let area = Rect {
+            x: 0.0,
+            y: 32.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let rects = mgr.compute_rects(area);
+        assert_eq!(rects.len(), 1);
+        let r = rects[&WinId(0)];
+        assert!((r.w - 800.0).abs() < 0.01);
+        assert!((r.h - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn add_git_window_splits() {
+        let mut mgr = TilingManager::new(28.0);
+        let area = Rect {
+            x: 0.0,
+            y: 32.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        mgr.add_window(ViewKind::GitClient, area);
+        assert_eq!(mgr.windows.len(), 2);
+        let rects = mgr.compute_rects(area);
+        assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn drop_zone_left() {
+        let r = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        assert_eq!(classify_zone(10.0, 50.0, r), DropZone::Left);
+        assert_eq!(classify_zone(90.0, 50.0, r), DropZone::Right);
+        assert_eq!(classify_zone(50.0, 10.0, r), DropZone::Top);
+        assert_eq!(classify_zone(50.0, 90.0, r), DropZone::Bottom);
+        assert_eq!(classify_zone(50.0, 50.0, r), DropZone::Center);
+    }
+}

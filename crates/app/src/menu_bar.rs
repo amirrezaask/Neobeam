@@ -62,7 +62,7 @@ impl MenuBar {
         ui: &Ui,
         settings: &mut Settings,
         session: &NvimSession,
-        current_page: AppPage,
+        focused_page: AppPage,
     ) -> MenuBarAction {
         let mut settings_changed = false;
         let mut theme_changed = None;
@@ -94,7 +94,7 @@ impl MenuBar {
             // remaining width of the menu bar and swallows hover/clicks for the
             // rest of the row. Buttons size to their label instead.
             for page in [AppPage::Editor, AppPage::GitClient] {
-                let selected = current_page == page;
+                let selected = focused_page == page;
                 let _color = selected.then(|| {
                     ui.push_style_color(StyleColor::Button, ui.style_color(StyleColor::ButtonActive))
                 });

@@ -12,6 +12,7 @@ mod git_diff;
 mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
+mod multiplexer;
 mod project;
 mod project_picker;
 mod settings;
@@ -32,6 +33,7 @@ use grep_picker::GrepPicker;
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
+use multiplexer::{Rect, TilingManager, ViewKind, WinId};
 use project::Project;
 use project_picker::ProjectPicker;
 use nvim_core::grid::GridStateStore;
@@ -85,7 +87,7 @@ struct App {
     rt: tokio::runtime::Runtime,
     settings: Settings,
     menu_bar: MenuBar,
-    current_page: AppPage,
+    tiling: TilingManager,
     git_client: GitClient,
     project_picker: ProjectPicker,
     file_picker: FilePicker,
@@ -110,48 +112,106 @@ fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
     state.cursor_pos.1 / scale < layout.editor_y as f64
 }
 
+fn app_page_to_view(page: AppPage) -> ViewKind {
+    match page {
+        AppPage::Editor => ViewKind::Editor,
+        AppPage::GitClient => ViewKind::GitClient,
+    }
+}
+
+fn view_to_app_page(view: ViewKind) -> AppPage {
+    match view {
+        ViewKind::Editor => AppPage::Editor,
+        ViewKind::GitClient => AppPage::GitClient,
+    }
+}
+
+fn editor_area(settings: &Settings, renderer: &Renderer) -> Rect {
+    let (lw, lh) = renderer.logical_size();
+    let layout = ChromeLayout::compute(lw, lh, &settings.chrome_layout_config());
+    Rect::from_array(layout.editor_rect)
+}
+
+fn cursor_logical(state: &State) -> (f32, f32) {
+    let scale = state.renderer.scale() as f32;
+    (
+        state.cursor_pos.0 as f32 / scale,
+        state.cursor_pos.1 as f32 / scale,
+    )
+}
+
+fn cursor_in_git_content(state: &State, settings: &Settings, tiling: &TilingManager) -> bool {
+    let area = editor_area(settings, &state.renderer);
+    let rects = tiling.compute_rects(area);
+    let cursor = cursor_logical(state);
+    let Some(win_id) = tiling.hit_window_content(cursor, &rects) else {
+        return false;
+    };
+    tiling
+        .windows
+        .iter()
+        .find(|w| w.id == win_id)
+        .is_some_and(|w| w.view == ViewKind::GitClient)
+}
+
 fn imgui_captures_input(
     state: &State,
     settings: &Settings,
-    page: AppPage,
+    tiling: &TilingManager,
     project_picker_open: bool,
 ) -> bool {
-    match page {
-        AppPage::GitClient => true,
-        AppPage::Editor => {
-            project_picker_open
-                || imgui_active(state)
-                || cursor_in_menu_bar(state, settings)
-        }
+    if tiling.is_dragging() {
+        return true;
     }
+    let area = editor_area(settings, &state.renderer);
+    let rects = tiling.compute_rects(area);
+    let cursor = cursor_logical(state);
+    if tiling.cursor_in_any_title_bar(cursor, &rects) {
+        return true;
+    }
+    if cursor_in_git_content(state, settings, tiling) {
+        return true;
+    }
+    project_picker_open
+        || imgui_active(state)
+        || cursor_in_menu_bar(state, settings)
 }
 
 fn mouse_to_nvim_blocked(
     state: &State,
     settings: &Settings,
-    page: AppPage,
+    tiling: &TilingManager,
     project_picker_open: bool,
 ) -> bool {
-    match page {
-        AppPage::GitClient => true,
-        AppPage::Editor => {
-            project_picker_open
-                || state.context_menu.open
-                || imgui_captures_input(state, settings, page, project_picker_open)
-        }
+    if tiling.is_dragging() {
+        return true;
     }
+    let area = editor_area(settings, &state.renderer);
+    let rects = tiling.compute_rects(area);
+    let cursor = cursor_logical(state);
+    if tiling.cursor_in_any_title_bar(cursor, &rects) {
+        return true;
+    }
+    if cursor_in_git_content(state, settings, tiling) {
+        return true;
+    }
+    project_picker_open
+        || state.context_menu.open
+        || imgui_captures_input(state, settings, tiling, project_picker_open)
 }
 
 fn keyboard_to_nvim_blocked(
     state: &State,
-    _settings: &Settings,
-    page: AppPage,
+    settings: &Settings,
+    tiling: &TilingManager,
     project_picker_open: bool,
 ) -> bool {
-    match page {
-        AppPage::GitClient => true,
-        AppPage::Editor => project_picker_open || state.imgui.wants_keyboard(),
+    if tiling.focused_view() == ViewKind::GitClient {
+        return true;
     }
+    project_picker_open
+        || state.imgui.wants_keyboard()
+        || imgui_captures_input(state, settings, tiling, project_picker_open)
 }
 
 impl App {
@@ -179,7 +239,7 @@ impl App {
             rt,
             settings,
             menu_bar,
-            current_page: AppPage::Editor,
+            tiling: TilingManager::new(28.0),
             git_client,
             project_picker: ProjectPicker::new(),
             file_picker: FilePicker::new(),
@@ -226,7 +286,14 @@ impl App {
         let (lw, lh) = renderer.logical_size();
         let chrome_cfg = self.settings.chrome_layout_config();
         let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
-        let (cols, rows) = layout.editor_grid_size(cw, ch);
+        let area = Rect::from_array(layout.editor_rect);
+        let rects = self.tiling.compute_rects(area);
+        let editor_id = self.tiling.editor_win().expect("default editor window");
+        let content = self
+            .tiling
+            .content_rect(self.tiling.visual_rect(editor_id, &rects));
+        let cols = ((content.w / cw).floor() as u32).max(1);
+        let rows = ((content.h / ch).floor() as u32).max(1);
 
         let proxy = self.proxy.clone();
         let redraw = Arc::new(move |args: Vec<Value>| {
@@ -306,7 +373,7 @@ impl App {
             tracing::warn!("font apply failed: {e:#}");
         }
         state.anim.cfg = self.settings.animation_config();
-        state.recompute_grid(&self.settings);
+        state.recompute_grid(&self.settings, &self.tiling);
     }
 
     fn adjust_font_size(&mut self, delta: f32) {
@@ -340,7 +407,10 @@ impl App {
                 }
             }
             MenuBarAction::PageChanged(page) => {
-                self.current_page = page;
+                if let Some(state) = self.state.as_ref() {
+                    let area = editor_area(&self.settings, &state.renderer);
+                    self.tiling.open_or_focus(app_page_to_view(page), area);
+                }
                 if page == AppPage::GitClient {
                     self.schedule_winbar_refresh();
                 }
@@ -398,38 +468,61 @@ impl App {
 }
 
 impl State {
-    fn hit_test(&self, settings: &Settings) -> (i64, i64) {
+    fn hit_test_in_rect(&self, content_rect: Rect) -> (i64, i64) {
         let scale = self.renderer.scale() as f64;
         let (cw, ch) = self.renderer.cell_size();
-        let (lw, lh) = self.renderer.logical_size();
-        let chrome_cfg = settings.chrome_layout_config();
-        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
-        let y = self.cursor_pos.1 / scale - layout.editor_y as f64;
-        let col = (self.cursor_pos.0 / scale / cw as f64).floor() as i64;
-        let max_row = (layout.editor_h / ch).floor() as i64;
+        let x = self.cursor_pos.0 / scale - content_rect.x as f64;
+        let y = self.cursor_pos.1 / scale - content_rect.y as f64;
+        let col = (x / cw as f64).floor() as i64;
+        let max_row = (content_rect.h / ch).floor() as i64;
         let row = (y / ch as f64).floor() as i64;
         (row.max(0).min(max_row), col.max(0))
     }
 
-    fn hit_test_editor(&self, settings: &Settings) -> Option<(i64, i64)> {
-        let scale = self.renderer.scale() as f64;
-        let (lw, lh) = self.renderer.logical_size();
-        let layout = ChromeLayout::compute(lw, lh, &settings.chrome_layout_config());
-        let y = self.cursor_pos.1 / scale;
-        let editor_top = layout.editor_y as f64;
-        let editor_bottom = (layout.editor_y + layout.editor_h) as f64;
-        if y < editor_top || y >= editor_bottom {
-            return None;
-        }
-        Some(self.hit_test(settings))
+    fn hit_test(&self, settings: &Settings, tiling: &TilingManager) -> (i64, i64) {
+        let area = editor_area(settings, &self.renderer);
+        let rects = tiling.compute_rects(area);
+        let Some(editor_id) = tiling.editor_win() else {
+            return (0, 0);
+        };
+        let visual = tiling.visual_rect(editor_id, &rects);
+        let content = tiling.content_rect(visual);
+        self.hit_test_in_rect(content)
     }
 
-    fn recompute_grid(&mut self, settings: &Settings) {
+    fn hit_test_editor(&self, settings: &Settings, tiling: &TilingManager) -> Option<(i64, i64)> {
+        let area = editor_area(settings, &self.renderer);
+        let rects = tiling.compute_rects(area);
+        let cursor = cursor_logical(self);
+        let win_id = tiling.hit_window_content(cursor, &rects)?;
+        let view = tiling
+            .windows
+            .iter()
+            .find(|w| w.id == win_id)
+            .map(|w| w.view)?;
+        if view != ViewKind::Editor {
+            return None;
+        }
+        let visual = tiling.visual_rect(win_id, &rects);
+        let content = tiling.content_rect(visual);
+        if content.contains(cursor.0, cursor.1) {
+            Some(self.hit_test_in_rect(content))
+        } else {
+            None
+        }
+    }
+
+    fn recompute_grid(&mut self, settings: &Settings, tiling: &TilingManager) {
+        let area = editor_area(settings, &self.renderer);
+        let rects = tiling.compute_rects(area);
+        let Some(editor_id) = tiling.editor_win() else {
+            return;
+        };
+        let visual = tiling.visual_rect(editor_id, &rects);
+        let content = tiling.content_rect(visual);
         let (cw, ch) = self.renderer.cell_size();
-        let (lw, lh) = self.renderer.logical_size();
-        let chrome_cfg = settings.chrome_layout_config();
-        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
-        let (cols, rows) = layout.editor_grid_size(cw, ch);
+        let cols = ((content.w / cw).floor() as u32).max(1);
+        let rows = ((content.h / ch).floor() as u32).max(1);
         if cols != self.grid_cols || rows != self.grid_rows {
             self.grid_cols = cols;
             self.grid_rows = rows;
@@ -441,7 +534,7 @@ impl State {
         &mut self,
         settings: &mut Settings,
         menu_bar: &mut MenuBar,
-        current_page: AppPage,
+        tiling: &mut TilingManager,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
         file_picker: &mut FilePicker,
@@ -470,6 +563,10 @@ impl State {
             self.renderer.logical_size().1,
             &chrome_cfg,
         );
+        let editor_area_rect = Rect::from_array(layout.editor_rect);
+        let window_rects = tiling.compute_rects(editor_area_rect);
+        let tiling_animating = tiling.update_anim(dt);
+        let focused_page = view_to_app_page(tiling.focused_view());
 
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
@@ -481,6 +578,12 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
+        let git_windows: Vec<WinId> = tiling
+            .windows
+            .iter()
+            .filter(|w| w.view == ViewKind::GitClient)
+            .map(|w| w.id)
+            .collect();
         if let Err(e) = self.imgui.prepare_ui(
             &window,
             store,
@@ -488,14 +591,15 @@ impl State {
             device,
             queue,
             |ui| {
-                menu_action = menu_bar.draw(ui, settings, session, current_page);
-                match current_page {
-                    AppPage::Editor => {
-                        context_action = context_menu.draw(ui);
-                    }
-                    AppPage::GitClient => {
-                        git_wants_redraw = git_client.draw(ui, &layout);
-                    }
+                menu_action = menu_bar.draw(ui, settings, session, focused_page);
+                tiling.draw_chrome(ui, &window_rects);
+                for win_id in &git_windows {
+                    let visual = tiling.visual_rect(*win_id, &window_rects);
+                    let content = tiling.content_rect(visual);
+                    git_wants_redraw |= git_client.draw(ui, content);
+                }
+                if tiling.focused_view() == ViewKind::Editor {
+                    context_action = context_menu.draw(ui);
                 }
                 project_selection = project_picker.draw(ui, dt);
                 if let Some(path) = file_picker.draw(ui, dt) {
@@ -509,18 +613,50 @@ impl State {
             tracing::warn!("imgui frame failed: {e:#}");
         }
 
+        let cursor = cursor_logical(self);
+        let cursor_in_editor = tiling
+            .hit_window_content(cursor, &window_rects)
+            .and_then(|id| {
+                tiling
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map(|w| w.view == ViewKind::Editor)
+            })
+            .unwrap_or(false);
+        let editor_render_rect = tiling.editor_win().map(|editor_id| {
+            let visual = tiling.visual_rect(editor_id, &window_rects);
+            let content = tiling.content_rect(visual);
+            [content.x, content.y, content.w, content.h]
+        });
+        let hide_cursor = !cursor_in_editor || tiling.focused_view() == ViewKind::GitClient;
+
         self.anim.update(dt, &self.store, cw, ch);
 
         let anim = &mut self.anim;
         let imgui = &mut self.imgui;
         let renderer = &mut self.renderer;
-        let hide_cursor = current_page == AppPage::GitClient;
-        if let Err(e) = renderer.render(
+        if let Some(editor_rect) = editor_render_rect {
+            if let Err(e) = renderer.render(
+                store,
+                anim,
+                overlay.as_deref(),
+                editor_rect,
+                hide_cursor,
+                |device, queue, pass| {
+                    if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
+                        tracing::warn!("imgui draw failed: {e:#}");
+                    }
+                },
+            ) {
+                tracing::error!("render error: {e}");
+            }
+        } else if let Err(e) = renderer.render(
             store,
             anim,
             overlay.as_deref(),
-            layout.editor_y,
-            hide_cursor,
+            [0.0, layout.editor_y, 0.0, 0.0],
+            true,
             |device, queue, pass| {
                 if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
                     tracing::warn!("imgui draw failed: {e:#}");
@@ -530,9 +666,12 @@ impl State {
             tracing::error!("render error: {e}");
         }
         self.frame_count += 1;
-        let needs_anim = self.anim.is_animating()
+        let needs_anim = tiling_animating
+            || self.anim.is_animating()
             || (!hide_cursor && self.anim.is_blinking(&self.store))
-            || self.anim.render_deadline().is_some();
+            || self.anim.render_deadline().is_some()
+            || tiling.preview_alpha() > 0.01
+            || tiling.is_dragging();
         if self.context_menu.open
             || project_picker.is_open()
             || file_picker.is_open()
@@ -703,18 +842,17 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
-            let page = self.current_page;
             let picker_open = self.project_picker.is_open()
                 || self.file_picker.is_open()
                 || self.grep_picker.is_open();
             let redraw = state.context_menu.open
                 || picker_open
-                || imgui_captures_input(state, &self.settings, page, picker_open);
+                || self.tiling.is_dragging()
+                || imgui_captures_input(state, &self.settings, &self.tiling, picker_open);
             if redraw {
                 state.window.request_redraw();
             }
         }
-        let page = self.current_page;
         let picker_open = self.project_picker.is_open()
             || self.file_picker.is_open()
             || self.grep_picker.is_open();
@@ -732,7 +870,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid(&self.settings);
+                state.recompute_grid(&self.settings, &self.tiling);
                 state.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -742,7 +880,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = state.window.inner_size();
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
-                state.recompute_grid(&self.settings);
+                state.recompute_grid(&self.settings, &self.tiling);
                 state.window.request_redraw();
             }
             WindowEvent::Focused(focused) => {
@@ -765,7 +903,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
-                if page == AppPage::GitClient || picker_open {
+                if self.state.as_ref().is_some_and(|s| {
+                    cursor_in_git_content(s, &self.settings, &self.tiling)
+                        || self.tiling.focused_view() == ViewKind::GitClient
+                }) || picker_open
+                {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -801,7 +943,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if page == AppPage::GitClient {
+                if self.tiling.focused_view() == ViewKind::GitClient {
                     return;
                 }
 
@@ -851,8 +993,13 @@ impl ApplicationHandler<UserEvent> for App {
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        imgui_captures_input(s, &self.settings, page, picker_open)
-                            || keyboard_to_nvim_blocked(s, &self.settings, page, picker_open)
+                        imgui_captures_input(s, &self.settings, &self.tiling, picker_open)
+                            || keyboard_to_nvim_blocked(
+                                s,
+                                &self.settings,
+                                &self.tiling,
+                                picker_open,
+                            )
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -868,7 +1015,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(s, &self.settings, page, picker_open)
+                    keyboard_to_nvim_blocked(s, &self.settings, &self.tiling, picker_open)
                 }) {
                     return;
                 }
@@ -894,14 +1041,21 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 state.cursor_pos = (position.x, position.y);
-                if cursor_in_menu_bar(state, &self.settings) {
+                if cursor_in_menu_bar(state, &self.settings) || self.tiling.is_dragging() {
                     state.window.request_redraw();
                 }
-                if mouse_to_nvim_blocked(state, &self.settings, page, picker_open) {
+                if self.tiling.is_dragging() {
+                    let area = editor_area(&self.settings, &state.renderer);
+                    let cursor = cursor_logical(state);
+                    self.tiling.update_drag(cursor, area);
+                    state.window.request_redraw();
+                    return;
+                }
+                if mouse_to_nvim_blocked(state, &self.settings, &self.tiling, picker_open) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
-                    let (row, col) = state.hit_test(&self.settings);
+                    let (row, col) = state.hit_test(&self.settings, &self.tiling);
                     state.session.mouse(
                         btn,
                         MouseAction::Drag,
@@ -917,23 +1071,46 @@ impl ApplicationHandler<UserEvent> for App {
                 button,
                 ..
             } => {
-                if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, &self.settings, page, picker_open)
-                }) {
-                    if let Some(state) = self.state.as_ref() {
-                        state.window.request_redraw();
-                    }
-                    return;
-                }
                 let Some(state) = self.state.as_mut() else {
                     return;
                 };
 
-                if page == AppPage::Editor
-                    && button == MouseButton::Right
-                    && btn_state == ElementState::Pressed
-                {
-                    if let Some(grid_pos) = state.hit_test_editor(&self.settings) {
+                if button == MouseButton::Left {
+                    let area = editor_area(&self.settings, &state.renderer);
+                    let rects = self.tiling.compute_rects(area);
+                    let cursor = cursor_logical(state);
+                    match btn_state {
+                        ElementState::Pressed => {
+                            if let Some(win_id) = self.tiling.hit_title_bar(cursor, &rects) {
+                                self.tiling.begin_drag(win_id, cursor);
+                                state.window.request_redraw();
+                                return;
+                            }
+                            if let Some(win_id) = self.tiling.hit_window_content(cursor, &rects)
+                            {
+                                self.tiling.set_focus(win_id);
+                            }
+                        }
+                        ElementState::Released => {
+                            if self.tiling.is_dragging() {
+                                self.tiling.commit_drop(area);
+                                state.recompute_grid(&self.settings, &self.tiling);
+                                state.window.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if mouse_to_nvim_blocked(state, &self.settings, &self.tiling, picker_open) {
+                    state.window.request_redraw();
+                    return;
+                }
+
+                if button == MouseButton::Right && btn_state == ElementState::Pressed {
+                    if let Some(grid_pos) =
+                        state.hit_test_editor(&self.settings, &self.tiling)
+                    {
                         let screen_pos = state.imgui.mouse_pos();
                         state.context_menu.open_at(screen_pos, grid_pos);
                         state.window.request_redraw();
@@ -944,7 +1121,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(btn) = map_button(button) else {
                     return;
                 };
-                let (row, col) = state.hit_test(&self.settings);
+                let (row, col) = state.hit_test(&self.settings, &self.tiling);
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_down = Some(btn);
@@ -972,14 +1149,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, &self.settings, page, picker_open)
+                    mouse_to_nvim_blocked(s, &self.settings, &self.tiling, picker_open)
                 }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
                     return;
                 };
-                let (row, col) = state.hit_test(&self.settings);
+                let (row, col) = state.hit_test(&self.settings, &self.tiling);
                 let (_, ch) = state.renderer.cell_size();
                 let scale = self.settings.mouse_scroll_sensitivity;
                 let lines = match delta {
@@ -1011,7 +1188,6 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let page = self.current_page;
                 let (needs_anim, menu_action, context_action, project_selection) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
@@ -1019,7 +1195,7 @@ impl ApplicationHandler<UserEvent> for App {
                     state.render(
                         &mut self.settings,
                         &mut self.menu_bar,
-                        page,
+                        &mut self.tiling,
                         &mut self.git_client,
                         &mut self.project_picker,
                         &mut self.file_picker,
@@ -1043,14 +1219,20 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::Poll);
                     }
                 } else if self.state.as_ref().is_some_and(|s| {
-                    // Only poll at full speed for Editor-page imgui interactions
+                    // Only poll at full speed for editor imgui interactions
                     // (context menu, project picker, hover states).  The git
                     // client drives its own redraws via the GitRefreshed event
                     // and must not force a continuous Poll loop.
                     s.context_menu.open
                         || picker_open
-                        || (page == AppPage::Editor
-                            && imgui_captures_input(s, &self.settings, page, picker_open))
+                        || self.tiling.is_dragging()
+                        || (self.tiling.focused_view() == ViewKind::Editor
+                            && imgui_captures_input(
+                                s,
+                                &self.settings,
+                                &self.tiling,
+                                picker_open,
+                            ))
                 }) {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
@@ -1065,12 +1247,11 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let page = self.current_page;
         let picker_open = self.project_picker.is_open()
             || self.file_picker.is_open()
             || self.grep_picker.is_open();
 
-        // For the git client page the event loop should stay in Wait mode.
+        // For git windows the event loop should stay in Wait mode when idle.
         // Redraws are triggered by the GitRefreshed user-event that the
         // background threads send via the proxy.  Forcing Poll here would
         // spin the render loop and block the main thread with git subprocess
@@ -1080,10 +1261,13 @@ impl ApplicationHandler<UserEvent> for App {
             || self.project_picker.is_animating()
             || self.file_picker.is_animating()
             || self.grep_picker.is_animating()
-            || (page == AppPage::Editor
-                && imgui_captures_input(state, &self.settings, page, picker_open))
+            || self.tiling.is_dragging()
+            || self.tiling.preview_alpha() > 0.01
+            || (self.tiling.focused_view() == ViewKind::Editor
+                && imgui_captures_input(state, &self.settings, &self.tiling, picker_open))
             || state.anim.is_animating()
-            || (page == AppPage::Editor && state.anim.is_blinking(&state.store));
+            || (self.tiling.focused_view() == ViewKind::Editor
+                && state.anim.is_blinking(&state.store));
 
         if needs_continuous {
             state.window.request_redraw();
