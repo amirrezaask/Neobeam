@@ -407,15 +407,14 @@ impl App {
                 }
             }
             MenuBarAction::PageChanged(page) => {
-                if let Some(state) = self.state.as_ref() {
+                if let Some(state) = self.state.as_mut() {
                     let area = editor_area(&self.settings, &state.renderer);
                     self.tiling.open_or_focus(app_page_to_view(page), area);
+                    state.recompute_grid(&self.settings, &self.tiling);
+                    state.window.request_redraw();
                 }
                 if page == AppPage::GitClient {
                     self.schedule_winbar_refresh();
-                }
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
                 }
             }
         }
@@ -566,6 +565,7 @@ impl State {
         let editor_area_rect = Rect::from_array(layout.editor_rect);
         let window_rects = tiling.compute_rects(editor_area_rect);
         let tiling_animating = tiling.update_anim(dt);
+        self.recompute_grid(settings, tiling);
         let focused_page = view_to_app_page(tiling.focused_view());
 
         let mut menu_action = MenuBarAction::None;
@@ -596,7 +596,7 @@ impl State {
                 for win_id in &git_windows {
                     let visual = tiling.visual_rect(*win_id, &window_rects);
                     let content = tiling.content_rect(visual);
-                    git_wants_redraw |= git_client.draw(ui, content);
+                    git_wants_redraw |= git_client.draw(ui, *win_id, content);
                 }
                 if tiling.focused_view() == ViewKind::Editor {
                     context_action = context_menu.draw(ui);
@@ -1081,6 +1081,14 @@ impl ApplicationHandler<UserEvent> for App {
                     let cursor = cursor_logical(state);
                     match btn_state {
                         ElementState::Pressed => {
+                            if let Some(win_id) =
+                                self.tiling.hit_fullscreen_button(cursor, &rects)
+                            {
+                                self.tiling.fullscreen(win_id, area);
+                                state.recompute_grid(&self.settings, &self.tiling);
+                                state.window.request_redraw();
+                                return;
+                            }
                             if let Some(win_id) = self.tiling.hit_title_bar(cursor, &rects) {
                                 self.tiling.begin_drag(win_id, cursor);
                                 state.window.request_redraw();

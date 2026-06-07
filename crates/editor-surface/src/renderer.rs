@@ -503,11 +503,12 @@ impl Renderer {
 
             let target_w = self.config.width;
             let target_h = self.config.height;
+            let editor_clip = editor_clip_rect(editor_rect);
             if lists.batches.is_empty() {
-                draw_all_instances(&mut pass, self, &lists, target_w, target_h);
+                draw_all_instances(&mut pass, self, &lists, target_w, target_h, editor_clip);
             } else {
-                draw_batched(&mut pass, self, &lists, target_w, target_h);
-                draw_unbatched_tail(&mut pass, self, &lists, target_w, target_h);
+                draw_batched(&mut pass, self, &lists, target_w, target_h, editor_clip);
+                draw_unbatched_tail(&mut pass, self, &lists, target_w, target_h, editor_clip);
             }
             ui_cb(&self.device, &self.queue, &mut pass);
         }
@@ -553,6 +554,42 @@ impl Renderer {
     }
 }
 
+fn editor_clip_rect(editor_rect: [f32; 4]) -> Option<ScissorRect> {
+    if editor_rect[2] <= 0.0 || editor_rect[3] <= 0.0 {
+        return None;
+    }
+    Some(ScissorRect {
+        x: editor_rect[0].max(0.0) as u32,
+        y: editor_rect[1].max(0.0) as u32,
+        w: editor_rect[2].max(1.0) as u32,
+        h: editor_rect[3].max(1.0) as u32,
+    })
+}
+
+fn combine_scissor(batch: Option<ScissorRect>, clip: Option<ScissorRect>) -> Option<ScissorRect> {
+    match (batch, clip) {
+        (None, None) => None,
+        (None, Some(c)) => Some(c),
+        (Some(b), None) => Some(b),
+        (Some(b), Some(c)) => {
+            let x1 = b.x.max(c.x);
+            let y1 = b.y.max(c.y);
+            let x2 = (b.x + b.w).min(c.x + c.w);
+            let y2 = (b.y + b.h).min(c.y + c.h);
+            if x2 <= x1 || y2 <= y1 {
+                None
+            } else {
+                Some(ScissorRect {
+                    x: x1,
+                    y: y1,
+                    w: x2 - x1,
+                    h: y2 - y1,
+                })
+            }
+        }
+    }
+}
+
 fn scissor_physical(s: ScissorRect, scale: f32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
     let x = (s.x as f32 * scale).round() as u32;
     let y = (s.y as f32 * scale).round() as u32;
@@ -589,23 +626,24 @@ fn draw_all_instances(
     lists: &DrawLists,
     target_w: u32,
     target_h: u32,
+    editor_clip: Option<ScissorRect>,
 ) {
     if !lists.rects.is_empty() {
-        apply_scissor(pass, None, r.scale, target_w, target_h);
+        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
         pass.set_pipeline(&r.rect_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
         pass.draw(0..6, 0..lists.rects.len() as u32);
     }
     if !lists.quads.is_empty() {
-        apply_scissor(pass, None, r.scale, target_w, target_h);
+        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
         pass.set_pipeline(&r.quad_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
         pass.draw(0..6, 0..lists.quads.len() as u32);
     }
     if !lists.glyphs.is_empty() {
-        apply_scissor(pass, None, r.scale, target_w, target_h);
+        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
         pass.set_pipeline(&r.glyph_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_bind_group(1, &r.atlas_bind_group, &[]);
@@ -620,6 +658,7 @@ fn draw_batched(
     lists: &DrawLists,
     target_w: u32,
     target_h: u32,
+    editor_clip: Option<ScissorRect>,
 ) {
     let scale = r.scale;
     for batch in &lists.batches {
@@ -628,7 +667,10 @@ fn draw_batched(
                 if *count == 0 {
                     continue;
                 }
-                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                let Some(scissor) = combine_scissor(*scissor, editor_clip) else {
+                    continue;
+                };
+                apply_scissor(pass, Some(scissor), scale, target_w, target_h);
                 pass.set_pipeline(&r.rect_pipeline);
                 pass.set_bind_group(0, &r.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
@@ -638,7 +680,10 @@ fn draw_batched(
                 if *count == 0 {
                     continue;
                 }
-                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                let Some(scissor) = combine_scissor(*scissor, editor_clip) else {
+                    continue;
+                };
+                apply_scissor(pass, Some(scissor), scale, target_w, target_h);
                 pass.set_pipeline(&r.quad_pipeline);
                 pass.set_bind_group(0, &r.globals_bind_group, &[]);
                 pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
@@ -648,7 +693,10 @@ fn draw_batched(
                 if *count == 0 {
                     continue;
                 }
-                apply_scissor(pass, *scissor, scale, target_w, target_h);
+                let Some(scissor) = combine_scissor(*scissor, editor_clip) else {
+                    continue;
+                };
+                apply_scissor(pass, Some(scissor), scale, target_w, target_h);
                 pass.set_pipeline(&r.glyph_pipeline);
                 pass.set_bind_group(0, &r.globals_bind_group, &[]);
                 pass.set_bind_group(1, &r.atlas_bind_group, &[]);
@@ -680,9 +728,16 @@ fn draw_unbatched_tail(
     lists: &DrawLists,
     target_w: u32,
     target_h: u32,
+    editor_clip: Option<ScissorRect>,
 ) {
     let (rect_end, glyph_end, quad_end) = batch_end(&lists.batches);
-    apply_scissor(pass, None, r.scale, target_w, target_h);
+    apply_scissor(
+        pass,
+        combine_scissor(None, editor_clip),
+        r.scale,
+        target_w,
+        target_h,
+    );
     if rect_end < lists.rects.len() as u32 {
         pass.set_pipeline(&r.rect_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);

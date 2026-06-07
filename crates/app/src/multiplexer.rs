@@ -107,6 +107,8 @@ pub struct TilingManager {
 }
 
 const LAYOUT_ANIM_LEN: f32 = 0.25;
+const FULLSCREEN_BTN_SIZE: f32 = 18.0;
+const FULLSCREEN_BTN_MARGIN: f32 = 6.0;
 
 impl TilingManager {
     pub fn new(title_bar_h: f32) -> Self {
@@ -415,6 +417,51 @@ impl TilingManager {
         self.preview_alpha = 0.0;
     }
 
+    pub fn can_fullscreen(&self) -> bool {
+        self.windows.len() > 1
+    }
+
+    pub fn fullscreen(&mut self, win_id: WinId, area: Rect) {
+        if !self.windows.iter().any(|w| w.id == win_id) {
+            return;
+        }
+        if self.windows.len() <= 1 && matches!(self.root, LayoutNode::Leaf(id) if id == win_id) {
+            return;
+        }
+
+        let old_rects = self.compute_rects(area);
+
+        self.windows.retain(|w| w.id == win_id);
+        self.root = LayoutNode::Leaf(win_id);
+        self.focused = win_id;
+        self.drag = None;
+        self.drop_preview = None;
+        self.anim.retain(|id, _| *id == win_id);
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+        self.preview_alpha = 0.0;
+    }
+
+    pub fn hit_fullscreen_button(
+        &self,
+        cursor: (f32, f32),
+        rects: &HashMap<WinId, Rect>,
+    ) -> Option<WinId> {
+        if !self.can_fullscreen() {
+            return None;
+        }
+        let (cx, cy) = cursor;
+        for win in self.windows.iter().rev() {
+            let tb = self.title_bar_rect(self.visual_rect(win.id, rects));
+            let btn = fullscreen_button_rect(tb);
+            if btn.contains(cx, cy) {
+                return Some(win.id);
+            }
+        }
+        None
+    }
+
     pub fn hit_title_bar(
         &self,
         cursor: (f32, f32),
@@ -424,6 +471,12 @@ impl TilingManager {
         for win in self.windows.iter().rev() {
             let r = self.visual_rect(win.id, rects);
             let tb = self.title_bar_rect(r);
+            if self.can_fullscreen() {
+                let btn = fullscreen_button_rect(tb);
+                if btn.contains(cx, cy) {
+                    continue;
+                }
+            }
             if cx >= tb.x && cx < tb.x + tb.w && cy >= tb.y && cy < tb.y + tb.h {
                 return Some(win.id);
             }
@@ -481,7 +534,14 @@ impl TilingManager {
             let visual = self.visual_rect(win.id, rects);
             let tb = self.title_bar_rect(visual);
             let focused = win.id == self.focused;
-            draw_title_bar(&draw, tb, &win.title, focused, self.is_dragging());
+            draw_title_bar(
+                &draw,
+                tb,
+                &win.title,
+                focused,
+                self.is_dragging(),
+                self.can_fullscreen(),
+            );
         }
 
         if let Some(preview) = &self.drop_preview {
@@ -641,7 +701,24 @@ fn insert_at_target(
     }
 }
 
-fn draw_title_bar(draw: &DrawListMut<'_>, rect: Rect, title: &str, focused: bool, dragging: bool) {
+fn fullscreen_button_rect(title_bar: Rect) -> Rect {
+    let size = FULLSCREEN_BTN_SIZE.min(title_bar.h - 4.0);
+    Rect {
+        x: title_bar.x + title_bar.w - FULLSCREEN_BTN_MARGIN - size,
+        y: title_bar.y + (title_bar.h - size) * 0.5,
+        w: size,
+        h: size,
+    }
+}
+
+fn draw_title_bar(
+    draw: &DrawListMut<'_>,
+    rect: Rect,
+    title: &str,
+    focused: bool,
+    dragging: bool,
+    show_fullscreen: bool,
+) {
     let bg = if dragging {
         [0.22, 0.24, 0.30, 1.0]
     } else if focused {
@@ -671,6 +748,40 @@ fn draw_title_bar(draw: &DrawListMut<'_>, rect: Rect, title: &str, focused: bool
     let text_x = rect.x + 10.0;
     let text_y = rect.y + (rect.h - 14.0) * 0.5;
     draw.add_text([text_x, text_y], text_color, title);
+
+    if show_fullscreen {
+        draw_fullscreen_button(draw, fullscreen_button_rect(rect), focused);
+    }
+}
+
+fn draw_fullscreen_button(draw: &DrawListMut<'_>, btn: Rect, focused: bool) {
+    let hover_bg = [0.28, 0.30, 0.38, 1.0];
+    let icon_color = if focused {
+        [0.85, 0.87, 0.92, 1.0]
+    } else {
+        [0.55, 0.57, 0.62, 1.0]
+    };
+    draw.add_rect([btn.x, btn.y], [btn.x + btn.w, btn.y + btn.h], hover_bg)
+        .filled(true)
+        .rounding(3.0)
+        .build();
+
+    let pad = 4.0;
+    let inner = Rect {
+        x: btn.x + pad,
+        y: btn.y + pad,
+        w: btn.w - pad * 2.0,
+        h: btn.h - pad * 2.0,
+    };
+    draw.add_rect(
+        [inner.x, inner.y],
+        [inner.x + inner.w, inner.y + inner.h],
+        icon_color,
+    )
+    .filled(false)
+    .thickness(1.5)
+    .rounding(1.0)
+    .build();
 }
 
 fn draw_drop_preview(draw: &DrawListMut<'_>, rect: Rect, alpha: f32) {
@@ -729,6 +840,34 @@ mod tests {
         assert_eq!(mgr.windows.len(), 2);
         let rects = mgr.compute_rects(area);
         assert_eq!(rects.len(), 2);
+    }
+
+    #[test]
+    fn fullscreen_collapses_split() {
+        let mut mgr = TilingManager::new(28.0);
+        let area = Rect {
+            x: 0.0,
+            y: 32.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        mgr.add_window(ViewKind::GitClient, area);
+        assert_eq!(mgr.windows.len(), 2);
+
+        let git_id = mgr
+            .windows
+            .iter()
+            .find(|w| w.view == ViewKind::GitClient)
+            .map(|w| w.id)
+            .unwrap();
+        mgr.fullscreen(git_id, area);
+
+        assert_eq!(mgr.windows.len(), 1);
+        assert_eq!(mgr.windows[0].id, git_id);
+        assert!(matches!(mgr.root, LayoutNode::Leaf(id) if id == git_id));
+        let rects = mgr.compute_rects(area);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[&git_id].w - 800.0).abs() < 0.01);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::multiplexer::Rect;
+use crate::multiplexer::{Rect, WinId};
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
 use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
@@ -162,6 +162,7 @@ pub struct GitClient {
     // Receive diff results from the diff thread.
     diff_rx: mpsc::Receiver<DiffResponse>,
     diff_pending: bool,
+    last_content_rect: Option<Rect>,
 }
 
 impl GitClient {
@@ -243,6 +244,7 @@ impl GitClient {
             diff_tx,
             diff_rx,
             diff_pending: false,
+            last_content_rect: None,
         }
     }
 
@@ -263,9 +265,18 @@ impl GitClient {
 
     /// Draw the git client UI.  Returns `true` when new data arrived from a
     /// background thread and a redraw should be scheduled.
-    pub fn draw(&mut self, ui: &Ui, content_rect: Rect) -> bool {
-
+    pub fn draw(&mut self, ui: &Ui, win_id: WinId, content_rect: Rect) -> bool {
         let mut wants_redraw = false;
+
+        let size_changed = self.last_content_rect.is_none_or(|r| {
+            (r.w - content_rect.w).abs() > 0.5 || (r.h - content_rect.h).abs() > 0.5
+        });
+        if size_changed {
+            let max_sidebar = (content_rect.w * 0.55).max(120.0);
+            self.sidebar_width = self.sidebar_width.min(max_sidebar);
+            wants_redraw = true;
+        }
+        self.last_content_rect = Some(content_rect);
 
         // ── Poll background results (non-blocking) ────────────────────────
 
@@ -312,7 +323,8 @@ impl GitClient {
             | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
             | WindowFlags::NO_NAV_FOCUS;
 
-        ui.window("##git_client")
+        let window_id = format!("##git_client_{}", win_id.0);
+        ui.window(&window_id)
             .position(pos, Condition::Always)
             .size(size, Condition::Always)
             .flags(flags)
