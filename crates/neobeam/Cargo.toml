@@ -1,16 +1,16 @@
 [package]
-name = "app"
+name = "neobeam"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "nvim-ui"
+name = "neobeam"
 path = "src/main.rs"
 
 [package.metadata.bundle]
-name = "nvim-ui"
-identifier = "dev.nvim-ui-rs.app"
+name = "Neobeam"
+identifier = "dev.neobeam.app"
 short_description = "GPU-accelerated Neovim GUI"
 category = "Developer Tool"
 osx_minimum_system_version = "11.0"

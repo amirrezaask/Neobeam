@@ -1,4 +1,4 @@
-//! Persisted settings in `$XDG_CONFIG_HOME/nvim-ui/settings.json` (or `~/.config/...`).
+//! Persisted settings in `$XDG_CONFIG_HOME/neobeam/settings.json` (or `~/.config/...`).
 
 use std::path::PathBuf;
 
@@ -143,7 +143,7 @@ impl Settings {
 pub fn config_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        let dirs = directories::ProjectDirs::from("", "", "nvim-ui")?;
+        let dirs = directories::ProjectDirs::from("", "", "neobeam")?;
         return Some(dirs.config_dir().join("settings.json"));
     }
     #[cfg(not(windows))]
@@ -154,7 +154,7 @@ pub fn config_path() -> Option<PathBuf> {
             .or_else(|| {
                 directories::BaseDirs::new().map(|d| d.home_dir().join(".config"))
             })?;
-        Some(config_home.join("nvim-ui").join("settings.json"))
+        Some(config_home.join("neobeam").join("settings.json"))
     }
 }
 

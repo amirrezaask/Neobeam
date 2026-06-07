@@ -1,2 +1,2 @@
 [alias]
-macos-app = "bundle --release -p app --format osx"
+macos-app = "bundle --release -p neobeam --format osx"

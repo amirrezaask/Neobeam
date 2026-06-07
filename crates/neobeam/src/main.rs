@@ -217,7 +217,7 @@ impl App {
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
         let attrs = Window::default_attributes()
-            .with_title("nvim-ui")
+            .with_title("Neobeam")
             .with_transparent(true);
         let window = Arc::new(event_loop.create_window(attrs)?);
         window.set_ime_allowed(true);
@@ -1170,7 +1170,7 @@ fn read_clipboard_text() -> Option<String> {
 }
 
 /// When launched from a shell, re-exec in the background so the terminal prompt returns.
-const DETACHED_ENV: &str = "NVIM_UI_DETACHED";
+const DETACHED_ENV: &str = "NEOBEAM_DETACHED";
 
 fn try_detach_from_terminal() -> Result<bool> {
     if std::env::var_os(DETACHED_ENV).is_some() {

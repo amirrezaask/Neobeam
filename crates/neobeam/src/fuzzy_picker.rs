@@ -326,16 +326,16 @@ mod tests {
 
     #[test]
     fn empty_query_matches_all() {
-        assert_eq!(fuzzy_score("", "nvim-ui-rs"), Some(0));
+        assert_eq!(fuzzy_score("", "neobeam"), Some(0));
     }
 
     #[test]
     fn subsequence_match() {
-        assert!(fuzzy_score("nui", "nvim-ui-rs").is_some());
+        assert!(fuzzy_score("neo", "neobeam").is_some());
     }
 
     #[test]
     fn non_match_returns_none() {
-        assert!(fuzzy_score("zzz", "nvim-ui-rs").is_none());
+        assert!(fuzzy_score("zzz", "neobeam").is_none());
     }
 }

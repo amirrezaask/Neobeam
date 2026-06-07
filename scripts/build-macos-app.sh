@@ -10,7 +10,7 @@ if ! command -v cargo-bundle >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo bundle --release -p app --format osx
+cargo bundle --release -p neobeam --format osx
 
-app_path="$root/target/release/bundle/osx/nvim-ui.app"
+app_path="$root/target/release/bundle/osx/Neobeam.app"
 echo "Built macOS app bundle: $app_path"

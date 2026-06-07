@@ -16,7 +16,7 @@ impl Project {
         Project { path }
     }
 
-    /// Returns a `~`-abbreviated path for display (e.g. `~/dev/nvim-ui-rs`).
+    /// Returns a `~`-abbreviated path for display (e.g. `~/dev/neobeam`).
     pub fn display(&self) -> String {
         let home = UserDirs::new().map(|d| d.home_dir().to_path_buf());
         if let Some(home) = home {

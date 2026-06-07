@@ -1,4 +1,4 @@
-# nvim-ui
+# Neobeam
 
 A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the editor with wgpu, and layers smooth motion on top — inspired by [4coder](https://4coder.net/)'s feel and borrowing animation ideas from [Neovide](https://neovide.dev/).
 
@@ -35,13 +35,13 @@ macOS is the primary target today, but the editor runs on other platforms too.
 
 ```bash
 cargo build --release
-./target/release/nvim-ui
+./target/release/neobeam
 ```
 
 On first launch, a default config is written to:
 
 ```
-~/.config/nvim-ui/settings.json
+~/.config/neobeam/settings.json
 ```
 
 Edit that file while the app is running — changes reload automatically when the settings panel is closed.
@@ -67,7 +67,7 @@ If your Neovim config sets `g:neovide_scroll_animation_length` or `g:neovide_scr
 
 | Crate | Role |
 |---|---|
-| [`crates/app`](crates/app) | Binary (`nvim-ui`): window loop, input, settings UI |
+| [`crates/neobeam`](crates/neobeam) | Binary (`neobeam`): window loop, input, settings UI |
 | [`crates/nvim-core`](crates/nvim-core) | Neovim session, protocol parsing, grid/window state |
 | [`crates/editor-surface`](crates/editor-surface) | wgpu renderer, fonts, animation engine, cursor VFX |
 
@@ -80,10 +80,10 @@ If your Neovim config sets `g:neovide_scroll_animation_length` or `g:neovide_scr
 cargo test
 
 # Verbose logging (`cargo run` stays attached to the terminal)
-RUST_LOG=nvim_ui=debug cargo run -p app
+RUST_LOG=neobeam=debug cargo run -p neobeam
 
 # Release binary detaches from the shell by default; keep the terminal for logs:
-RUST_LOG=nvim_ui=debug ./target/release/nvim-ui --foreground
+RUST_LOG=neobeam=debug ./target/release/neobeam --foreground
 ```
 
 ## Credits

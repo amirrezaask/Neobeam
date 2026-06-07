@@ -93,37 +93,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "directories",
- "editor-surface",
- "flume",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "imgui",
- "imgui-wgpu",
- "imgui-winit-support",
- "notify-debouncer-mini",
- "nvim-core",
- "nvim-rs",
- "pollster",
- "rmpv",
- "serde",
- "serde_json",
- "similar",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1496,6 +1465,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "neobeam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "directories",
+ "editor-surface",
+ "flume",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "imgui",
+ "imgui-wgpu",
+ "imgui-winit-support",
+ "notify-debouncer-mini",
+ "nvim-core",
+ "nvim-rs",
+ "pollster",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "similar",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
