@@ -4,7 +4,9 @@
 
 mod app_page;
 mod context_menu;
+mod file_picker;
 mod fuzzy_picker;
+mod grep_picker;
 mod git_client;
 mod git_diff;
 mod imgui_layer;
@@ -25,6 +27,8 @@ use app_page::AppPage;
 use arboard::Clipboard;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use editor_surface::{AnimationState, ChromeLayout, Renderer};
+use file_picker::FilePicker;
+use grep_picker::GrepPicker;
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
@@ -84,6 +88,8 @@ struct App {
     current_page: AppPage,
     git_client: GitClient,
     project_picker: ProjectPicker,
+    file_picker: FilePicker,
+    grep_picker: GrepPicker,
     /// Single source of truth for the current project used by all views.
     project: Option<Project>,
     /// True while a winbar RPC is in flight.
@@ -176,6 +182,8 @@ impl App {
             current_page: AppPage::Editor,
             git_client,
             project_picker: ProjectPicker::new(),
+            file_picker: FilePicker::new(),
+            grep_picker: GrepPicker::new(),
             project: initial_project,
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
@@ -436,6 +444,8 @@ impl State {
         current_page: AppPage,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
+        file_picker: &mut FilePicker,
+        grep_picker: &mut GrepPicker,
     ) -> (bool, MenuBarAction, ContextMenuAction, Option<PathBuf>) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -487,7 +497,13 @@ impl State {
                         git_wants_redraw = git_client.draw(ui, &layout);
                     }
                 }
-                project_selection = project_picker.draw(ui);
+                project_selection = project_picker.draw(ui, dt);
+                if let Some(path) = file_picker.draw(ui, dt) {
+                    session.open_file(path);
+                }
+                if let Some(m) = grep_picker.draw(ui, dt) {
+                    session.open_file_at_line(m.path, m.line_number);
+                }
             },
         ) {
             tracing::warn!("imgui frame failed: {e:#}");
@@ -519,6 +535,8 @@ impl State {
             || self.anim.render_deadline().is_some();
         if self.context_menu.open
             || project_picker.is_open()
+            || file_picker.is_open()
+            || grep_picker.is_open()
             || needs_anim
             || imgui_active(self)
             || git_wants_redraw
@@ -686,7 +704,9 @@ impl ApplicationHandler<UserEvent> for App {
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
             let page = self.current_page;
-            let picker_open = self.project_picker.is_open();
+            let picker_open = self.project_picker.is_open()
+                || self.file_picker.is_open()
+                || self.grep_picker.is_open();
             let redraw = state.context_menu.open
                 || picker_open
                 || imgui_captures_input(state, &self.settings, page, picker_open);
@@ -695,7 +715,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         let page = self.current_page;
-        let picker_open = self.project_picker.is_open();
+        let picker_open = self.project_picker.is_open()
+            || self.file_picker.is_open()
+            || self.grep_picker.is_open();
         match event {
             WindowEvent::CloseRequested => {
                 let Some(state) = self.state.as_mut() else {
@@ -787,6 +809,36 @@ impl ApplicationHandler<UserEvent> for App {
                     is_project_picker_shortcut(&event.logical_key, s.mods)
                 }) {
                     self.project_picker.open();
+                    if let Some(state) = self.state.as_mut() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self.state.as_ref().is_some_and(|s| {
+                    is_file_picker_shortcut(&event.logical_key, s.mods)
+                }) {
+                    let root = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.path.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    self.file_picker.open(&root);
+                    if let Some(state) = self.state.as_mut() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self.state.as_ref().is_some_and(|s| {
+                    is_grep_picker_shortcut(&event.logical_key, s.mods)
+                }) {
+                    let root = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.path.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    self.grep_picker.open(&root);
                     if let Some(state) = self.state.as_mut() {
                         state.window.request_redraw();
                     }
@@ -970,6 +1022,8 @@ impl ApplicationHandler<UserEvent> for App {
                         page,
                         &mut self.git_client,
                         &mut self.project_picker,
+                        &mut self.file_picker,
+                        &mut self.grep_picker,
                     )
                 };
                 self.handle_menu_action(menu_action);
@@ -977,7 +1031,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(path) = project_selection {
                     self.set_project(path);
                 }
-                let picker_open = self.project_picker.is_open();
+                let picker_open = self.project_picker.is_open()
+                    || self.file_picker.is_open()
+                    || self.grep_picker.is_open();
                 if needs_anim {
                     if let Some(deadline) =
                         self.state.as_ref().and_then(|s| s.anim.render_deadline())
@@ -1010,7 +1066,9 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let page = self.current_page;
-        let picker_open = self.project_picker.is_open();
+        let picker_open = self.project_picker.is_open()
+            || self.file_picker.is_open()
+            || self.grep_picker.is_open();
 
         // For the git client page the event loop should stay in Wait mode.
         // Redraws are triggered by the GitRefreshed user-event that the
@@ -1019,6 +1077,9 @@ impl ApplicationHandler<UserEvent> for App {
         // calls every frame.
         let needs_continuous = state.context_menu.open
             || picker_open
+            || self.project_picker.is_animating()
+            || self.file_picker.is_animating()
+            || self.grep_picker.is_animating()
             || (page == AppPage::Editor
                 && imgui_captures_input(state, &self.settings, page, picker_open))
             || state.anim.is_animating()
@@ -1061,6 +1122,20 @@ fn is_project_picker_shortcut(key: &Key, mods: Mods) -> bool {
         return false;
     }
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p")) && mods.meta
+}
+
+fn is_file_picker_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.shift || mods.ctrl {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("o")) && mods.meta
+}
+
+fn is_grep_picker_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.ctrl {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("f")) && mods.meta && mods.shift
 }
 
 fn parse_cli_project_dir() -> Option<PathBuf> {
@@ -1118,7 +1193,9 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let initial_project = parse_cli_project_dir().map(Project::new);
+    let initial_project = parse_cli_project_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .map(Project::new);
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();

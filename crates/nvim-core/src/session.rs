@@ -241,6 +241,39 @@ impl NvimSession {
         });
     }
 
+    /// Open a file in the embedded nvim buffer using `:edit`.
+    /// Uses `fnameescape()` so paths with spaces and special characters work.
+    pub fn open_file(&self, path: PathBuf) {
+        let nvim = self.nvim.clone();
+        self.rt.spawn(async move {
+            let path_val = Value::from(path.to_string_lossy().as_ref());
+            if let Ok(escaped) = nvim
+                .call_function("fnameescape", vec![path_val])
+                .await
+            {
+                if let Some(s) = escaped.as_str() {
+                    let _ = nvim.command(&format!("e {s}")).await;
+                }
+            }
+        });
+    }
+
+    /// Open a file at a specific line using `:edit +{line}`.
+    pub fn open_file_at_line(&self, path: PathBuf, line: u64) {
+        let nvim = self.nvim.clone();
+        self.rt.spawn(async move {
+            let path_val = Value::from(path.to_string_lossy().as_ref());
+            if let Ok(escaped) = nvim
+                .call_function("fnameescape", vec![path_val])
+                .await
+            {
+                if let Some(s) = escaped.as_str() {
+                    let _ = nvim.command(&format!("e +{line} {s}")).await;
+                }
+            }
+        });
+    }
+
     /// Change the embedded nvim working directory (`nvim_set_current_dir`).
     pub fn change_working_directory(&mut self, path: PathBuf) -> Result<()> {
         let dir = path.canonicalize().unwrap_or(path);

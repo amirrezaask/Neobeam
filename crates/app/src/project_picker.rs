@@ -31,8 +31,13 @@ impl ProjectPicker {
         self.picker.open(items);
     }
 
-    pub fn draw(&mut self, ui: &Ui) -> Option<PathBuf> {
-        self.picker.draw(ui, "Session")
+    pub fn draw(&mut self, ui: &Ui, dt: f32) -> Option<PathBuf> {
+        self.picker.draw(ui, "Session", dt)
+    }
+
+    /// True while a fade animation (in or out) is in progress.
+    pub fn is_animating(&self) -> bool {
+        self.picker.is_animating()
     }
 }
 

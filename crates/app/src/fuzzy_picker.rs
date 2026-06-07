@@ -1,12 +1,18 @@
-//! Reusable Dear ImGui fuzzy-finder popup.
+//! Reusable Dear ImGui fuzzy-finder popup with fade-in/out animations.
 
-use imgui::{Condition, Key, Ui, WindowFlags};
+use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
 
-const WINDOW_ID: &str = "##fuzzy_picker";
+const WINDOW_ID_SUFFIX: &str = "##fuzzy_picker";
 const INPUT_ID: &str = "##fuzzy_query";
-const LIST_HEIGHT: f32 = 280.0;
-const WINDOW_WIDTH: f32 = 520.0;
-const MAX_VISIBLE: usize = 12;
+pub(crate) const PICKER_DEFAULT_WIDTH: f32 = 720.0;
+pub(crate) const PICKER_DEFAULT_HEIGHT: f32 = 500.0;
+pub(crate) const PICKER_MIN_WIDTH: f32 = 400.0;
+pub(crate) const PICKER_MIN_HEIGHT: f32 = 200.0;
+
+/// Alpha ramp speed when opening (units/sec). Reaches 1.0 in ~200 ms.
+const FADE_IN_SPEED: f32 = 5.0;
+/// Alpha ramp speed when closing via Escape (units/sec). Reaches 0.0 in ~250 ms.
+const FADE_OUT_SPEED: f32 = 4.0;
 
 /// Subsequence fuzzy match with bonuses for contiguous runs and word boundaries.
 pub fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
@@ -63,8 +69,44 @@ pub struct FuzzyPicker<T: Clone> {
     query: String,
     filtered: Vec<ScoredItem<T>>,
     selected: usize,
+    /// Last selection we auto-scrolled to; `None` forces a scroll on the next draw.
+    scroll_anchor: Option<usize>,
     open: bool,
+    /// True while fading out after Escape (open stays true until alpha hits 0).
+    closing: bool,
+    /// Current window alpha (0.0 = invisible, 1.0 = fully opaque).
+    alpha: f32,
     focus_input: bool,
+}
+
+pub(crate) fn picker_initial_position(ui: &Ui) -> [f32; 2] {
+    let display = ui.io().display_size;
+    [
+        (display[0] - PICKER_DEFAULT_WIDTH) * 0.5,
+        display[1] * 0.2,
+    ]
+}
+
+pub(crate) fn visible_row_count(ui: &Ui) -> usize {
+    let h = ui.content_region_avail()[1];
+    (h / ui.text_line_height_with_spacing()).max(1.0) as usize
+}
+
+/// Scroll a child list so `selected` stays visible. Only runs when selection changes
+/// so manual mouse-wheel scrolling is not overwritten every frame.
+pub(crate) fn scroll_list_to_selection(
+    ui: &Ui,
+    selected: usize,
+    anchor: &mut Option<usize>,
+    max_visible: usize,
+) {
+    if anchor == &Some(selected) {
+        return;
+    }
+    let scroll_y = (selected.saturating_sub(max_visible / 2) as f32)
+        * ui.text_line_height_with_spacing();
+    ui.set_scroll_y(scroll_y);
+    *anchor = Some(selected);
 }
 
 impl<T: Clone> FuzzyPicker<T> {
@@ -74,7 +116,10 @@ impl<T: Clone> FuzzyPicker<T> {
             query: String::new(),
             filtered: Vec::new(),
             selected: 0,
+            scroll_anchor: None,
             open: false,
+            closing: false,
+            alpha: 0.0,
             focus_input: false,
         }
     }
@@ -83,21 +128,38 @@ impl<T: Clone> FuzzyPicker<T> {
         self.open
     }
 
+    /// Returns true while a fade-in or fade-out animation is in progress.
+    /// Use this to keep the render loop polling during transitions.
+    pub fn is_animating(&self) -> bool {
+        self.open && (self.alpha < 1.0 || self.closing)
+    }
+
     pub fn open(&mut self, items: Vec<(String, T)>) {
         self.items = items;
         self.query.clear();
         self.selected = 0;
+        self.scroll_anchor = None;
         self.open = true;
+        self.closing = false;
+        self.alpha = 0.0;
         self.focus_input = true;
         self.rebuild_filtered();
     }
 
-    pub fn close(&mut self) {
+    fn close_immediate(&mut self) {
         self.open = false;
+        self.closing = false;
+        self.alpha = 0.0;
         self.query.clear();
         self.filtered.clear();
         self.selected = 0;
+        self.scroll_anchor = None;
         self.focus_input = false;
+    }
+
+    /// Begin an animated close (fade-out). Used when the user presses Escape.
+    fn begin_close(&mut self) {
+        self.closing = true;
     }
 
     fn rebuild_filtered(&mut self) {
@@ -119,40 +181,51 @@ impl<T: Clone> FuzzyPicker<T> {
         }
     }
 
+    /// Confirm the current selection and close immediately (no fade-out).
     fn confirm_selection(&mut self) -> Option<T> {
         let value = self.filtered.get(self.selected).map(|item| item.value.clone())?;
-        self.close();
+        self.close_immediate();
         Some(value)
     }
 
-    pub fn draw(&mut self, ui: &Ui, title: &str) -> Option<T> {
+    /// `dt` is the frame delta time in seconds, used to advance the fade animation.
+    pub fn draw(&mut self, ui: &Ui, title: &str, dt: f32) -> Option<T> {
         if !self.open {
             return None;
         }
 
-        let display = ui.io().display_size;
-        let pos = [
-            (display[0] - WINDOW_WIDTH) * 0.5,
-            display[1] * 0.2,
-        ];
+        // Advance fade animation.
+        if self.closing {
+            self.alpha = (self.alpha - dt * FADE_OUT_SPEED).max(0.0);
+            if self.alpha <= 0.0 {
+                self.close_immediate();
+                return None;
+            }
+        } else {
+            self.alpha = (self.alpha + dt * FADE_IN_SPEED).min(1.0);
+        }
 
-        let flags = WindowFlags::NO_TITLE_BAR
-            | WindowFlags::NO_RESIZE
-            | WindowFlags::NO_MOVE
-            | WindowFlags::NO_COLLAPSE
-            | WindowFlags::ALWAYS_AUTO_RESIZE;
+        let window_name = format!("{title}{WINDOW_ID_SUFFIX}");
+        let pos = picker_initial_position(ui);
 
         let mut confirmed = None;
-        ui.window(WINDOW_ID)
-            .position(pos, Condition::Always)
-            .size([WINDOW_WIDTH, 0.0], Condition::Always)
-            .flags(flags)
-            .movable(false)
-            .resizable(false)
+        // Apply fade alpha to the entire popup.
+        let _alpha_token = ui.push_style_var(StyleVar::Alpha(self.alpha));
+        ui.window(&window_name)
+            .position(pos, Condition::FirstUseEver)
+            .size(
+                [PICKER_DEFAULT_WIDTH, PICKER_DEFAULT_HEIGHT],
+                Condition::FirstUseEver,
+            )
+            .size_constraints(
+                [PICKER_MIN_WIDTH, PICKER_MIN_HEIGHT],
+                [f32::MAX, f32::MAX],
+            )
+            .flags(WindowFlags::NO_COLLAPSE)
+            .title_bar(true)
+            .movable(true)
+            .resizable(true)
             .build(|| {
-                ui.text(title);
-                ui.separator();
-
                 if self.focus_input {
                     ui.set_keyboard_focus_here();
                     self.focus_input = false;
@@ -168,14 +241,19 @@ impl<T: Clone> FuzzyPicker<T> {
                 }
 
                 if ui.is_key_pressed(Key::Escape) {
-                    self.close();
+                    self.begin_close();
                     return;
                 }
 
-                if ui.is_key_pressed(Key::UpArrow) && self.selected > 0 {
+                let go_up = ui.is_key_pressed(Key::UpArrow)
+                    || (ui.io().key_ctrl && ui.is_key_pressed(Key::P));
+                let go_down = ui.is_key_pressed(Key::DownArrow)
+                    || (ui.io().key_ctrl && ui.is_key_pressed(Key::N));
+
+                if go_up && self.selected > 0 {
                     self.selected -= 1;
                 }
-                if ui.is_key_pressed(Key::DownArrow) && self.selected + 1 < self.filtered.len() {
+                if go_down && self.selected + 1 < self.filtered.len() {
                     self.selected += 1;
                 }
                 if ui.is_key_pressed(Key::Enter) && !self.filtered.is_empty() {
@@ -183,8 +261,9 @@ impl<T: Clone> FuzzyPicker<T> {
                     return;
                 }
 
+                let list_size = ui.content_region_avail();
                 ui.child_window("##fuzzy_list")
-                    .size([WINDOW_WIDTH - 16.0, LIST_HEIGHT])
+                    .size(list_size)
                     .border(true)
                     .build(|| {
                         if self.filtered.is_empty() {
@@ -192,13 +271,18 @@ impl<T: Clone> FuzzyPicker<T> {
                             return;
                         }
 
-                        let scroll_y = (self.selected.saturating_sub(MAX_VISIBLE / 2) as f32)
-                            * ui.text_line_height_with_spacing();
-                        ui.set_scroll_y(scroll_y);
+                        let max_visible = visible_row_count(ui);
+                        scroll_list_to_selection(
+                            ui,
+                            self.selected,
+                            &mut self.scroll_anchor,
+                            max_visible,
+                        );
 
                         for (idx, item) in self.filtered.iter().enumerate() {
                             let selected = idx == self.selected;
-                            let clicked = ui.selectable_config(&item.label).selected(selected).build();
+                            let clicked =
+                                ui.selectable_config(&item.label).selected(selected).build();
                             if clicked {
                                 self.selected = idx;
                                 confirmed = self.confirm_selection();
