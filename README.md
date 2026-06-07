@@ -1,5 +1,9 @@
 # Neobeam
 
+<p align="center">
+  <img src="icons/1.png" alt="Neobeam" width="256"/>
+</p>
+
 A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the editor with wgpu, and layers smooth motion on top — inspired by [4coder](https://4coder.net/)'s feel and borrowing animation ideas from [Neovide](https://neovide.dev/).
 
 ```
