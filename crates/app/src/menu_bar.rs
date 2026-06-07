@@ -42,6 +42,12 @@ impl MenuBar {
         self.winbar = session.fetch_winbar_info();
     }
 
+    pub fn set_winbar(&mut self, info: WinbarInfo) {
+        if self.winbar != info {
+            self.winbar = info;
+        }
+    }
+
     pub fn project_path(&self) -> &str {
         &self.winbar.project
     }

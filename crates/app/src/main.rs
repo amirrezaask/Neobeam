@@ -33,7 +33,7 @@ use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
 };
 use nvim_core::protocol::parse_redraw;
-use nvim_core::session::{NvimSession, SessionConfig};
+use nvim_core::session::{NvimSession, SessionConfig, WinbarInfo};
 use nvim_core::Value;
 use settings::{spawn_watcher, Settings};
 use winit::application::ApplicationHandler;
@@ -50,6 +50,8 @@ enum UserEvent {
     /// A background git thread finished work; schedule a redraw so the
     /// git-client panel can pick up the new data from its channels.
     GitRefreshed,
+    /// Async winbar query finished (see `App::schedule_winbar_refresh`).
+    WinbarUpdated(WinbarInfo),
 }
 
 struct State {
@@ -81,6 +83,10 @@ struct App {
     git_client: GitClient,
     project_picker: ProjectPicker,
     project_dir: Option<PathBuf>,
+    /// True while a winbar RPC is in flight.
+    winbar_refresh_pending: bool,
+    /// Another flush arrived while a winbar RPC was in flight.
+    winbar_refresh_dirty: bool,
     state: Option<State>,
 }
 
@@ -162,8 +168,27 @@ impl App {
             }),
             project_picker: ProjectPicker::new(),
             project_dir,
+            winbar_refresh_pending: false,
+            winbar_refresh_dirty: false,
             state: None,
         })
+    }
+
+    /// Coalesced async winbar refresh. Must not call nvim synchronously from
+    /// the redraw hot path — that deadlocks when nvim is busy (e.g. fzf).
+    fn schedule_winbar_refresh(&mut self) {
+        if self.winbar_refresh_pending {
+            self.winbar_refresh_dirty = true;
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        self.winbar_refresh_pending = true;
+        let proxy = self.proxy.clone();
+        state.session.fetch_winbar_info_async(move |info| {
+            let _ = proxy.send_event(UserEvent::WinbarUpdated(info));
+        });
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
@@ -287,9 +312,7 @@ impl App {
             MenuBarAction::PageChanged(page) => {
                 self.current_page = page;
                 if page == AppPage::GitClient {
-                    if let Some(state) = &self.state {
-                        self.menu_bar.refresh_winbar(&state.session);
-                    }
+                    self.schedule_winbar_refresh();
                 }
                 if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
@@ -559,17 +582,24 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Redraw(args) => {
-                let Some(state) = self.state.as_mut() else {
-                    return;
+                let refresh_winbar = {
+                    let Some(state) = self.state.as_mut() else {
+                        return;
+                    };
+                    let events = parse_redraw(&args);
+                    let flushed = state.store.apply_batch(events);
+                    if flushed {
+                        let scroll = state.store.take_pending_scroll();
+                        state.anim.on_flush(&state.store, &scroll);
+                        state.anim.sync_floats(&state.store.active_floats());
+                        state.window.request_redraw();
+                        true
+                    } else {
+                        false
+                    }
                 };
-                let events = parse_redraw(&args);
-                let flushed = state.store.apply_batch(events);
-                if flushed {
-                    let scroll = state.store.take_pending_scroll();
-                    state.anim.on_flush(&state.store, &scroll);
-                    state.anim.sync_floats(&state.store.active_floats());
-                    self.menu_bar.refresh_winbar(&state.session);
-                    state.window.request_redraw();
+                if refresh_winbar {
+                    self.schedule_winbar_refresh();
                 }
             }
             UserEvent::SettingsReloaded => {
@@ -580,6 +610,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // loop so `git_client.draw()` can pick it up from the channel.
                 if let Some(state) = self.state.as_ref() {
                     state.window.request_redraw();
+                }
+            }
+            UserEvent::WinbarUpdated(info) => {
+                self.winbar_refresh_pending = false;
+                let dirty = self.winbar_refresh_dirty;
+                self.winbar_refresh_dirty = false;
+                self.menu_bar.set_winbar(info);
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+                if dirty {
+                    self.schedule_winbar_refresh();
                 }
             }
             UserEvent::Exited => {

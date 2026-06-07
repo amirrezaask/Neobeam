@@ -244,31 +244,17 @@ impl NvimSession {
     /// Buffer file name and working directory for the host winbar.
     pub fn fetch_winbar_info(&self) -> WinbarInfo {
         let nvim = self.nvim.clone();
-        self.rt.block_on(async move {
-            let result = nvim
-                .exec_lua(
-                    r#"
-                    local name = vim.api.nvim_buf_get_name(0)
-                    if name == '' then
-                      name = '[No Name]'
-                    else
-                      name = vim.fn.fnamemodify(name, ':t')
-                    end
-                    local path = vim.fn.getcwd()
-                    local home = vim.env.HOME or vim.env.USERPROFILE
-                    if home and vim.startswith(path, home) then
-                      path = '~' .. path:sub(#home + 1)
-                    end
-                    return { name, path }
-                    "#,
-                    vec![],
-                )
-                .await;
-            result
-                .ok()
-                .and_then(|v| winbar_info_from_value(&v))
-                .unwrap_or_default()
-        })
+        self.rt
+            .block_on(async move { fetch_winbar_info_async(&nvim).await })
+    }
+
+    /// Non-blocking winbar query; runs on the session runtime and invokes `on_ready` when done.
+    pub fn fetch_winbar_info_async(&self, on_ready: impl FnOnce(WinbarInfo) + Send + 'static) {
+        let nvim = self.nvim.clone();
+        self.rt.spawn(async move {
+            let info = fetch_winbar_info_async(&nvim).await;
+            on_ready(info);
+        });
     }
 
     /// Read `g:neovide_scroll_animation_length` and `g:neovide_scroll_animation_far_lines` if set.
@@ -346,6 +332,32 @@ impl Drop for NvimSession {
         self.exit_guard.store(true, Ordering::SeqCst);
         let _ = self.child.start_kill();
     }
+}
+
+async fn fetch_winbar_info_async(nvim: &Nvim) -> WinbarInfo {
+    let result = nvim
+        .exec_lua(
+            r#"
+            local name = vim.api.nvim_buf_get_name(0)
+            if name == '' then
+              name = '[No Name]'
+            else
+              name = vim.fn.fnamemodify(name, ':t')
+            end
+            local path = vim.fn.getcwd()
+            local home = vim.env.HOME or vim.env.USERPROFILE
+            if home and vim.startswith(path, home) then
+              path = '~' .. path:sub(#home + 1)
+            end
+            return { name, path }
+            "#,
+            vec![],
+        )
+        .await;
+    result
+        .ok()
+        .and_then(|v| winbar_info_from_value(&v))
+        .unwrap_or_default()
 }
 
 async fn configure_host_chrome(nvim: &Nvim) -> Result<(), Box<nvim_rs::error::CallError>> {
