@@ -1,0 +1,310 @@
+//! Git change discovery and file content fetch via `git` subprocess.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSide {
+    Staged,
+    Unstaged,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: char,
+    pub staged: bool,
+    pub unstaged: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum FileContent {
+    Text { old: String, new: String },
+    Binary,
+    Added { new: String },
+    Deleted { old: String },
+    Error(String),
+}
+
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(path)
+}
+
+pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
+    let cwd = cwd.to_str()?;
+    let output = Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+pub fn stage_file(repo: &Path, path: &str) -> Result<(), String> {
+    git_file_op(repo, &["add", "--", path], "stage file")
+}
+
+pub fn unstage_file(repo: &Path, path: &str) -> Result<(), String> {
+    git_file_op(repo, &["restore", "--staged", "--", path], "unstage file")
+}
+
+fn git_file_op(repo: &Path, args: &[&str], action: &str) -> Result<(), String> {
+    let repo_str = repo
+        .to_str()
+        .ok_or_else(|| "invalid repository path".to_string())?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_str)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to {action}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("git failed to {action}")
+        } else {
+            stderr
+        })
+    }
+}
+
+pub fn path_matches(filter: &str, file: &str) -> bool {
+    let f = filter.trim().trim_matches('/');
+    if f.is_empty() {
+        return true;
+    }
+    file == f || file.starts_with(&format!("{f}/"))
+}
+
+pub fn list_changed_files(repo: &Path) -> Vec<ChangedFile> {
+    let mut map: HashMap<String, ChangedFile> = HashMap::new();
+
+    for (status, path) in git_name_status(repo, true) {
+        map.entry(path.clone())
+            .and_modify(|f| {
+                f.staged = true;
+                f.status = status;
+            })
+            .or_insert(ChangedFile {
+                path,
+                status,
+                staged: true,
+                unstaged: false,
+            });
+    }
+
+    for (status, path) in git_name_status(repo, false) {
+        map.entry(path.clone())
+            .and_modify(|f| {
+                f.unstaged = true;
+                if !f.staged {
+                    f.status = status;
+                }
+            })
+            .or_insert(ChangedFile {
+                path,
+                status,
+                staged: false,
+                unstaged: true,
+            });
+    }
+
+    // Untracked (new) files don't show up in `git diff`; list them explicitly.
+    for path in git_untracked_files(repo) {
+        map.entry(path.clone())
+            .and_modify(|f| {
+                f.unstaged = true;
+            })
+            .or_insert(ChangedFile {
+                path,
+                status: 'A',
+                staged: false,
+                unstaged: true,
+            });
+    }
+
+    let mut files: Vec<_> = map.into_values().collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+pub fn fetch_file_content(repo: &Path, path: &str, side: DiffSide) -> FileContent {
+    match side {
+        DiffSide::Unstaged => fetch_unstaged(repo, path),
+        DiffSide::Staged => fetch_staged(repo, path),
+    }
+}
+
+fn fetch_unstaged(repo: &Path, path: &str) -> FileContent {
+    let old = git_show_bytes(repo, &format!(":{path}"));
+    let wt = repo.join(path);
+    let new = std::fs::read(&wt).ok();
+
+    match (old, new) {
+        (None, None) => FileContent::Error("File not found in index or working tree".into()),
+        (Some(old_bytes), None) => {
+            if is_probably_binary(&old_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Deleted {
+                    old: String::from_utf8_lossy(&old_bytes).into_owned(),
+                }
+            }
+        }
+        (None, Some(new_bytes)) => {
+            if is_probably_binary(&new_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Added {
+                    new: String::from_utf8_lossy(&new_bytes).into_owned(),
+                }
+            }
+        }
+        (Some(old_bytes), Some(new_bytes)) => {
+            if is_probably_binary(&old_bytes) || is_probably_binary(&new_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Text {
+                    old: String::from_utf8_lossy(&old_bytes).into_owned(),
+                    new: String::from_utf8_lossy(&new_bytes).into_owned(),
+                }
+            }
+        }
+    }
+}
+
+fn fetch_staged(repo: &Path, path: &str) -> FileContent {
+    let old = git_show_bytes(repo, &format!("HEAD:{path}"));
+    let new = git_show_bytes(repo, &format!(":{path}"));
+
+    match (old, new) {
+        (None, None) => FileContent::Error("File not found in HEAD or index".into()),
+        (Some(old_bytes), None) => {
+            if is_probably_binary(&old_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Deleted {
+                    old: String::from_utf8_lossy(&old_bytes).into_owned(),
+                }
+            }
+        }
+        (None, Some(new_bytes)) => {
+            if is_probably_binary(&new_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Added {
+                    new: String::from_utf8_lossy(&new_bytes).into_owned(),
+                }
+            }
+        }
+        (Some(old_bytes), Some(new_bytes)) => {
+            if is_probably_binary(&old_bytes) || is_probably_binary(&new_bytes) {
+                FileContent::Binary
+            } else {
+                FileContent::Text {
+                    old: String::from_utf8_lossy(&old_bytes).into_owned(),
+                    new: String::from_utf8_lossy(&new_bytes).into_owned(),
+                }
+            }
+        }
+    }
+}
+
+fn git_name_status(repo: &Path, cached: bool) -> Vec<(char, String)> {
+    let Some(repo_str) = repo.to_str() else {
+        return Vec::new();
+    };
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_str);
+    if cached {
+        cmd.args(["diff", "--cached", "--name-status"]);
+    } else {
+        cmd.args(["diff", "--name-status"]);
+    }
+    let Ok(output) = cmd.output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_name_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_name_status(text: &str) -> Vec<(char, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let status_part = parts.next().unwrap_or("");
+        let path = if status_part.starts_with('R') || status_part.starts_with('C') {
+            parts.nth(1).unwrap_or("").to_string()
+        } else {
+            parts.next().unwrap_or("").to_string()
+        };
+        let status = status_part.chars().next().unwrap_or('?');
+        if !path.is_empty() {
+            out.push((status, path));
+        }
+    }
+    out
+}
+
+fn git_untracked_files(repo: &Path) -> Vec<String> {
+    let Some(repo_str) = repo.to_str() else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new("git")
+        .args(["-C", repo_str, "ls-files", "--others", "--exclude-standard"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn git_show_bytes(repo: &Path, spec: &str) -> Option<Vec<u8>> {
+    let repo_str = repo.to_str()?;
+    let output = Command::new("git")
+        .args(["-C", repo_str, "show", spec])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+fn is_probably_binary(data: &[u8]) -> bool {
+    data.iter().take(8192).any(|&b| b == 0)
+}

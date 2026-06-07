@@ -2,7 +2,10 @@
 //! state and animation engine, and wires input/resize/redraw together
 //! (AGENT_RUST_PORT.md §3, §7, §8).
 
+mod app_page;
 mod context_menu;
+mod git_client;
+mod git_diff;
 mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
@@ -14,9 +17,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use app_page::AppPage;
 use arboard::Clipboard;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use editor_surface::{AnimationState, ChromeLayout, Renderer};
+use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
 use nvim_core::grid::GridStateStore;
@@ -65,6 +70,8 @@ struct App {
     rt: tokio::runtime::Runtime,
     settings: Settings,
     menu_bar: MenuBar,
+    current_page: AppPage,
+    git_client: GitClient,
     state: Option<State>,
 }
 
@@ -79,12 +86,25 @@ fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
     state.cursor_pos.1 / scale < layout.editor_y as f64
 }
 
-fn imgui_captures_input(state: &State, settings: &Settings) -> bool {
-    imgui_active(state) || cursor_in_menu_bar(state, settings)
+fn imgui_captures_input(state: &State, settings: &Settings, page: AppPage) -> bool {
+    match page {
+        AppPage::GitClient => true,
+        AppPage::Editor => imgui_active(state) || cursor_in_menu_bar(state, settings),
+    }
 }
 
-fn mouse_to_nvim_blocked(state: &State, settings: &Settings) -> bool {
-    state.context_menu.open || imgui_captures_input(state, settings)
+fn mouse_to_nvim_blocked(state: &State, settings: &Settings, page: AppPage) -> bool {
+    match page {
+        AppPage::GitClient => true,
+        AppPage::Editor => state.context_menu.open || imgui_captures_input(state, settings, page),
+    }
+}
+
+fn keyboard_to_nvim_blocked(state: &State, _settings: &Settings, page: AppPage) -> bool {
+    match page {
+        AppPage::GitClient => true,
+        AppPage::Editor => state.imgui.wants_keyboard(),
+    }
 }
 
 impl App {
@@ -103,6 +123,8 @@ impl App {
             rt,
             settings,
             menu_bar: MenuBar::new(),
+            current_page: AppPage::Editor,
+            git_client: GitClient::new(),
             state: None,
         })
     }
@@ -224,6 +246,17 @@ impl App {
                     state.window.request_redraw();
                 }
             }
+            MenuBarAction::PageChanged(page) => {
+                self.current_page = page;
+                if page == AppPage::GitClient {
+                    if let Some(state) = &self.state {
+                        self.menu_bar.refresh_winbar(&state.session);
+                    }
+                }
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -285,6 +318,8 @@ impl State {
         &mut self,
         settings: &mut Settings,
         menu_bar: &mut MenuBar,
+        current_page: AppPage,
+        git_client: &mut GitClient,
     ) -> (bool, MenuBarAction, ContextMenuAction) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -318,13 +353,25 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
-        if let Err(e) =
-            self.imgui
-                .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
-                    menu_action = menu_bar.draw(ui, settings, session);
-                    context_action = context_menu.draw(ui);
-                })
-        {
+        let project_path = menu_bar.project_path().to_string();
+        if let Err(e) = self.imgui.prepare_ui(
+            &window,
+            store,
+            settings.font_size,
+            device,
+            queue,
+            |ui| {
+                menu_action = menu_bar.draw(ui, settings, session, current_page);
+                match current_page {
+                    AppPage::Editor => {
+                        context_action = context_menu.draw(ui);
+                    }
+                    AppPage::GitClient => {
+                        git_client.draw(ui, &project_path, &layout);
+                    }
+                }
+            },
+        ) {
             tracing::warn!("imgui frame failed: {e:#}");
         }
 
@@ -350,7 +397,8 @@ impl State {
         let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
             || self.anim.render_deadline().is_some();
-        if self.context_menu.open || needs_anim || imgui_active(self) {
+        let page_active = matches!(current_page, AppPage::GitClient);
+        if self.context_menu.open || needs_anim || imgui_active(self) || page_active {
             self.window.request_redraw();
         }
         (needs_anim, menu_action, context_action)
@@ -487,12 +535,14 @@ impl ApplicationHandler<UserEvent> for App {
             state
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
+            let page = self.current_page;
             let redraw =
-                state.context_menu.open || imgui_captures_input(state, &self.settings);
+                state.context_menu.open || imgui_captures_input(state, &self.settings, page);
             if redraw {
                 state.window.request_redraw();
             }
         }
+        let page = self.current_page;
         match event {
             WindowEvent::CloseRequested => {
                 let Some(state) = self.state.as_mut() else {
@@ -540,6 +590,9 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
+                if page == AppPage::GitClient {
+                    return;
+                }
                 let Some(state) = self.state.as_mut() else {
                     return;
                 };
@@ -554,6 +607,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if page == AppPage::GitClient {
+                    return;
+                }
                 let pressed = event.state == ElementState::Pressed;
                 let ime_active = self.state.as_ref().is_some_and(|s| s.ime_active);
                 if !pressed || ime_active {
@@ -565,10 +621,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .as_ref()
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
-                    let imgui_wants_kb = self
-                        .state
-                        .as_ref()
-                        .is_some_and(|s| imgui_captures_input(s, &self.settings));
+                    let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
+                        imgui_captures_input(s, &self.settings, page)
+                            || keyboard_to_nvim_blocked(s, &self.settings, page)
+                    });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
                             let Some(state) = self.state.as_mut() else {
@@ -614,7 +670,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if cursor_in_menu_bar(state, &self.settings) {
                     state.window.request_redraw();
                 }
-                if mouse_to_nvim_blocked(state, &self.settings) {
+                if mouse_to_nvim_blocked(state, &self.settings, page) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -634,11 +690,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button,
                 ..
             } => {
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| mouse_to_nvim_blocked(s, &self.settings))
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    mouse_to_nvim_blocked(s, &self.settings, page)
+                }) {
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }
@@ -648,7 +702,10 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
 
-                if button == MouseButton::Right && btn_state == ElementState::Pressed {
+                if page == AppPage::Editor
+                    && button == MouseButton::Right
+                    && btn_state == ElementState::Pressed
+                {
                     if let Some(grid_pos) = state.hit_test_editor(&self.settings) {
                         let screen_pos = state.imgui.mouse_pos();
                         state.context_menu.open_at(screen_pos, grid_pos);
@@ -687,11 +744,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| mouse_to_nvim_blocked(s, &self.settings))
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    mouse_to_nvim_blocked(s, &self.settings, page)
+                }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -729,11 +784,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let page = self.current_page;
                 let (needs_anim, menu_action, context_action) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
-                    state.render(&mut self.settings, &mut self.menu_bar)
+                    state.render(
+                        &mut self.settings,
+                        &mut self.menu_bar,
+                        page,
+                        &mut self.git_client,
+                    )
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
@@ -746,7 +807,7 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::Poll);
                     }
                 } else if self.state.as_ref().is_some_and(|s| {
-                    s.context_menu.open || imgui_captures_input(s, &self.settings)
+                    s.context_menu.open || imgui_captures_input(s, &self.settings, page)
                 })
                 {
                     event_loop.set_control_flow(ControlFlow::Poll);
@@ -762,8 +823,9 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
+        let page = self.current_page;
         if state.context_menu.open
-            || imgui_captures_input(state, &self.settings)
+            || imgui_captures_input(state, &self.settings, page)
             || state.anim.is_animating()
             || state.anim.is_blinking(&state.store)
         {

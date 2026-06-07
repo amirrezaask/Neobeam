@@ -4,6 +4,7 @@ use editor_surface::list_monospace_fonts;
 use imgui::{StyleColor, Ui};
 use nvim_core::session::{NvimSession, WinbarInfo};
 
+use crate::app_page::AppPage;
 use crate::settings::Settings;
 
 /// Font Awesome gear from Symbols Nerd Font Mono (merged in ImGui atlas).
@@ -41,14 +42,20 @@ impl MenuBar {
         self.winbar = session.fetch_winbar_info();
     }
 
+    pub fn project_path(&self) -> &str {
+        &self.winbar.project
+    }
+
     pub fn draw(
         &mut self,
         ui: &Ui,
         settings: &mut Settings,
         session: &NvimSession,
+        current_page: AppPage,
     ) -> MenuBarAction {
         let mut settings_changed = false;
         let mut theme_changed = None;
+        let mut page_changed = None;
 
         ui.main_menu_bar(|| {
             ui.menu(SETTINGS_LABEL, || {
@@ -71,12 +78,31 @@ impl MenuBar {
             ui.same_line_with_spacing(0.0, 10.0);
             ui.separator();
             ui.same_line_with_spacing(0.0, 10.0);
+
+            // Use buttons for page tabs: a Selectable with default size fills the
+            // remaining width of the menu bar and swallows hover/clicks for the
+            // rest of the row. Buttons size to their label instead.
+            for page in [AppPage::Editor, AppPage::GitClient] {
+                let selected = current_page == page;
+                let _color = selected.then(|| {
+                    ui.push_style_color(StyleColor::Button, ui.style_color(StyleColor::ButtonActive))
+                });
+                if ui.button(page.label()) && !selected {
+                    page_changed = Some(page);
+                }
+                ui.same_line_with_spacing(0.0, 6.0);
+            }
+
+            ui.separator();
+            ui.same_line_with_spacing(0.0, 10.0);
             ui.text(&self.winbar.file_name);
             ui.same_line_with_spacing(0.0, 16.0);
             ui.text_disabled(&self.winbar.project);
         });
 
-        if let Some(name) = theme_changed {
+        if let Some(page) = page_changed {
+            MenuBarAction::PageChanged(page)
+        } else if let Some(name) = theme_changed {
             MenuBarAction::ThemeChanged(name)
         } else if settings_changed {
             MenuBarAction::SettingsChanged
@@ -250,4 +276,5 @@ pub enum MenuBarAction {
     None,
     SettingsChanged,
     ThemeChanged(String),
+    PageChanged(AppPage),
 }
