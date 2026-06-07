@@ -11,7 +11,8 @@ use ignore::WalkState;
 use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
 
 use crate::fuzzy_picker::{
-    picker_default_size, picker_initial_position, scroll_list_to_selection, visible_row_count,
+    picker_default_size, picker_initial_position, scroll_list_to_selection, title_bar_pin_button,
+    visible_row_count,
     PICKER_MIN_HEIGHT, PICKER_MIN_WIDTH,
 };
 
@@ -141,6 +142,18 @@ impl GrepPicker {
             .movable(true)
             .resizable(true)
             .build(|| {
+                let content_start = ui.cursor_screen_pos();
+                if title_bar_pin_button(ui) {
+                    outcome = GrepPickerOutcome::Pinned {
+                        results: self.results.clone(),
+                        query: self.query.clone(),
+                        project_root: self.project_root.clone(),
+                    };
+                    self.close_immediate();
+                    return;
+                }
+                ui.set_cursor_screen_pos(content_start);
+
                 if self.focus_input {
                     ui.set_keyboard_focus_here();
                     self.focus_input = false;
@@ -156,17 +169,6 @@ impl GrepPicker {
                     }
                 } else {
                     self.query = query;
-                }
-
-                ui.same_line();
-                if ui.button("Pin##pin") {
-                    outcome = GrepPickerOutcome::Pinned {
-                        results: self.results.clone(),
-                        query: self.query.clone(),
-                        project_root: self.project_root.clone(),
-                    };
-                    self.close_immediate();
-                    return;
                 }
 
                 if ui.is_key_pressed(Key::Escape) {

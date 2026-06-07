@@ -1,6 +1,6 @@
 //! Reusable Dear ImGui fuzzy-finder popup with fade-in/out animations.
 
-use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
+use imgui::{Condition, Key, MouseButton, StyleVar, Ui, WindowFlags};
 
 use crate::multiplexer::Rect;
 
@@ -111,6 +111,53 @@ pub(crate) fn picker_initial_position(ui: &Ui) -> [f32; 2] {
 pub(crate) fn visible_row_count(ui: &Ui) -> usize {
     let h = ui.content_region_avail()[1];
     (h / ui.text_line_height_with_spacing()).max(1.0) as usize
+}
+
+const TITLE_BAR_PIN_ICON: &str = "📌";
+
+fn title_bar_pin_rect(ui: &Ui) -> Rect {
+    let win_pos = ui.window_pos();
+    let win_size = ui.window_size();
+    let content_top = ui.cursor_screen_pos()[1];
+    let title_bar_h = (content_top - win_pos[1]).max(ui.frame_height());
+    let btn_size = (title_bar_h - 4.0).max(18.0);
+    let margin = ui.clone_style().frame_padding[0];
+    Rect {
+        x: win_pos[0] + win_size[0] - btn_size - margin - 2.0,
+        y: win_pos[1] + (title_bar_h - btn_size) * 0.5,
+        w: btn_size,
+        h: btn_size,
+    }
+}
+
+/// Pin control in the floating window title bar (top-right), drawn above native chrome.
+pub(crate) fn title_bar_pin_button(ui: &Ui) -> bool {
+    let btn = title_bar_pin_rect(ui);
+    let mouse = ui.io().mouse_pos;
+    let hovered = btn.contains(mouse[0], mouse[1]);
+    let clicked = hovered && ui.is_mouse_clicked(MouseButton::Left);
+
+    let draw = ui.get_foreground_draw_list();
+    let bg = if hovered {
+        [0.32, 0.34, 0.42, 1.0]
+    } else {
+        [0.22, 0.24, 0.30, 0.9]
+    };
+    draw.add_rect([btn.x, btn.y], [btn.x + btn.w, btn.y + btn.h], bg)
+        .filled(true)
+        .rounding(3.0)
+        .build();
+
+    let text_h = ui.text_line_height();
+    let text_x = btn.x + (btn.w - text_h * 0.75) * 0.5;
+    let text_y = btn.y + (btn.h - text_h) * 0.5;
+    draw.add_text(
+        [text_x, text_y],
+        [0.92, 0.93, 0.96, 1.0],
+        TITLE_BAR_PIN_ICON,
+    );
+
+    clicked
 }
 
 /// Scroll a child list so `selected` stays visible. Only runs when selection changes
@@ -253,6 +300,17 @@ impl<T: Clone> FuzzyPicker<T> {
             .movable(true)
             .resizable(true)
             .build(|| {
+                let content_start = ui.cursor_screen_pos();
+                if title_bar_pin_button(ui) {
+                    outcome = PickerOutcome::Pinned {
+                        items: self.items.clone(),
+                        query: self.query.clone(),
+                    };
+                    self.close_immediate();
+                    return;
+                }
+                ui.set_cursor_screen_pos(content_start);
+
                 if self.focus_input {
                     ui.set_keyboard_focus_here();
                     self.focus_input = false;
@@ -265,16 +323,6 @@ impl<T: Clone> FuzzyPicker<T> {
                     self.rebuild_filtered();
                 } else {
                     self.query = query;
-                }
-
-                ui.same_line();
-                if ui.button("Pin##pin") {
-                    outcome = PickerOutcome::Pinned {
-                        items: self.items.clone(),
-                        query: self.query.clone(),
-                    };
-                    self.close_immediate();
-                    return;
                 }
 
                 if ui.is_key_pressed(Key::Escape) {

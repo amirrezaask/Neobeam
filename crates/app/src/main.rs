@@ -1054,10 +1054,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.tiling.focused_view().captures_input() {
-                    return;
-                }
-
+                // Global pickers must work even when a pinned results panel has focus.
                 if self.state.as_ref().is_some_and(|s| {
                     is_project_picker_shortcut(&event.logical_key, s.mods)
                 }) {
@@ -1095,6 +1092,10 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(state) = self.state.as_mut() {
                         state.window.request_redraw();
                     }
+                    return;
+                }
+
+                if self.tiling.focused_view().captures_input() {
                     return;
                 }
 
