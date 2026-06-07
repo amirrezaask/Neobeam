@@ -8,6 +8,13 @@ license.workspace = true
 name = "nvim-ui"
 path = "src/main.rs"
 
+[package.metadata.bundle]
+name = "nvim-ui"
+identifier = "dev.nvim-ui-rs.app"
+short_description = "GPU-accelerated Neovim GUI"
+category = "Developer Tool"
+osx_minimum_system_version = "11.0"
+
 [dependencies]
 anyhow = "1.0.102"
 arboard = "3.6.1"

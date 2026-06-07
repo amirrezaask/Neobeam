@@ -1,0 +1,2 @@
+[alias]
+macos-app = "bundle --release -p app --format osx"
