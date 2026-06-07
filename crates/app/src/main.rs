@@ -616,6 +616,13 @@ impl State {
                 if current_page == AppPage::GitClient {
                     git_wants_redraw |= git_client.draw(ui, main_rect);
                 }
+                if current_page == AppPage::Settings {
+                    let settings_action =
+                        menu_bar.draw_settings_page(ui, settings, session, main_rect);
+                    if menu_action == MenuBarAction::None {
+                        menu_action = settings_action;
+                    }
+                }
                 if current_page == AppPage::Editor {
                     context_action = context_menu.draw(ui);
                 }

@@ -6,9 +6,8 @@ use nvim_core::session::{NvimSession, WinbarInfo};
 
 use crate::activity_icons;
 use crate::app_page::AppPage;
+use crate::layout::Rect;
 use crate::settings::Settings;
-
-const SETTINGS_POPUP: &str = "##settings_popup";
 
 /// Pixel width of the vertical activity bar for a given editor font size.
 pub fn activity_bar_width(font_size: f32) -> f32 {
@@ -135,12 +134,10 @@ impl MenuBar {
         &mut self,
         ui: &Ui,
         settings: &mut Settings,
-        session: &NvimSession,
+        _session: &NvimSession,
         focused_page: AppPage,
         window_h: f32,
     ) -> MenuBarAction {
-        let mut settings_changed = false;
-        let mut theme_changed = None;
         let mut page_changed = None;
 
         let width = activity_bar_width(settings.font_size);
@@ -165,33 +162,7 @@ impl MenuBar {
             .movable(false)
             .resizable(false)
             .build(|| {
-                if draw_activity_item(
-                    ui,
-                    "##settings",
-                    activity_icons::SETTINGS,
-                    width,
-                    item_h,
-                    false,
-                ) {
-                    ui.open_popup(SETTINGS_POPUP);
-                }
-                if let Some(_popup) = ui.begin_popup(SETTINGS_POPUP) {
-                    ui.menu("Font", || {
-                        settings_changed |= self.draw_font_menu(ui, settings);
-                    });
-
-                    ui.menu("Theme", || {
-                        if let Some(name) = self.draw_theme_menu(ui, session) {
-                            self.selected_theme = Some(name.clone());
-                            theme_changed = Some(name);
-                        }
-                    });
-
-                    ui.menu("Animations", || {
-                        settings_changed |= self.draw_animations_menu(ui, settings);
-                    });
-                }
-
+                // Page icons at the top.
                 for page in [AppPage::Editor, AppPage::GitClient] {
                     let selected = focused_page == page;
                     if draw_activity_item(ui, page.label(), page.icon(), width, item_h, selected)
@@ -200,11 +171,107 @@ impl MenuBar {
                         page_changed = Some(page);
                     }
                 }
+
+                // Settings gear pinned to the bottom of the bar.
+                let settings_y = window_h - item_h;
+                ui.set_cursor_pos([0.0, settings_y]);
+                let selected = focused_page == AppPage::Settings;
+                if draw_activity_item(
+                    ui,
+                    AppPage::Settings.label(),
+                    activity_icons::SETTINGS,
+                    width,
+                    item_h,
+                    selected,
+                ) && !selected
+                {
+                    page_changed = Some(AppPage::Settings);
+                }
             });
 
         if let Some(page) = page_changed {
             MenuBarAction::PageChanged(page)
-        } else if let Some(name) = theme_changed {
+        } else {
+            MenuBarAction::None
+        }
+    }
+
+    /// Draw a flat single-page settings UI inside `rect`.
+    pub fn draw_settings_page(
+        &mut self,
+        ui: &Ui,
+        settings: &mut Settings,
+        session: &NvimSession,
+        rect: Rect,
+    ) -> MenuBarAction {
+        let mut settings_changed = false;
+        let mut theme_changed = None;
+
+        let flags = WindowFlags::NO_TITLE_BAR
+            | WindowFlags::NO_RESIZE
+            | WindowFlags::NO_MOVE
+            | WindowFlags::NO_COLLAPSE
+            | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+            | WindowFlags::NO_NAV_FOCUS
+            | WindowFlags::NO_SCROLLBAR;
+
+        ui.window("##settings_page")
+            .position([rect.x, rect.y], Condition::Always)
+            .size([rect.w, rect.h], Condition::Always)
+            .flags(flags)
+            .movable(false)
+            .resizable(false)
+            .build(|| {
+                let section_color = ui.push_style_color(
+                    StyleColor::Text,
+                    blend_rgba(
+                        ui.style_color(StyleColor::Text),
+                        ui.style_color(StyleColor::WindowBg),
+                        0.3,
+                    ),
+                );
+                ui.text("FONT");
+                section_color.pop();
+                ui.separator();
+                settings_changed |= self.draw_font_section(ui, settings);
+
+                ui.spacing();
+                ui.spacing();
+
+                let section_color = ui.push_style_color(
+                    StyleColor::Text,
+                    blend_rgba(
+                        ui.style_color(StyleColor::Text),
+                        ui.style_color(StyleColor::WindowBg),
+                        0.3,
+                    ),
+                );
+                ui.text("THEME");
+                section_color.pop();
+                ui.separator();
+                if let Some(name) = self.draw_theme_section(ui, session) {
+                    self.selected_theme = Some(name.clone());
+                    theme_changed = Some(name);
+                }
+
+                ui.spacing();
+                ui.spacing();
+
+                let section_color = ui.push_style_color(
+                    StyleColor::Text,
+                    blend_rgba(
+                        ui.style_color(StyleColor::Text),
+                        ui.style_color(StyleColor::WindowBg),
+                        0.3,
+                    ),
+                );
+                ui.text("ANIMATIONS");
+                section_color.pop();
+                ui.separator();
+                settings_changed |= self.draw_animations_menu(ui, settings);
+            });
+
+        if let Some(name) = theme_changed {
             MenuBarAction::ThemeChanged(name)
         } else if settings_changed {
             MenuBarAction::SettingsChanged
@@ -213,7 +280,7 @@ impl MenuBar {
         }
     }
 
-    fn draw_font_menu(&mut self, ui: &Ui, settings: &mut Settings) -> bool {
+    fn draw_font_section(&mut self, ui: &Ui, settings: &mut Settings) -> bool {
         let mut changed = false;
 
         let is_default = settings.font_family.is_none();
@@ -277,7 +344,7 @@ impl MenuBar {
         changed
     }
 
-    fn draw_theme_menu(&mut self, ui: &Ui, session: &NvimSession) -> Option<String> {
+    fn draw_theme_section(&mut self, ui: &Ui, session: &NvimSession) -> Option<String> {
         if !self.colorschemes_loaded {
             self.colorschemes = session.fetch_colorschemes();
             self.colorschemes_loaded = true;

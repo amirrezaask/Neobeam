@@ -7,6 +7,7 @@ pub enum AppPage {
     #[default]
     Editor,
     GitClient,
+    Settings,
 }
 
 impl AppPage {
@@ -14,6 +15,7 @@ impl AppPage {
         match self {
             AppPage::Editor => "Editor",
             AppPage::GitClient => "Git",
+            AppPage::Settings => "Settings",
         }
     }
 
@@ -22,6 +24,7 @@ impl AppPage {
         match self {
             AppPage::Editor => activity_icons::EDITOR,
             AppPage::GitClient => activity_icons::GIT,
+            AppPage::Settings => activity_icons::SETTINGS,
         }
     }
 }
