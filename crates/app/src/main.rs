@@ -4,14 +4,17 @@
 
 mod app_page;
 mod context_menu;
+mod fuzzy_picker;
 mod git_client;
 mod git_diff;
 mod imgui_layer;
 mod imgui_theme;
 mod menu_bar;
+mod project_picker;
 mod settings;
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +27,7 @@ use editor_surface::{AnimationState, ChromeLayout, Renderer};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use menu_bar::{MenuBar, MenuBarAction};
+use project_picker::ProjectPicker;
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -43,6 +47,9 @@ enum UserEvent {
     Redraw(Vec<Value>),
     SettingsReloaded,
     Exited,
+    /// A background git thread finished work; schedule a redraw so the
+    /// git-client panel can pick up the new data from its channels.
+    GitRefreshed,
 }
 
 struct State {
@@ -72,6 +79,8 @@ struct App {
     menu_bar: MenuBar,
     current_page: AppPage,
     git_client: GitClient,
+    project_picker: ProjectPicker,
+    project_dir: Option<PathBuf>,
     state: Option<State>,
 }
 
@@ -86,29 +95,52 @@ fn cursor_in_menu_bar(state: &State, settings: &Settings) -> bool {
     state.cursor_pos.1 / scale < layout.editor_y as f64
 }
 
-fn imgui_captures_input(state: &State, settings: &Settings, page: AppPage) -> bool {
+fn imgui_captures_input(
+    state: &State,
+    settings: &Settings,
+    page: AppPage,
+    project_picker_open: bool,
+) -> bool {
     match page {
         AppPage::GitClient => true,
-        AppPage::Editor => imgui_active(state) || cursor_in_menu_bar(state, settings),
+        AppPage::Editor => {
+            project_picker_open
+                || imgui_active(state)
+                || cursor_in_menu_bar(state, settings)
+        }
     }
 }
 
-fn mouse_to_nvim_blocked(state: &State, settings: &Settings, page: AppPage) -> bool {
+fn mouse_to_nvim_blocked(
+    state: &State,
+    settings: &Settings,
+    page: AppPage,
+    project_picker_open: bool,
+) -> bool {
     match page {
         AppPage::GitClient => true,
-        AppPage::Editor => state.context_menu.open || imgui_captures_input(state, settings, page),
+        AppPage::Editor => {
+            project_picker_open
+                || state.context_menu.open
+                || imgui_captures_input(state, settings, page, project_picker_open)
+        }
     }
 }
 
-fn keyboard_to_nvim_blocked(state: &State, _settings: &Settings, page: AppPage) -> bool {
+fn keyboard_to_nvim_blocked(
+    state: &State,
+    _settings: &Settings,
+    page: AppPage,
+    project_picker_open: bool,
+) -> bool {
     match page {
         AppPage::GitClient => true,
-        AppPage::Editor => state.imgui.wants_keyboard(),
+        AppPage::Editor => project_picker_open || state.imgui.wants_keyboard(),
     }
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
+    fn new(proxy: EventLoopProxy<UserEvent>, project_dir: Option<PathBuf>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -118,13 +150,18 @@ impl App {
         spawn_watcher(move || {
             let _ = reload_proxy.send_event(UserEvent::SettingsReloaded);
         });
+        let git_proxy = proxy.clone();
         Ok(App {
             proxy,
             rt,
             settings,
             menu_bar: MenuBar::new(),
             current_page: AppPage::Editor,
-            git_client: GitClient::new(),
+            git_client: GitClient::new(move || {
+                let _ = git_proxy.send_event(UserEvent::GitRefreshed);
+            }),
+            project_picker: ProjectPicker::new(),
+            project_dir,
             state: None,
         })
     }
@@ -163,6 +200,7 @@ impl App {
             SessionConfig {
                 cols,
                 rows,
+                working_dir: self.project_dir.clone(),
                 ..Default::default()
             },
             redraw,
@@ -272,6 +310,19 @@ impl App {
         state.window.request_redraw();
     }
 
+    fn handle_project_selection(&mut self, path: PathBuf) {
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!("failed to create project dir {}: {e:#}", path.display());
+        }
+        match spawn_project_instance(&path) {
+            Ok(()) => tracing::info!("opened project session: {}", path.display()),
+            Err(e) => tracing::warn!("failed to open project session: {e:#}"),
+        }
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
 }
 
 impl State {
@@ -320,7 +371,8 @@ impl State {
         menu_bar: &mut MenuBar,
         current_page: AppPage,
         git_client: &mut GitClient,
-    ) -> (bool, MenuBarAction, ContextMenuAction) {
+        project_picker: &mut ProjectPicker,
+    ) -> (bool, MenuBarAction, ContextMenuAction, Option<PathBuf>) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -347,6 +399,8 @@ impl State {
 
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
+        let mut project_selection = None;
+        let mut git_wants_redraw = false;
         let window = self.window.clone();
         let session = &self.session;
         let store = &self.store;
@@ -367,9 +421,10 @@ impl State {
                         context_action = context_menu.draw(ui);
                     }
                     AppPage::GitClient => {
-                        git_client.draw(ui, &project_path, &layout);
+                        git_wants_redraw = git_client.draw(ui, &project_path, &layout);
                     }
                 }
+                project_selection = project_picker.draw(ui);
             },
         ) {
             tracing::warn!("imgui frame failed: {e:#}");
@@ -397,11 +452,15 @@ impl State {
         let needs_anim = self.anim.is_animating()
             || self.anim.is_blinking(&self.store)
             || self.anim.render_deadline().is_some();
-        let page_active = matches!(current_page, AppPage::GitClient);
-        if self.context_menu.open || needs_anim || imgui_active(self) || page_active {
+        if self.context_menu.open
+            || project_picker.is_open()
+            || needs_anim
+            || imgui_active(self)
+            || git_wants_redraw
+        {
             self.window.request_redraw();
         }
-        (needs_anim, menu_action, context_action)
+        (needs_anim, menu_action, context_action, project_selection)
     }
 }
 
@@ -516,6 +575,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::SettingsReloaded => {
                 self.reload_settings_from_disk();
             }
+            UserEvent::GitRefreshed => {
+                // A background git thread has new data ready; wake the render
+                // loop so `git_client.draw()` can pick it up from the channel.
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
             UserEvent::Exited => {
                 // nvim exited (e.g. `:q`); tear down and close the app.
                 tracing::info!("nvim exited; closing");
@@ -536,13 +602,16 @@ impl ApplicationHandler<UserEvent> for App {
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
             let page = self.current_page;
-            let redraw =
-                state.context_menu.open || imgui_captures_input(state, &self.settings, page);
+            let picker_open = self.project_picker.is_open();
+            let redraw = state.context_menu.open
+                || picker_open
+                || imgui_captures_input(state, &self.settings, page, picker_open);
             if redraw {
                 state.window.request_redraw();
             }
         }
         let page = self.current_page;
+        let picker_open = self.project_picker.is_open();
         match event {
             WindowEvent::CloseRequested => {
                 let Some(state) = self.state.as_mut() else {
@@ -590,7 +659,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
-                if page == AppPage::GitClient {
+                if page == AppPage::GitClient || picker_open {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -616,14 +685,24 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                if self.state.as_ref().is_some_and(|s| {
+                    is_project_picker_shortcut(&event.logical_key, s.mods)
+                }) {
+                    self.project_picker.open();
+                    if let Some(state) = self.state.as_mut() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
                 let paste_shortcut = self
                     .state
                     .as_ref()
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        imgui_captures_input(s, &self.settings, page)
-                            || keyboard_to_nvim_blocked(s, &self.settings, page)
+                        imgui_captures_input(s, &self.settings, page, picker_open)
+                            || keyboard_to_nvim_blocked(s, &self.settings, page, picker_open)
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -638,11 +717,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| s.imgui.wants_keyboard())
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    keyboard_to_nvim_blocked(s, &self.settings, page, picker_open)
+                }) {
                     return;
                 }
 
@@ -670,7 +747,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if cursor_in_menu_bar(state, &self.settings) {
                     state.window.request_redraw();
                 }
-                if mouse_to_nvim_blocked(state, &self.settings, page) {
+                if mouse_to_nvim_blocked(state, &self.settings, page, picker_open) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -691,7 +768,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, &self.settings, page)
+                    mouse_to_nvim_blocked(s, &self.settings, page, picker_open)
                 }) {
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
@@ -745,7 +822,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, &self.settings, page)
+                    mouse_to_nvim_blocked(s, &self.settings, page, picker_open)
                 }) {
                     return;
                 }
@@ -785,7 +862,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let page = self.current_page;
-                let (needs_anim, menu_action, context_action) = {
+                let (needs_anim, menu_action, context_action, project_selection) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
@@ -794,10 +871,15 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.menu_bar,
                         page,
                         &mut self.git_client,
+                        &mut self.project_picker,
                     )
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
+                if let Some(path) = project_selection {
+                    self.handle_project_selection(path);
+                }
+                let picker_open = self.project_picker.is_open();
                 if needs_anim {
                     if let Some(deadline) =
                         self.state.as_ref().and_then(|s| s.anim.render_deadline())
@@ -807,9 +889,15 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::Poll);
                     }
                 } else if self.state.as_ref().is_some_and(|s| {
-                    s.context_menu.open || imgui_captures_input(s, &self.settings, page)
-                })
-                {
+                    // Only poll at full speed for Editor-page imgui interactions
+                    // (context menu, project picker, hover states).  The git
+                    // client drives its own redraws via the GitRefreshed event
+                    // and must not force a continuous Poll loop.
+                    s.context_menu.open
+                        || picker_open
+                        || (page == AppPage::Editor
+                            && imgui_captures_input(s, &self.settings, page, picker_open))
+                }) {
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
                     event_loop.set_control_flow(ControlFlow::Wait);
@@ -824,11 +912,21 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let page = self.current_page;
-        if state.context_menu.open
-            || imgui_captures_input(state, &self.settings, page)
+        let picker_open = self.project_picker.is_open();
+
+        // For the git client page the event loop should stay in Wait mode.
+        // Redraws are triggered by the GitRefreshed user-event that the
+        // background threads send via the proxy.  Forcing Poll here would
+        // spin the render loop and block the main thread with git subprocess
+        // calls every frame.
+        let needs_continuous = state.context_menu.open
+            || picker_open
+            || (page == AppPage::Editor
+                && imgui_captures_input(state, &self.settings, page, picker_open))
             || state.anim.is_animating()
-            || state.anim.is_blinking(&state.store)
-        {
+            || state.anim.is_blinking(&state.store);
+
+        if needs_continuous {
             state.window.request_redraw();
             if let Some(deadline) = state.anim.render_deadline() {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
@@ -844,6 +942,35 @@ fn is_paste_shortcut(key: &Key, mods: Mods) -> bool {
         return false;
     }
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v")) && (mods.meta || mods.ctrl)
+}
+
+fn is_project_picker_shortcut(key: &Key, mods: Mods) -> bool {
+    if mods.alt || mods.shift || mods.ctrl {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p")) && mods.meta
+}
+
+fn parse_cli_project_dir() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--project" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn spawn_project_instance(path: &PathBuf) -> Result<()> {
+    Command::new(std::env::current_exe()?)
+        .arg("--project")
+        .arg(path)
+        .env(DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 fn read_clipboard_text() -> Option<String> {
@@ -891,10 +1018,11 @@ fn main() -> Result<()> {
         )
         .init();
 
+    let project_dir = parse_cli_project_dir();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy)?;
+    let mut app = App::new(proxy, project_dir)?;
     event_loop.run_app(&mut app)?;
     Ok(())
 }

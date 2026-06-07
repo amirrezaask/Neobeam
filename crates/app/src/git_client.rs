@@ -1,6 +1,20 @@
 //! Git Client page: ImGui filters + `similar`-powered diff view.
+//!
+//! All blocking git subprocess calls run in dedicated background threads so the
+//! render/event thread is never stalled.  The two background workers are:
+//!
+//!  • Refresh thread  – polls `git status` once per second (or immediately when
+//!    woken via `refresh_wake`) and sends the new file list back via a channel.
+//!  • Diff thread     – receives a diff request, runs the heavy `git show` /
+//!    `git apply --check` work, and sends the result back via a channel.
+//!
+//! `draw()` does only non-blocking `try_recv` calls and returns `true` whenever
+//! new data arrived (so the caller knows to `request_redraw`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use editor_surface::ChromeLayout;
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
@@ -95,6 +109,31 @@ struct CachedDiff {
     content: DiffContent,
 }
 
+// ---------------------------------------------------------------------------
+// Background thread message types
+// ---------------------------------------------------------------------------
+
+/// Result delivered by the background refresh thread.
+struct RefreshResult {
+    repo_root: Option<PathBuf>,
+    files: Vec<ChangedFile>,
+}
+
+/// Request sent to the background diff thread.
+struct DiffRequest {
+    repo: PathBuf,
+    file: ChangedFile,
+    generation: u64,
+}
+
+/// Result delivered by the background diff thread.
+struct DiffResponse {
+    path: String,
+    generation: u64,
+    content: DiffContent,
+}
+
+// ---------------------------------------------------------------------------
 
 pub struct GitClient {
     sidebar_width: f32,
@@ -107,14 +146,84 @@ pub struct GitClient {
     repo_root: Option<PathBuf>,
     generation: u64,
     cwd: String,
-    filters_dirty: bool,
-    last_file_refresh: std::time::Instant,
     current_hunk: usize,
     scroll_to_hunk: Option<usize>,
+
+    // Shared cwd so the refresh thread always uses the latest project path.
+    shared_cwd: Arc<Mutex<Option<String>>>,
+    // Send () to wake the refresh thread early (e.g. after a git op).
+    refresh_wake: mpsc::SyncSender<()>,
+    // Receive file-list updates from the refresh thread.
+    refresh_rx: mpsc::Receiver<RefreshResult>,
+
+    // Send a diff request to the diff thread.
+    diff_tx: mpsc::SyncSender<DiffRequest>,
+    // Receive diff results from the diff thread.
+    diff_rx: mpsc::Receiver<DiffResponse>,
+    diff_pending: bool,
 }
 
 impl GitClient {
-    pub fn new() -> Self {
+    /// `on_change` is called from background threads whenever new data is
+    /// ready; the caller should use it to wake the event loop (e.g. via
+    /// `EventLoopProxy::send_event`).
+    pub fn new(on_change: impl Fn() + Send + Sync + 'static) -> Self {
+        let on_change = Arc::new(on_change);
+
+        // ── Refresh thread ────────────────────────────────────────────────
+        let shared_cwd: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
+        let (refresh_tx, refresh_rx) = mpsc::sync_channel::<RefreshResult>(1);
+
+        let cwd_ref = shared_cwd.clone();
+        let on_change_refresh = on_change.clone();
+        std::thread::Builder::new()
+            .name("git-refresh".into())
+            .spawn(move || {
+                loop {
+                    // Wait up to 1 second for an early-wake signal, then
+                    // refresh regardless.
+                    let _ = wake_rx.recv_timeout(Duration::from_secs(1));
+
+                    let cwd_opt = cwd_ref.lock().unwrap().clone();
+                    let Some(cwd) = cwd_opt else {
+                        continue;
+                    };
+                    let path = expand_tilde(&cwd);
+                    let repo = repo_root(&path);
+                    let files = repo
+                        .as_ref()
+                        .map(|r| list_changed_files(r))
+                        .unwrap_or_default();
+                    // Drop result if the main thread is not keeping up; we
+                    // will refresh again soon anyway.
+                    let _ = refresh_tx.try_send(RefreshResult { repo_root: repo, files });
+                    on_change_refresh();
+                }
+            })
+            .expect("git-refresh thread");
+
+        // ── Diff thread ───────────────────────────────────────────────────
+        let (diff_tx, diff_rx_thread) = mpsc::sync_channel::<DiffRequest>(1);
+        let (diff_tx_thread, diff_rx) = mpsc::sync_channel::<DiffResponse>(1);
+
+        let on_change_diff = on_change.clone();
+        std::thread::Builder::new()
+            .name("git-diff".into())
+            .spawn(move || {
+                while let Ok(req) = diff_rx_thread.recv() {
+                    let content = load_diff_content(&req.repo, &req.file);
+                    let _ = diff_tx_thread.try_send(DiffResponse {
+                        path: req.file.path,
+                        generation: req.generation,
+                        content,
+                    });
+                    on_change_diff();
+                }
+            })
+            .expect("git-diff thread");
+
         GitClient {
             sidebar_width: 220.0,
             view_mode: ViewMode::default(),
@@ -126,27 +235,64 @@ impl GitClient {
             repo_root: None,
             generation: 0,
             cwd: String::new(),
-            filters_dirty: true,
-            last_file_refresh: std::time::Instant::now(),
             current_hunk: 0,
             scroll_to_hunk: None,
+            shared_cwd,
+            refresh_wake: wake_tx,
+            refresh_rx,
+            diff_tx,
+            diff_rx,
+            diff_pending: false,
         }
     }
 
-    pub fn draw(&mut self, ui: &Ui, project_path: &str, layout: &ChromeLayout) {
+    /// Draw the git client UI.  Returns `true` when new data arrived from a
+    /// background thread and a redraw should be scheduled.
+    pub fn draw(&mut self, ui: &Ui, project_path: &str, layout: &ChromeLayout) -> bool {
         if project_path != self.cwd {
             self.cwd = project_path.to_string();
-            self.filters_dirty = true;
+            *self.shared_cwd.lock().unwrap() = Some(self.cwd.clone());
+            // Trigger an immediate refresh for the new project.
+            let _ = self.refresh_wake.try_send(());
         }
 
-        // Poll git status at most once per second so the sidebar always reflects
-        // the real repository state without relying solely on explicit dirty flags.
-        let poll_due = self.last_file_refresh.elapsed() >= std::time::Duration::from_secs(1);
-        if self.filters_dirty || poll_due {
-            self.refresh_files();
-            self.filters_dirty = false;
-            self.last_file_refresh = std::time::Instant::now();
+        let mut wants_redraw = false;
+
+        // ── Poll background results (non-blocking) ────────────────────────
+
+        if let Ok(result) = self.refresh_rx.try_recv() {
+            match result.repo_root {
+                Some(repo) => {
+                    self.repo_root = Some(repo);
+                    self.error = None;
+                }
+                None => {
+                    self.error = Some("Not a git repository.".into());
+                    self.files.clear();
+                    self.selected = None;
+                    self.repo_root = None;
+                }
+            }
+            self.files = result.files;
+            self.validate_selection();
+            wants_redraw = true;
         }
+
+        if let Ok(resp) = self.diff_rx.try_recv() {
+            if self.selected.as_ref().is_some_and(|s| s.path == resp.path)
+                && resp.generation == self.generation
+            {
+                self.cached_diff = Some(CachedDiff {
+                    path: resp.path,
+                    generation: resp.generation,
+                    content: resp.content,
+                });
+            }
+            self.diff_pending = false;
+            wants_redraw = true;
+        }
+
+        // ── Draw UI ───────────────────────────────────────────────────────
 
         let pos = [0.0, layout.editor_y];
         let size = [layout.window_w, layout.editor_h];
@@ -172,6 +318,8 @@ impl GitClient {
                 }
                 self.draw_body(ui);
             });
+
+        wants_redraw
     }
 
     fn draw_toolbar(&mut self, ui: &Ui) {
@@ -210,7 +358,7 @@ impl GitClient {
 
         ui.same_line_with_spacing(0.0, 16.0);
         if ui.button("Refresh") {
-            self.refresh_files();
+            self.trigger_refresh_now();
         }
         ui.same_line();
         if ui.button("Push") {
@@ -254,7 +402,6 @@ impl GitClient {
                 .min(avail[0] - min_side - splitter_w);
         }
         if ui.is_item_hovered() || ui.is_item_active() {
-            // Draw a visible line while hovering/dragging.
             let draw = ui.get_window_draw_list();
             let col = ui.style_color(StyleColor::SeparatorActive);
             draw.add_line(
@@ -328,15 +475,13 @@ impl GitClient {
                 self.commit_message.clear();
                 self.cached_diff = None;
                 self.generation = self.generation.wrapping_add(1);
-                self.refresh_files();
-                self.last_file_refresh = std::time::Instant::now();
+                self.trigger_refresh_now();
             }
             Err(e) => self.error = Some(e),
         }
     }
 
     fn draw_file_entry(&mut self, ui: &Ui, file: &ChangedFile) {
-        // Checked when the file has any staged changes; unchecking unstages the whole file.
         let has_staged = file.staged;
         let mut checked = has_staged;
         ui.checkbox(&format!("##file_cb_{}", file.path), &mut checked);
@@ -359,6 +504,7 @@ impl GitClient {
                 path: file.path.clone(),
             });
             self.cached_diff = None;
+            self.diff_pending = false;
             self.current_hunk = 0;
             self.scroll_to_hunk = None;
         }
@@ -410,10 +556,10 @@ impl GitClient {
     }
 
     fn after_file_git_op(&mut self, path: &str) {
-        self.refresh_files();
-        self.last_file_refresh = std::time::Instant::now();
+        self.trigger_refresh_now();
         if self.selected.as_ref().is_some_and(|s| s.path == path) {
             self.cached_diff = None;
+            self.diff_pending = false;
         }
     }
 
@@ -462,8 +608,6 @@ impl GitClient {
         ui.checkbox(&format!("##hunk_cb_{}", hunk.index), &mut staged);
         ui.same_line();
 
-        // Render header as a selectable so it carries an item ID.
-        // `text_colored` has no ID and causes `BeginPopupContextItem` to abort.
         let hdr_color = ui.style_color(StyleColor::TextDisabled);
         let hdr_label = format!("{}##hunk_hdr_{}", hunk.header.trim_end(), hunk.index);
         let _col = ui.push_style_color(StyleColor::Text, hdr_color);
@@ -528,9 +672,10 @@ impl GitClient {
         match result {
             Ok(()) => {
                 self.error = None;
-                self.filters_dirty = true;
+                self.trigger_refresh_now();
                 if self.selected.as_ref().is_some_and(|s| s.path == path) {
                     self.cached_diff = None;
+                    self.diff_pending = false;
                 }
             }
             Err(e) => self.error = Some(e),
@@ -549,12 +694,17 @@ impl GitClient {
         let needs_load = self.cached_diff.as_ref().is_none_or(|c| {
             c.path != file.path || c.generation != self.generation
         });
-        if needs_load {
-            self.load_diff(&file);
+        if needs_load && !self.diff_pending {
+            self.trigger_diff_load(&file);
         }
 
         ui.text(&format!("{} {}", file.status, file.path));
         ui.separator();
+
+        if self.diff_pending && self.cached_diff.is_none() {
+            ui.text_disabled("Loading…");
+            return;
+        }
 
         let content = self.cached_diff.as_ref().map(|c| c.content.clone());
         let Some(content) = content else {
@@ -583,20 +733,27 @@ impl GitClient {
         }
     }
 
-    fn refresh_files(&mut self) {
-        let cwd = expand_tilde(&self.cwd);
-        self.repo_root = repo_root(&cwd);
+    /// Send a wake signal so the refresh thread runs immediately without
+    /// waiting for the 1-second timeout.
+    fn trigger_refresh_now(&self) {
+        let _ = self.refresh_wake.try_send(());
+    }
+
+    /// Queue a diff load in the background thread.  Does nothing if a load is
+    /// already in flight (the result from the previous request will arrive
+    /// shortly via `diff_rx`).
+    fn trigger_diff_load(&mut self, file: &ChangedFile) {
         let Some(repo) = self.repo_root.clone() else {
-            self.error = Some("Not a git repository.".into());
-            self.files.clear();
-            self.selected = None;
             return;
         };
-        self.error = None;
-
-        self.files = list_changed_files(&repo);
-
-        self.validate_selection();
+        let req = DiffRequest {
+            repo,
+            file: file.clone(),
+            generation: self.generation,
+        };
+        if self.diff_tx.try_send(req).is_ok() {
+            self.diff_pending = true;
+        }
     }
 
     fn validate_selection(&mut self) {
@@ -610,65 +767,11 @@ impl GitClient {
         }
 
         self.cached_diff = None;
+        self.diff_pending = false;
         self.generation = self.generation.wrapping_add(1);
         self.selected = self.files.first().map(|f| SelectedEntry {
             path: f.path.clone(),
         });
-    }
-
-    fn load_diff(&mut self, file: &ChangedFile) {
-        let Some(repo) = self.repo_root.clone() else {
-            return;
-        };
-        let content = match fetch_head_vs_worktree(&repo, &file.path) {
-            FileContent::Text { old, new } => {
-                if old == new {
-                    DiffContent::Message("No textual changes.".into())
-                } else {
-                    let mut diff = build_diff_lines(&old, &new, &file.path);
-                    self.apply_hunk_staged_states(&repo, file, &mut diff);
-                    DiffContent::Lines(diff)
-                }
-            }
-            FileContent::Added { new } => {
-                let mut diff = build_diff_lines("", &new, &file.path);
-                self.apply_hunk_staged_states(&repo, file, &mut diff);
-                DiffContent::Lines(diff)
-            }
-            FileContent::Deleted { old } => {
-                let mut diff = build_diff_lines(&old, "", &file.path);
-                self.apply_hunk_staged_states(&repo, file, &mut diff);
-                DiffContent::Lines(diff)
-            }
-            FileContent::Binary => DiffContent::Binary,
-            FileContent::Error(msg) => DiffContent::Message(msg),
-        };
-        self.cached_diff = Some(CachedDiff {
-            path: file.path.clone(),
-            generation: self.generation,
-            content,
-        });
-    }
-
-    fn apply_hunk_staged_states(
-        &self,
-        repo: &std::path::Path,
-        file: &ChangedFile,
-        diff: &mut DiffLines,
-    ) {
-        if file.staged && !file.unstaged {
-            for h in &mut diff.hunks {
-                h.staged = true;
-            }
-        } else if !file.staged && file.unstaged {
-            for h in &mut diff.hunks {
-                h.staged = false;
-            }
-        } else {
-            for h in &mut diff.hunks {
-                h.staged = hunk_is_staged(repo, &h.patch);
-            }
-        }
     }
 
     fn hunk_count(&self) -> usize {
@@ -683,6 +786,56 @@ impl GitClient {
         self.scroll_to_hunk = Some(index);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Background diff loading (free functions, no `&self`)
+// ---------------------------------------------------------------------------
+
+fn load_diff_content(repo: &Path, file: &ChangedFile) -> DiffContent {
+    match fetch_head_vs_worktree(repo, &file.path) {
+        FileContent::Text { old, new } => {
+            if old == new {
+                DiffContent::Message("No textual changes.".into())
+            } else {
+                let mut diff = build_diff_lines(&old, &new, &file.path);
+                apply_hunk_staged_states(repo, file, &mut diff);
+                DiffContent::Lines(diff)
+            }
+        }
+        FileContent::Added { new } => {
+            let mut diff = build_diff_lines("", &new, &file.path);
+            apply_hunk_staged_states(repo, file, &mut diff);
+            DiffContent::Lines(diff)
+        }
+        FileContent::Deleted { old } => {
+            let mut diff = build_diff_lines(&old, "", &file.path);
+            apply_hunk_staged_states(repo, file, &mut diff);
+            DiffContent::Lines(diff)
+        }
+        FileContent::Binary => DiffContent::Binary,
+        FileContent::Error(msg) => DiffContent::Message(msg),
+    }
+}
+
+fn apply_hunk_staged_states(repo: &Path, file: &ChangedFile, diff: &mut DiffLines) {
+    if file.staged && !file.unstaged {
+        for h in &mut diff.hunks {
+            h.staged = true;
+        }
+    } else if !file.staged && file.unstaged {
+        for h in &mut diff.hunks {
+            h.staged = false;
+        }
+    } else {
+        for h in &mut diff.hunks {
+            h.staged = hunk_is_staged(repo, &h.patch);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
 
 struct DiffColors {
     gutter: [f32; 4],
@@ -802,8 +955,6 @@ fn draw_side_by_side(
     ui.columns(1, "##sxs_reset", false);
 }
 
-/// Pair up delete/insert runs into aligned left/right rows; equal lines occupy
-/// both columns on the same row.
 fn build_side_rows(lines: &[DiffLine]) -> Vec<(Option<usize>, Option<usize>)> {
     let mut rows = Vec::new();
     let mut dels: Vec<usize> = Vec::new();
@@ -848,8 +999,6 @@ fn draw_diff_half(
         return;
     };
 
-    // Skip a line that has no content on this side (e.g. an insert in the
-    // left column, or a delete in the right column).
     let belongs = matches!(
         (half, line.tag),
         (Half::Left, ChangeTag::Delete)

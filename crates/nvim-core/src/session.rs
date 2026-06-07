@@ -1,6 +1,7 @@
 //! Embedded Neovim session: spawn `nvim --embed`, attach the UI, forward redraw
 //! batches, and expose non-blocking input/resize/mouse calls.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -52,6 +53,8 @@ pub struct SessionConfig {
     pub ext_cmdline: bool,
     pub ext_popupmenu: bool,
     pub ext_messages: bool,
+    /// Working directory for the embedded nvim process.
+    pub working_dir: Option<PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -62,6 +65,7 @@ impl Default for SessionConfig {
             ext_cmdline: false,
             ext_popupmenu: false,
             ext_messages: false,
+            working_dir: None,
         }
     }
 }
@@ -86,10 +90,14 @@ impl NvimSession {
         on_close: CloseCallback,
     ) -> Result<Self> {
         let handler = NvimHandler { redraw: redraw.clone() };
+        let working_dir = cfg.working_dir.clone();
         let (nvim, io, child) = rt
             .block_on(async move {
                 let mut cmd = Command::new("nvim");
                 cmd.arg("--embed");
+                if let Some(dir) = &working_dir {
+                    cmd.current_dir(dir);
+                }
                 new_child_cmd(&mut cmd, handler).await
             })
             .context("spawn nvim --embed")?;
