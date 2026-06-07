@@ -466,7 +466,7 @@ impl App {
             MenuBarAction::PageChanged(page) => {
                 if let Some(state) = self.state.as_mut() {
                     let area = editor_area(&self.settings, &state.renderer);
-                    self.tiling.open_or_focus(app_page_to_view(page), area);
+                    self.tiling.switch_to_page(app_page_to_view(page), area);
                     state.window.request_redraw();
                 }
                 if page == AppPage::GitClient {

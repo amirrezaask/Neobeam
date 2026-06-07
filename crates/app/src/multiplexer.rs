@@ -223,6 +223,47 @@ impl TilingManager {
         self.add_window(view, area);
     }
 
+    /// Switch to `view` as the sole visible window, hiding all others.
+    /// This gives page-switch semantics: clicking Git/Editor in the activity
+    /// bar replaces whatever is on screen rather than adding a split.
+    pub fn switch_to_page(&mut self, view: ViewKind, area: Rect) {
+        let old_rects = self.compute_rects(area);
+
+        // Find or create the target window.
+        let win_id = if let Some(w) = self.windows.iter().find(|w| w.view == view) {
+            w.id
+        } else {
+            let id = WinId(self.next_id);
+            self.next_id += 1;
+            self.windows.push(TilingWindow {
+                id,
+                view,
+                title: view.default_title().into(),
+            });
+            id
+        };
+
+        // Push every other visible window into the hidden set without
+        // going through hide_window (which guards against hiding the editor).
+        let to_hide: Vec<WinId> = self
+            .windows
+            .iter()
+            .filter(|w| w.id != win_id && self.is_visible(w.id))
+            .map(|w| w.id)
+            .collect();
+        for id in to_hide {
+            self.hidden.insert(id);
+        }
+
+        // Make the target the sole root leaf, removing it from hidden if needed.
+        self.hidden.remove(&win_id);
+        self.root = LayoutNode::Leaf(win_id);
+        self.focused = win_id;
+
+        let new_rects = self.compute_rects(area);
+        self.begin_layout_anim(&old_rects, &new_rects);
+    }
+
     pub fn hide_window(&mut self, win_id: WinId, area: Rect) {
         if !self.can_close(win_id) {
             return;
