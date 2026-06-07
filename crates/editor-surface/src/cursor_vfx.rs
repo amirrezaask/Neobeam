@@ -1,4 +1,4 @@
-//! Cursor visual effects: particle trails and point highlights (Neovide port).
+//! Cursor visual effects: particle trails and point highlights.
 
 use crate::animation::AnimationConfig;
 use crate::color::Rgba;

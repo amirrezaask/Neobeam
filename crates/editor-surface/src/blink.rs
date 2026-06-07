@@ -1,4 +1,4 @@
-//! Cursor blink state machine (Neovide port).
+//! Cursor blink state machine.
 
 use std::time::{Duration, Instant};
 

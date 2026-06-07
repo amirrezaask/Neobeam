@@ -259,8 +259,6 @@ impl App {
             redraw,
             on_close,
         )?;
-        let (scroll, far) = session.fetch_neovide_scroll_globals();
-        self.settings.apply_neovide_scroll_globals(scroll, far);
         self.menu_bar.init_theme(&session);
         self.menu_bar.refresh_winbar(&session);
         tracing::info!(

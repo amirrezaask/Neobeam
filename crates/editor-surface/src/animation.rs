@@ -1,4 +1,4 @@
-//! Frame-delta animation engine with Neovide-style spring cursor, scroll, and VFX.
+//! Frame-delta animation engine with spring cursor, scroll, and VFX.
 
 use std::collections::HashMap;
 

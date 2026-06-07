@@ -113,31 +113,6 @@ impl Settings {
         cfg
     }
 
-    /// Apply `g:neovide_scroll_*` from nvim when those keys are absent from settings.json.
-    pub fn apply_neovide_scroll_globals(&mut self, scroll: Option<f32>, far: Option<u32>) {
-        if !Self::json_has_scroll_keys() {
-            if let Some(v) = scroll {
-                self.scroll_animation_length = v;
-            }
-            if let Some(v) = far {
-                self.scroll_animation_far_lines = v;
-            }
-        }
-    }
-
-    fn json_has_scroll_keys() -> bool {
-        let Some(path) = config_path() else {
-            return false;
-        };
-        let Ok(s) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-            return false;
-        };
-        v.get("scroll_animation_length").is_some()
-            || v.get("scroll_animation_far_lines").is_some()
-    }
 }
 
 pub fn config_path() -> Option<PathBuf> {

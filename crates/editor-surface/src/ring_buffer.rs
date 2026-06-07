@@ -1,4 +1,4 @@
-//! Ring buffer for scrollback line storage (Neovide port).
+//! Ring buffer for scrollback line storage.
 
 use std::ops::{Bound, Index, IndexMut, Range, RangeBounds};
 

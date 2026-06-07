@@ -1,4 +1,4 @@
-//! Easing helpers and critically-damped spring animation (Neovide port).
+//! Easing helpers and critically-damped spring animation.
 
 #[allow(dead_code)]
 pub fn ease_linear(t: f32) -> f32 {

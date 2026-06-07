@@ -1,4 +1,4 @@
-//! Per-window scrollback buffer, scroll spring, and position easing (Neovide port).
+//! Per-window scrollback buffer, scroll spring, and position easing.
 
 use std::collections::HashMap;
 use std::ops::Range;

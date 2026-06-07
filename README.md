@@ -4,7 +4,7 @@
   <img src="icons/1.png" alt="Neobeam" width="256"/>
 </p>
 
-A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the editor with wgpu, and layers smooth motion on top — inspired by [4coder](https://4coder.net/)'s feel and borrowing animation ideas from [Neovide](https://neovide.dev/).
+A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the editor with wgpu, and layers smooth motion on top — inspired by [4coder](https://4coder.net/)'s feel.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -24,7 +24,7 @@ A GPU-accelerated Neovim GUI written in Rust. It embeds Neovim, renders the edit
 - **GPU text rendering** — glyph atlas, syntax highlighting, multi-grid floats and splits
 - **Smooth animations** — interpolated cursor, scroll springs, highlight flashes, float fade/slide
 - **Cursor effects** — glow, trails, squash/stretch, and optional power-mode particles
-- **Neovide-compatible VFX** — `sonicboom`, `railgun`, `torpedo`, `pixiedust` cursor modes
+- **Cursor VFX** — `sonicboom`, `railgun`, `torpedo`, `pixiedust` cursor modes
 - **Live settings** — in-app panel with hot-reload from disk
 
 ## Requirements
@@ -65,8 +65,6 @@ Open the in-app settings panel with **⌘,** (Cmd+Comma). Press **Esc** to cance
 | `scroll_animation_length` | Smooth-scroll duration in seconds |
 | `vfx_modes` | Comma-separated cursor VFX, e.g. `railgun,sonicboom` |
 
-If your Neovim config sets `g:neovide_scroll_animation_length` or `g:neovide_scroll_animation_far_lines`, those values are picked up on startup when the corresponding keys are absent from `settings.json`.
-
 ## Project layout
 
 | Crate | Role |
@@ -93,7 +91,6 @@ RUST_LOG=neobeam=debug ./target/release/neobeam --foreground
 ## Credits
 
 - **[4coder](https://4coder.net/)** and Ryan Fleury — the original inspiration for smooth, frame-delta editor animations (cursor interpolation, trails, glow, power mode).
-- **[Neovide](https://neovide.dev/)** — spring-based scroll and cursor motion, blink timing, cursor particle VFX (`railgun`, `torpedo`, `pixiedust`, `sonicboom`), and scroll global compatibility. Several subsystems in `editor-surface` are direct ports of Neovide's approach.
 - **[Dear ImGui](https://github.com/ocornut/imgui)** — settings panel overlay.
 - **[wgpu](https://wgpu.rs/)** — cross-platform GPU rendering.
 
