@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use etagere::{size2, AtlasAllocator};
 use fontdue::{Font, FontSettings};
 
+use crate::fonts::load_editor_font;
 use crate::nerd_glyphs::is_nerd_glyph;
 
 static SYMBOLS_NERD_FONT: &[u8] =
@@ -56,7 +57,7 @@ impl GlyphAtlas {
         line_height: f32,
         scale: f32,
     ) -> Result<Self> {
-        let font = load_font(font_family)?;
+        let font = load_editor_font(font_family)?;
         let symbols = load_symbols_font()?;
         let (texture, view, sampler) = create_atlas_texture(device);
         let mut atlas = GlyphAtlas {
@@ -119,7 +120,7 @@ impl GlyphAtlas {
         line_height: f32,
         scale: f32,
     ) -> Result<()> {
-        self.font = load_font(font_family)?;
+        self.font = load_editor_font(font_family)?;
         self.size_px = size_px;
         self.line_height = line_height;
         self.scale = scale;
@@ -248,46 +249,6 @@ fn load_symbols_font() -> Result<Font> {
     .map_err(|e| anyhow!("failed to parse Symbols Nerd Font Mono: {e:?}"))
 }
 
-fn load_font(family: Option<&str>) -> Result<Font> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-
-    let query = fontdb::Query {
-        families: &[match family {
-            Some(name) => fontdb::Family::Name(name),
-            None => fontdb::Family::Monospace,
-        }],
-        weight: fontdb::Weight::NORMAL,
-        stretch: fontdb::Stretch::Normal,
-        style: fontdb::Style::Normal,
-    };
-
-    let id = db
-        .query(&query)
-        .or_else(|| {
-            db.query(&fontdb::Query {
-                families: &[fontdb::Family::Monospace],
-                ..query
-            })
-        })
-        .ok_or_else(|| anyhow!("no monospace font found on this system"))?;
-
-    let font = db
-        .with_face_data(id, |data, index| {
-            Font::from_bytes(
-                data,
-                FontSettings {
-                    collection_index: index,
-                    ..FontSettings::default()
-                },
-            )
-            .ok()
-        })
-        .flatten()
-        .ok_or_else(|| anyhow!("failed to parse selected font face"))?;
-    Ok(font)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,7 +274,7 @@ mod tests {
 
     #[test]
     fn primary_font_falls_back_to_symbols_for_missing_nerd_glyph() {
-        let primary = load_font(None).expect("system monospace should exist");
+        let primary = load_editor_font(None).expect("system monospace should exist");
         let symbols = load_symbols_font().expect("symbols font should parse");
         let ch = '\u{E0B0}';
 

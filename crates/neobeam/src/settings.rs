@@ -151,6 +151,15 @@ impl Settings {
             let _ = std::fs::write(path, json);
         }
     }
+
+    /// Write defaults only when the config file does not exist yet.
+    pub fn save_if_missing(&self) {
+        let Some(path) = config_path() else { return };
+        if path.exists() {
+            return;
+        }
+        self.save();
+    }
 }
 
 /// Watch `settings.json` and invoke `on_change` after writes settle (debounced).

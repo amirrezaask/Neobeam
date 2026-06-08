@@ -20,6 +20,7 @@ fn blend_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 
 pub struct MenuBar {
     fonts: Vec<String>,
+    fonts_loaded: bool,
     colorschemes: Vec<String>,
     colorschemes_loaded: bool,
     pub selected_theme: Option<String>,
@@ -32,7 +33,8 @@ pub struct MenuBar {
 impl MenuBar {
     pub fn new() -> Self {
         MenuBar {
-            fonts: list_monospace_fonts(),
+            fonts: Vec::new(),
+            fonts_loaded: false,
             colorschemes: Vec::new(),
             colorschemes_loaded: false,
             selected_theme: None,
@@ -41,12 +43,15 @@ impl MenuBar {
         }
     }
 
-    pub fn init_theme(&mut self, session: &NvimSession) {
-        self.selected_theme = session.current_colorscheme();
+    pub fn set_selected_theme(&mut self, theme: Option<String>) {
+        self.selected_theme = theme;
     }
 
-    pub fn refresh_winbar(&mut self, session: &NvimSession) {
-        self.winbar = session.fetch_winbar_info();
+    fn ensure_fonts_loaded(&mut self) {
+        if !self.fonts_loaded {
+            self.fonts = list_monospace_fonts();
+            self.fonts_loaded = true;
+        }
     }
 
     pub fn set_winbar(&mut self, info: WinbarInfo) {
@@ -145,6 +150,7 @@ impl MenuBar {
     }
 
     fn draw_font_section(&mut self, ui: &Ui, settings: &mut Settings) -> bool {
+        self.ensure_fonts_loaded();
         let mut changed = false;
 
         let mut font_labels: Vec<&str> = Vec::with_capacity(self.fonts.len() + 1);

@@ -14,6 +14,6 @@ pub use grid::{
 };
 pub use input::{encode_key, KeyInput, Mods, MouseAction, MouseButton, NamedKey};
 pub use protocol::{parse_redraw, CursorShape, HlAttr, ModeInfo, UiEvent};
-pub use session::{NvimSession, RedrawCallback, SessionConfig, WinbarInfo};
+pub use session::{NvimBoot, NvimSession, RedrawCallback, SessionConfig, WinbarInfo};
 
 pub use rmpv::Value;

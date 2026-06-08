@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use app_page::AppPage;
 use arboard::Clipboard;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
@@ -30,15 +30,15 @@ use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use layout::{Rect, SimpleLayout};
 use menu_bar::{MenuBar, MenuBarAction};
-use project::Project;
-use project_picker::ProjectPicker;
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
 };
 use nvim_core::protocol::parse_redraw;
-use nvim_core::session::{NvimSession, SessionConfig, WinbarInfo};
+use nvim_core::session::{NvimBoot, NvimSession, SessionConfig, WinbarInfo};
 use nvim_core::Value;
+use project::Project;
+use project_picker::ProjectPicker;
 use settings::{spawn_watcher, Settings};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -56,6 +56,8 @@ enum UserEvent {
     GitRefreshed,
     /// Async winbar query finished (see `App::schedule_winbar_refresh`).
     WinbarUpdated(WinbarInfo),
+    /// Async colorscheme query finished during startup.
+    ColorschemeUpdated(Option<String>),
 }
 
 struct State {
@@ -77,6 +79,8 @@ struct State {
     grid_cols: u32,
     grid_rows: u32,
     context_menu: ContextMenu,
+    /// Window is created before the first paint; stay hidden until then.
+    window_pending_show: bool,
 }
 
 struct App {
@@ -95,6 +99,9 @@ struct App {
     /// Another flush arrived while a winbar RPC was in flight.
     winbar_refresh_dirty: bool,
     state: Option<State>,
+    /// Background nvim boot started in `App::new`.
+    nvim_boot: Option<tokio::task::JoinHandle<Result<NvimBoot>>>,
+    startup_t0: Instant,
 }
 
 fn imgui_active(state: &State) -> bool {
@@ -115,22 +122,14 @@ fn cursor_logical(state: &State) -> (f32, f32) {
     )
 }
 
-fn imgui_captures_input(
-    state: &State,
-    current_page: AppPage,
-    project_picker_open: bool,
-) -> bool {
+fn imgui_captures_input(state: &State, current_page: AppPage, project_picker_open: bool) -> bool {
     if current_page == AppPage::GitClient {
         return true;
     }
     project_picker_open || imgui_active(state)
 }
 
-fn mouse_to_nvim_blocked(
-    state: &State,
-    current_page: AppPage,
-    project_picker_open: bool,
-) -> bool {
+fn mouse_to_nvim_blocked(state: &State, current_page: AppPage, project_picker_open: bool) -> bool {
     if current_page != AppPage::Editor {
         return true;
     }
@@ -154,11 +153,22 @@ fn keyboard_to_nvim_blocked(
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, initial_project: Option<Project>) -> Result<Self> {
+        let startup_t0 = Instant::now();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
         let settings = Settings::load();
-        settings.save();
+        settings.save_if_missing();
+        tracing::info!(
+            "startup: settings loaded (+{:.1}ms)",
+            startup_t0.elapsed().as_secs_f64() * 1000.0
+        );
+        let working_dir = initial_project.as_ref().map(|p| p.path.clone());
+        let nvim_boot = rt.spawn(async move { NvimBoot::boot(working_dir).await });
+        tracing::info!(
+            "startup: nvim prefetch started (+{:.1}ms)",
+            startup_t0.elapsed().as_secs_f64() * 1000.0
+        );
         let reload_proxy = proxy.clone();
         spawn_watcher(move || {
             let _ = reload_proxy.send_event(UserEvent::SettingsReloaded);
@@ -185,7 +195,21 @@ impl App {
             winbar_refresh_pending: false,
             winbar_refresh_dirty: false,
             state: None,
+            nvim_boot: Some(nvim_boot),
+            startup_t0,
         })
+    }
+
+    /// Defer theme/winbar RPCs until after the first frame is scheduled.
+    fn schedule_startup_metadata(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        state.session.fetch_colorscheme_async(move |name| {
+            let _ = proxy.send_event(UserEvent::ColorschemeUpdated(name));
+        });
+        self.schedule_winbar_refresh();
     }
 
     /// Drop GPU/window state while the event loop is still running.
@@ -217,27 +241,7 @@ impl App {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<State> {
-        let attrs = Window::default_attributes()
-            .with_title("Neobeam")
-            .with_transparent(true);
-        let window = Arc::new(event_loop.create_window(attrs)?);
-        window.set_ime_allowed(true);
-
-        let renderer = Renderer::new(
-            window.clone(),
-            self.settings.font_family.as_deref(),
-            self.settings.font_size,
-            self.settings.line_height,
-        )?;
-
-        let (cw, ch) = renderer.cell_size();
-        let (lw, lh) = renderer.logical_size();
-        let chrome_cfg = self.settings.chrome_layout_config();
-        let layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
-        let area = Rect::from_array(layout.editor_rect);
-        let main_rect = self.layout.compute(area);
-        let cols = ((main_rect.w / cw).floor() as u32).max(1);
-        let rows = ((main_rect.h / ch).floor() as u32).max(1);
+        let t0 = self.startup_t0;
 
         let proxy = self.proxy.clone();
         let redraw = Arc::new(move |args: Vec<Value>| {
@@ -248,26 +252,71 @@ impl App {
             let _ = proxy_close.send_event(UserEvent::Exited);
         });
 
-        let session = NvimSession::spawn(
-            self.rt.handle(),
-            SessionConfig {
-                cols,
-                rows,
-                working_dir: self.project.as_ref().map(|p| p.path.clone()),
-                ..Default::default()
-            },
-            redraw,
-            on_close,
-        )?;
-        self.menu_bar.init_theme(&session);
-        self.menu_bar.refresh_winbar(&session);
+        // Attach nvim before creating the window so no transparent shell is shown.
+        let boot_handle = self
+            .nvim_boot
+            .take()
+            .context("nvim boot task already consumed")?;
+        let rt_handle = self.rt.handle().clone();
+        let session_cfg = SessionConfig {
+            working_dir: self.project.as_ref().map(|p| p.path.clone()),
+            ..Default::default()
+        };
+        let t_nvim = Instant::now();
+        let session = self.rt.block_on(async move {
+            let boot = boot_handle.await.context("nvim boot task join")??;
+            boot.finish_async(session_cfg, redraw, on_close, &rt_handle)
+                .await
+        })?;
         tracing::info!(
-            "nvim attached: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}",
+            "startup: nvim attached (+{:.1}ms, nvim={:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            t_nvim.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let attrs = Window::default_attributes()
+            .with_title("Neobeam")
+            .with_transparent(true)
+            .with_visible(false);
+        let window = Arc::new(event_loop.create_window(attrs)?);
+        window.set_ime_allowed(true);
+        tracing::info!(
+            "startup: window created (+{:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let t_gpu = Instant::now();
+        let renderer = Renderer::new(
+            window.clone(),
+            self.settings.font_family.as_deref(),
+            self.settings.font_size,
+            self.settings.line_height,
+        )?;
+        tracing::info!(
+            "startup: gpu renderer ready (+{:.1}ms, gpu={:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            t_gpu.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let chrome_cfg = self.settings.chrome_layout_config();
+        let (cw, ch) = renderer.cell_size();
+        let (lw, lh) = renderer.logical_size();
+        let chrome_layout = ChromeLayout::compute(lw, lh, &chrome_cfg);
+        let (cols, rows) = chrome_layout.editor_grid_size(cw, ch);
+        session.resize(cols, rows);
+        tracing::info!(
+            "nvim grid: {cols}x{rows} cells, cell={cw:.1}x{ch:.1}px, scale={}",
             renderer.scale()
         );
 
+        let t_imgui = Instant::now();
         let anim = AnimationState::new(self.settings.animation_config());
         let imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
+        tracing::info!(
+            "startup: imgui ready (+{:.1}ms, imgui={:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            t_imgui.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(State {
             window,
@@ -288,6 +337,7 @@ impl App {
             grid_cols: cols,
             grid_rows: rows,
             context_menu: ContextMenu::new(),
+            window_pending_show: true,
         })
     }
 
@@ -388,14 +438,16 @@ impl App {
 
         tracing::info!(
             "project: {}",
-            self.project.as_ref().map(|p| p.display()).unwrap_or_default()
+            self.project
+                .as_ref()
+                .map(|p| p.display())
+                .unwrap_or_default()
         );
         self.schedule_winbar_refresh();
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
     }
-
 }
 
 impl State {
@@ -450,12 +502,12 @@ impl State {
         current_page: AppPage,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
-    ) -> (
-        bool,
-        MenuBarAction,
-        ContextMenuAction,
-        Option<PathBuf>,
-    ) {
+    ) -> (bool, MenuBarAction, ContextMenuAction, Option<PathBuf>) {
+        if self.window_pending_show {
+            self.window_pending_show = false;
+            self.window.set_visible(true);
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -503,35 +555,31 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
-        if let Err(e) = self.imgui.prepare_ui(
-            &window,
-            store,
-            settings.font_size,
-            device,
-            queue,
-            |ui| {
-                if current_page == AppPage::GitClient {
-                    git_wants_redraw |= git_client.draw(ui, main_rect);
-                }
-                if current_page == AppPage::Settings {
-                    let settings_action =
-                        menu_bar.draw_settings_page(ui, settings, session, main_rect);
-                    if menu_action == MenuBarAction::None {
-                        menu_action = settings_action;
+        if let Err(e) =
+            self.imgui
+                .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
+                    if current_page == AppPage::GitClient {
+                        git_wants_redraw |= git_client.draw(ui, main_rect);
                     }
-                }
-                if current_page == AppPage::Editor {
-                    context_action = context_menu.draw(ui);
-                }
-                project_selection = project_picker.draw(ui, dt);
-            },
-        ) {
+                    if current_page == AppPage::Settings {
+                        let settings_action =
+                            menu_bar.draw_settings_page(ui, settings, session, main_rect);
+                        if menu_action == MenuBarAction::None {
+                            menu_action = settings_action;
+                        }
+                    }
+                    if current_page == AppPage::Editor {
+                        context_action = context_menu.draw(ui);
+                    }
+                    project_selection = project_picker.draw(ui, dt);
+                })
+        {
             tracing::warn!("imgui frame failed: {e:#}");
         }
 
         let cursor = cursor_logical(self);
-        let cursor_in_editor = current_page == AppPage::Editor
-            && main_rect.contains(cursor.0, cursor.1);
+        let cursor_in_editor =
+            current_page == AppPage::Editor && main_rect.contains(cursor.0, cursor.1);
         let editor_render_rect = if current_page == AppPage::Editor {
             Some([main_rect.x, main_rect.y, main_rect.w, main_rect.h])
         } else {
@@ -563,7 +611,12 @@ impl State {
             store,
             anim,
             overlay.as_deref(),
-            [chrome_layout.editor_rect[0], chrome_layout.editor_rect[1], 0.0, 0.0],
+            [
+                chrome_layout.editor_rect[0],
+                chrome_layout.editor_rect[1],
+                0.0,
+                0.0,
+            ],
             true,
             |device, queue, pass| {
                 if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
@@ -672,6 +725,11 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
+                self.schedule_startup_metadata();
+                tracing::info!(
+                    "startup: init complete (+{:.1}ms)",
+                    self.startup_t0.elapsed().as_secs_f64() * 1000.0
+                );
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Err(e) => {
@@ -724,6 +782,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if dirty {
                     self.schedule_winbar_refresh();
+                }
+            }
+            UserEvent::ColorschemeUpdated(name) => {
+                self.menu_bar.set_selected_theme(name);
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
                 }
             }
             UserEvent::Exited => {
@@ -802,9 +866,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
-                if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(s, self.current_page, picker_open)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open))
+                {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -827,23 +893,29 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.state.as_ref().is_some_and(|s| {
-                    is_font_increase_shortcut(&event.logical_key, s.mods)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_font_increase_shortcut(&event.logical_key, s.mods))
+                {
                     self.adjust_font_size(1.0);
                     return;
                 }
-                if self.state.as_ref().is_some_and(|s| {
-                    is_font_decrease_shortcut(&event.logical_key, s.mods)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_font_decrease_shortcut(&event.logical_key, s.mods))
+                {
                     self.adjust_font_size(-1.0);
                     return;
                 }
 
                 // Global pickers must work even when a pinned results panel has focus.
-                if self.state.as_ref().is_some_and(|s| {
-                    is_project_picker_shortcut(&event.logical_key, s.mods)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_project_picker_shortcut(&event.logical_key, s.mods))
+                {
                     self.project_picker.open();
                     if let Some(state) = self.state.as_mut() {
                         state.window.request_redraw();
@@ -851,9 +923,11 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self.state.as_ref().is_some_and(|s| {
-                    is_page_shortcut(&event.logical_key, s.mods).is_some()
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_page_shortcut(&event.logical_key, s.mods).is_some())
+                {
                     let page = self
                         .state
                         .as_ref()
@@ -891,9 +965,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(s, self.current_page, picker_open)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open))
+                {
                     return;
                 }
 
@@ -948,9 +1024,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if button == MouseButton::Right && btn_state == ElementState::Pressed {
-                    if let Some(grid_pos) =
-                        state.hit_test_editor(&self.settings, &self.layout)
-                    {
+                    if let Some(grid_pos) = state.hit_test_editor(&self.settings, &self.layout) {
                         let screen_pos = state.imgui.mouse_pos();
                         state.context_menu.open_at(screen_pos, grid_pos);
                         state.window.request_redraw();
@@ -988,9 +1062,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.state.as_ref().is_some_and(|s| {
-                    mouse_to_nvim_blocked(s, self.current_page, picker_open)
-                }) {
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| mouse_to_nvim_blocked(s, self.current_page, picker_open))
+                {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -1028,12 +1104,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (
-                    needs_anim,
-                    menu_action,
-                    context_action,
-                    project_selection,
-                ) = {
+                let (needs_anim, menu_action, context_action, project_selection) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
@@ -1096,8 +1167,7 @@ impl ApplicationHandler<UserEvent> for App {
             || (self.current_page == AppPage::Editor
                 && imgui_captures_input(state, self.current_page, picker_open))
             || state.anim.is_animating()
-            || (self.current_page == AppPage::Editor
-                && state.anim.is_blinking(&state.store));
+            || (self.current_page == AppPage::Editor && state.anim.is_blinking(&state.store));
 
         if needs_continuous {
             state.window.request_redraw();

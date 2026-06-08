@@ -3,13 +3,14 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use nvim_rs::{create::tokio::new_child_cmd, Handler, Neovim, UiAttachOptions};
 use rmpv::Value;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::runtime::Handle as RtHandle;
+use tokio::task::JoinHandle;
 use tokio_util::compat::Compat;
 
 use crate::input::{MouseAction, MouseButton};
@@ -45,7 +46,7 @@ fn nvim_embed_command(working_dir: Option<&PathBuf>) -> Command {
 
 #[derive(Clone)]
 struct NvimHandler {
-    redraw: RedrawCallback,
+    redraw: Arc<Mutex<Option<RedrawCallback>>>,
 }
 
 #[async_trait::async_trait]
@@ -54,8 +55,89 @@ impl Handler for NvimHandler {
 
     async fn handle_notify(&self, name: String, args: Vec<Value>, _nvim: Nvim) {
         if name == "redraw" {
-            (self.redraw)(args);
+            if let Ok(guard) = self.redraw.lock() {
+                if let Some(cb) = guard.as_ref() {
+                    cb(args);
+                }
+            }
         }
+    }
+}
+
+/// Neovim process started and RPC-ready, but UI not yet attached.
+pub struct NvimBoot {
+    pub nvim: Nvim,
+    io: JoinHandle<Result<(), Box<nvim_rs::error::LoopError>>>,
+    child: Child,
+    redraw_slot: Arc<Mutex<Option<RedrawCallback>>>,
+}
+
+impl NvimBoot {
+    /// Start `nvim --embed` and wait for the RPC handshake (no `ui_attach`).
+    pub async fn boot(working_dir: Option<PathBuf>) -> Result<Self> {
+        let redraw_slot = Arc::new(Mutex::new(None));
+        let handler = NvimHandler {
+            redraw: redraw_slot.clone(),
+        };
+        let mut cmd = nvim_embed_command(working_dir.as_ref());
+        let (nvim, io, child) = new_child_cmd(&mut cmd, handler)
+            .await
+            .context("spawn nvim --embed")?;
+        Ok(NvimBoot {
+            nvim,
+            io,
+            child,
+            redraw_slot,
+        })
+    }
+
+    /// Wire callbacks, attach the UI, and return a live session.
+    pub fn finish(
+        self,
+        rt: &RtHandle,
+        cfg: SessionConfig,
+        redraw: RedrawCallback,
+        on_close: CloseCallback,
+    ) -> Result<NvimSession> {
+        rt.block_on(self.finish_async(cfg, redraw, on_close, rt))
+    }
+
+    /// Async variant for parallel startup (must not call `block_on` from inside).
+    pub async fn finish_async(
+        self,
+        cfg: SessionConfig,
+        redraw: RedrawCallback,
+        on_close: CloseCallback,
+        rt: &RtHandle,
+    ) -> Result<NvimSession> {
+        if let Ok(mut guard) = self.redraw_slot.lock() {
+            *guard = Some(redraw.clone());
+        }
+
+        let exit_guard = Arc::new(AtomicBool::new(false));
+        {
+            let guard = exit_guard.clone();
+            let oc = on_close.clone();
+            let io = self.io;
+            rt.spawn(async move {
+                let _ = io.await;
+                if !guard.load(Ordering::SeqCst) {
+                    oc();
+                }
+            });
+        }
+
+        attach_ui_async(&self.nvim, &cfg).await.context("nvim_ui_attach")?;
+
+        Ok(NvimSession {
+            nvim: self.nvim,
+            rt: rt.clone(),
+            child: self.child,
+            cfg,
+            redraw,
+            on_close,
+            exit_guard,
+        })
     }
 }
 
@@ -66,6 +148,7 @@ pub struct WinbarInfo {
     pub project: String,
 }
 
+#[derive(Clone)]
 pub struct SessionConfig {
     pub cols: u32,
     pub rows: u32,
@@ -108,61 +191,17 @@ impl NvimSession {
         redraw: RedrawCallback,
         on_close: CloseCallback,
     ) -> Result<Self> {
-        let handler = NvimHandler { redraw: redraw.clone() };
         let working_dir = cfg.working_dir.clone();
-        let (nvim, io, child) = rt
-            .block_on(async move {
-                let mut cmd = nvim_embed_command(working_dir.as_ref());
-                new_child_cmd(&mut cmd, handler).await
-            })
+        let boot = rt
+            .block_on(NvimBoot::boot(working_dir))
             .context("spawn nvim --embed")?;
-
-        // Watch the RPC io loop: it resolves when nvim closes its stdio (exit).
-        let exit_guard = Arc::new(AtomicBool::new(false));
-        {
-            let guard = exit_guard.clone();
-            let oc = on_close.clone();
-            rt.spawn(async move {
-                let _ = io.await;
-                if !guard.load(Ordering::SeqCst) {
-                    oc();
-                }
-            });
-        }
-
-        let session = NvimSession {
-            nvim,
-            rt: rt.clone(),
-            child,
-            cfg,
-            redraw,
-            on_close,
-            exit_guard,
-        };
-        session.attach()?;
-        Ok(session)
+        boot.finish(rt, cfg, redraw, on_close)
     }
 
     fn attach(&self) -> Result<()> {
-        let nvim = self.nvim.clone();
-        let (cols, rows) = (self.cfg.cols as i64, self.cfg.rows as i64);
-        let (cmdline, popup, msgs) =
-            (self.cfg.ext_cmdline, self.cfg.ext_popupmenu, self.cfg.ext_messages);
         self.rt
-            .block_on(async move {
-                let mut opts = UiAttachOptions::new();
-                opts.set_rgb(true)
-                    .set_linegrid_external(true)
-                    .set_multigrid_external(true)
-                    .set_cmdline_external(cmdline)
-                    .set_popupmenu_external(popup)
-                    .set_messages_externa(msgs);
-                nvim.ui_attach(cols, rows, &opts).await?;
-                let _ = nvim.command("set noswapfile nobackup nowritebackup").await;
-                Ok::<(), Box<nvim_rs::error::CallError>>(())
-            })
-            .context("nvim_ui_attach")?;
-        Ok(())
+            .block_on(attach_ui_async(&self.nvim, &self.cfg))
+            .context("nvim_ui_attach")
     }
 
     /// Send a raw `nvim_input` string (already in Neovim key notation).
@@ -238,12 +277,16 @@ impl NvimSession {
     /// Read `g:colors_name` for the active colorscheme.
     pub fn current_colorscheme(&self) -> Option<String> {
         let nvim = self.nvim.clone();
-        self.rt.block_on(async move {
-            nvim.get_var("colors_name")
-                .await
-                .ok()
-                .and_then(|v| value_as_string(&v))
-        })
+        self.rt.block_on(async move { current_colorscheme_async(&nvim).await })
+    }
+
+    /// Non-blocking colorscheme query; runs on the session runtime.
+    pub fn fetch_colorscheme_async(&self, on_ready: impl FnOnce(Option<String>) + Send + 'static) {
+        let nvim = self.nvim.clone();
+        self.rt.spawn(async move {
+            let name = current_colorscheme_async(&nvim).await;
+            on_ready(name);
+        });
     }
 
     /// Apply a colorscheme immediately.
@@ -336,20 +379,20 @@ impl NvimSession {
         self.exit_guard.store(true, Ordering::SeqCst);
         self.kill();
 
-        let handler = NvimHandler { redraw: self.redraw.clone() };
         let working_dir = self.cfg.working_dir.clone();
-        let (nvim, io, child) = self
+        let boot = self
             .rt
-            .block_on(async move {
-                let mut cmd = nvim_embed_command(working_dir.as_ref());
-                new_child_cmd(&mut cmd, handler).await
-            })
+            .block_on(NvimBoot::boot(working_dir))
             .context("respawn nvim --embed")?;
+        if let Ok(mut guard) = boot.redraw_slot.lock() {
+            *guard = Some(self.redraw.clone());
+        }
 
         let exit_guard = Arc::new(AtomicBool::new(false));
         {
             let guard = exit_guard.clone();
             let oc = self.on_close.clone();
+            let io = boot.io;
             self.rt.spawn(async move {
                 let _ = io.await;
                 if !guard.load(Ordering::SeqCst) {
@@ -358,8 +401,8 @@ impl NvimSession {
             });
         }
 
-        self.nvim = nvim;
-        self.child = child;
+        self.nvim = boot.nvim;
+        self.child = boot.child;
         self.exit_guard = exit_guard;
         self.attach()?;
         Ok(())
@@ -372,6 +415,29 @@ impl Drop for NvimSession {
         self.exit_guard.store(true, Ordering::SeqCst);
         let _ = self.child.start_kill();
     }
+}
+
+async fn attach_ui_async(nvim: &Nvim, cfg: &SessionConfig) -> Result<(), Box<nvim_rs::error::CallError>> {
+    let (cols, rows) = (cfg.cols as i64, cfg.rows as i64);
+    let (cmdline, popup, msgs) =
+        (cfg.ext_cmdline, cfg.ext_popupmenu, cfg.ext_messages);
+    let mut opts = UiAttachOptions::new();
+    opts.set_rgb(true)
+        .set_linegrid_external(true)
+        .set_multigrid_external(true)
+        .set_cmdline_external(cmdline)
+        .set_popupmenu_external(popup)
+        .set_messages_externa(msgs);
+    nvim.ui_attach(cols, rows, &opts).await?;
+    let _ = nvim.command("set noswapfile nobackup nowritebackup").await;
+    Ok(())
+}
+
+async fn current_colorscheme_async(nvim: &Nvim) -> Option<String> {
+    nvim.get_var("colors_name")
+        .await
+        .ok()
+        .and_then(|v| value_as_string(&v))
 }
 
 async fn fetch_winbar_info_async(nvim: &Nvim) -> WinbarInfo {
