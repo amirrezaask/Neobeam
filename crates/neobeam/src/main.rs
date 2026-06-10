@@ -2,6 +2,7 @@
 //! state and animation engine, and wires input/resize/redraw together.
 
 mod app_page;
+mod component_picker;
 mod context_menu;
 mod fuzzy_picker;
 mod git_client;
@@ -11,6 +12,8 @@ mod imgui_theme;
 mod layout;
 mod menu_bar;
 mod nvim_view;
+mod pane;
+mod pane_anim;
 mod project;
 mod project_picker;
 mod settings;
@@ -25,12 +28,15 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use app_page::AppPage;
 use arboard::Clipboard;
+use component_picker::ComponentPicker;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
 use editor_surface::{AnimationState, ChromeLayout, Renderer};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use layout::{Rect, SimpleLayout};
 use menu_bar::{MenuBar, MenuBarAction};
+use pane::{FocusDir, PaneKind, PaneTree, SplitDir, SplitId};
+use pane_anim::PaneAnimStore;
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -90,6 +96,10 @@ struct App {
     settings: Settings,
     menu_bar: MenuBar,
     layout: SimpleLayout,
+    pane_tree: PaneTree,
+    pane_anims: PaneAnimStore,
+    component_picker: ComponentPicker,
+    pane_drag: Option<PaneDrag>,
     current_page: AppPage,
     git_client: GitClient,
     project_picker: ProjectPicker,
@@ -104,6 +114,16 @@ struct App {
     nvim_boot: Option<tokio::task::JoinHandle<Result<NvimBoot>>>,
     startup_t0: Instant,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct PaneDrag {
+    split_id: SplitId,
+    dir: SplitDir,
+    parent_rect: Rect,
+}
+
+/// Gutter thickness in logical px — generous enough to grab without precision.
+const GUTTER_THICKNESS: f32 = 8.0;
 
 fn imgui_active(state: &State) -> bool {
     state.imgui.wants_mouse() || state.imgui.wants_keyboard()
@@ -130,8 +150,21 @@ fn imgui_captures_input(state: &State, current_page: AppPage, project_picker_ope
     project_picker_open || imgui_active(state)
 }
 
-fn mouse_to_nvim_blocked(state: &State, current_page: AppPage, project_picker_open: bool) -> bool {
+fn is_pane_kind_imgui(kind: PaneKind) -> bool {
+    matches!(kind, PaneKind::GitDiff | PaneKind::Settings | PaneKind::Empty)
+}
+
+fn mouse_to_nvim_blocked(
+    state: &State,
+    current_page: AppPage,
+    project_picker_open: bool,
+    focused_kind: PaneKind,
+    component_picker_open: bool,
+) -> bool {
     if current_page != AppPage::Editor {
+        return true;
+    }
+    if component_picker_open || is_pane_kind_imgui(focused_kind) {
         return true;
     }
     project_picker_open
@@ -143,8 +176,13 @@ fn keyboard_to_nvim_blocked(
     state: &State,
     current_page: AppPage,
     project_picker_open: bool,
+    focused_kind: PaneKind,
+    component_picker_open: bool,
 ) -> bool {
     if current_page != AppPage::Editor {
+        return true;
+    }
+    if component_picker_open || is_pane_kind_imgui(focused_kind) {
         return true;
     }
     project_picker_open
@@ -189,6 +227,10 @@ impl App {
             settings,
             menu_bar,
             layout: SimpleLayout::new(),
+            pane_tree: PaneTree::new_with(PaneKind::Nvim),
+            pane_anims: PaneAnimStore::new(),
+            component_picker: ComponentPicker::new(),
+            pane_drag: None,
             current_page: AppPage::Editor,
             git_client,
             project_picker: ProjectPicker::new(),
@@ -277,7 +319,6 @@ impl App {
 
         let attrs = Window::default_attributes()
             .with_title("Neobeam")
-            .with_transparent(true)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs)?);
         window.set_ime_allowed(true);
@@ -422,6 +463,13 @@ impl App {
         state.window.request_redraw();
     }
 
+    fn editor_area_logical(&self) -> Rect {
+        let Some(state) = self.state.as_ref() else {
+            return Rect::default();
+        };
+        editor_area(&self.settings, &state.renderer)
+    }
+
     /// Switch all views to a new project. This is the single place that
     /// updates the session cwd, git client, and menu bar together.
     fn set_project(&mut self, path: PathBuf) {
@@ -492,6 +540,10 @@ impl State {
 
     fn recompute_grid(&mut self, settings: &Settings, layout: &SimpleLayout) {
         let content = self.editor_content_rect(settings, layout);
+        self.recompute_grid_for(settings, content);
+    }
+
+    fn recompute_grid_for(&mut self, _settings: &Settings, content: Rect) {
         let (cw, ch) = self.renderer.cell_size();
         let cols = ((content.w / cw).floor() as u32).max(1);
         let rows = ((content.h / ch).floor() as u32).max(1);
@@ -507,10 +559,19 @@ impl State {
         settings: &mut Settings,
         menu_bar: &mut MenuBar,
         layout: &mut SimpleLayout,
+        pane_tree: &PaneTree,
+        pane_anims: &mut PaneAnimStore,
+        component_picker: &mut ComponentPicker,
         current_page: AppPage,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
-    ) -> (bool, MenuBarAction, ContextMenuAction, Option<PathBuf>) {
+    ) -> (
+        bool,
+        MenuBarAction,
+        ContextMenuAction,
+        Option<PathBuf>,
+        Option<PaneKind>,
+    ) {
         if self.window_pending_show {
             self.window_pending_show = false;
             self.window.set_visible(true);
@@ -551,11 +612,39 @@ impl State {
         );
         let editor_area_rect = Rect::from_array(chrome_layout.editor_rect);
         let main_rect = layout.compute(editor_area_rect);
-        self.recompute_grid(settings, layout);
+        let target_leaves = pane_tree.layout(editor_area_rect);
+        let anim_targets: Vec<(pane::PaneId, Rect)> =
+            target_leaves.iter().map(|l| (l.id, l.rect)).collect();
+        pane_anims.sync(&anim_targets);
+        let pane_anim_active = pane_anims.tick(dt);
+        // Resolve animated rect per leaf (falls back to target if missing).
+        let leaves: Vec<pane::LeafLayout> = target_leaves
+            .iter()
+            .map(|l| {
+                let rect = pane_anims
+                    .get(l.id)
+                    .map(|a| a.render_rect())
+                    .unwrap_or(l.rect);
+                pane::LeafLayout { id: l.id, kind: l.kind, rect }
+            })
+            .collect();
+        // Nvim grid follows the TARGET rect (not animated) so animation
+        // doesn't fire grid_resize events on every frame.
+        let nvim_leaf_rect = target_leaves
+            .iter()
+            .find(|l| l.kind == PaneKind::Nvim)
+            .map(|l| l.rect)
+            .unwrap_or(main_rect);
+        let nvim_anim_rect = leaves
+            .iter()
+            .find(|l| l.kind == PaneKind::Nvim)
+            .map(|l| l.rect)
+            .unwrap_or(nvim_leaf_rect);
+        self.recompute_grid_for(settings, nvim_leaf_rect);
 
         let cursor = cursor_logical(self);
         let cursor_in_editor =
-            current_page == AppPage::Editor && main_rect.contains(cursor.0, cursor.1);
+            current_page == AppPage::Editor && nvim_leaf_rect.contains(cursor.0, cursor.1);
         let hide_cursor = !cursor_in_editor;
 
         self.anim.update(dt, &self.store, cw, ch);
@@ -564,7 +653,7 @@ impl State {
         // Render with offset [0,0] — the texture origin IS the nvim area origin.
         let mut nvim_clear_color = [0.0f32; 4];
         if current_page == AppPage::Editor {
-            let editor_rect = [0.0, 0.0, main_rect.w, main_rect.h];
+            let editor_rect = [0.0, 0.0, nvim_anim_rect.w, nvim_anim_rect.h];
             if let Some(tex_view) = self.imgui.nvim_texture_view_arc() {
                 let (tex_w, tex_h) = self
                     .imgui
@@ -593,6 +682,7 @@ impl State {
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let mut project_selection = None;
+        let mut component_selection: Option<PaneKind> = None;
         let mut git_wants_redraw = false;
         let window = self.window.clone();
         let session = &self.session;
@@ -600,13 +690,37 @@ impl State {
         let device = self.renderer.device();
         let queue = self.renderer.queue();
         let context_menu = &mut self.context_menu;
+        let focused_id = pane_tree.focused;
         if let Err(e) =
             self.imgui
                 .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
                     if current_page == AppPage::Editor {
-                        if let Some(tid) = nvim_texture_id {
-                            let (tw, th) = nvim_tex_size;
-                            nvim_view::NvimView::new(tid, tw, th).draw(ui, main_rect, nvim_scale);
+                        for leaf in &leaves {
+                            let is_focused = leaf.id == focused_id;
+                            match leaf.kind {
+                                PaneKind::Nvim => {
+                                    if let Some(tid) = nvim_texture_id {
+                                        let (tw, th) = nvim_tex_size;
+                                        nvim_view::NvimView::new(tid, tw, th).draw(
+                                            ui, leaf.rect, nvim_scale,
+                                        );
+                                    }
+                                }
+                                PaneKind::GitDiff => {
+                                    git_wants_redraw |= git_client.draw(ui, leaf.rect);
+                                }
+                                PaneKind::Settings => {
+                                    let settings_action = menu_bar.draw_settings_page(
+                                        ui, settings, session, leaf.rect,
+                                    );
+                                    if menu_action == MenuBarAction::None {
+                                        menu_action = settings_action;
+                                    }
+                                }
+                                PaneKind::Empty => {
+                                    draw_empty_pane(ui, leaf.rect, is_focused);
+                                }
+                            }
                         }
                         context_action = context_menu.draw(ui);
                     }
@@ -621,6 +735,7 @@ impl State {
                         }
                     }
                     project_selection = project_picker.draw(ui, dt);
+                    component_selection = component_picker.draw(ui);
                 })
         {
             tracing::warn!("imgui frame failed: {e:#}");
@@ -639,17 +754,56 @@ impl State {
         self.frame_count += 1;
         let needs_anim = self.anim.is_animating()
             || (!hide_cursor && self.anim.is_blinking(&self.store))
-            || self.anim.render_deadline().is_some();
+            || self.anim.render_deadline().is_some()
+            || pane_anim_active;
         if self.context_menu.open
             || project_picker.is_open()
+            || component_picker.is_open()
             || needs_anim
             || imgui_active(self)
             || git_wants_redraw
         {
             self.window.request_redraw();
         }
-        (needs_anim, menu_action, context_action, project_selection)
+        (
+            needs_anim,
+            menu_action,
+            context_action,
+            project_selection,
+            component_selection,
+        )
     }
+}
+
+fn draw_empty_pane(ui: &imgui::Ui, rect: Rect, focused: bool) {
+    use imgui::{Condition, WindowFlags};
+    let flags = WindowFlags::NO_TITLE_BAR
+        | WindowFlags::NO_RESIZE
+        | WindowFlags::NO_MOVE
+        | WindowFlags::NO_SCROLLBAR
+        | WindowFlags::NO_COLLAPSE
+        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+        | WindowFlags::NO_DECORATION
+        | WindowFlags::NO_INPUTS;
+    let bg = if focused {
+        [0.10, 0.11, 0.14, 1.0]
+    } else {
+        [0.07, 0.08, 0.10, 1.0]
+    };
+    let _bg = ui.push_style_color(imgui::StyleColor::WindowBg, bg);
+    let id = format!("##empty_pane_{}_{}", rect.x as i32, rect.y as i32);
+    ui.window(&id)
+        .position([rect.x, rect.y], Condition::Always)
+        .size([rect.w, rect.h], Condition::Always)
+        .flags(flags)
+        .build(|| {
+            let label = "Empty pane — pick a component (Cmd+T)";
+            let ts = ui.calc_text_size(label);
+            let cx = rect.w * 0.5 - ts[0] * 0.5;
+            let cy = rect.h * 0.5 - ts[1] * 0.5;
+            ui.set_cursor_pos([cx, cy]);
+            ui.text_disabled(label);
+        });
 }
 
 fn dispatch_context_command(
@@ -825,6 +979,8 @@ impl ApplicationHandler<UserEvent> for App {
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
             let picker_open = self.project_picker.is_open();
+        let comp_open = self.component_picker.is_open();
+        let focused_kind = self.pane_tree.focused_kind();
             let redraw = state.context_menu.open
                 || picker_open
                 || imgui_captures_input(state, self.current_page, picker_open);
@@ -833,6 +989,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         let picker_open = self.project_picker.is_open();
+        let comp_open = self.component_picker.is_open();
+        let focused_kind = self.pane_tree.focused_kind();
         match event {
             WindowEvent::CloseRequested => {
                 self.teardown(event_loop);
@@ -891,7 +1049,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open))
+                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
                 {
                     return;
                 }
@@ -948,19 +1106,61 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| is_page_shortcut(&event.logical_key, s.mods).is_some())
+                    .is_some_and(|s| is_component_picker_shortcut(&event.logical_key, s.mods))
                 {
-                    let page = self
+                    self.component_picker.open();
+                    if let Some(state) = self.state.as_mut() {
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
+
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_pane_shortcut(&event.logical_key, s.mods).is_some())
+                {
+                    let cmd = self
                         .state
                         .as_ref()
-                        .and_then(|s| is_page_shortcut(&event.logical_key, s.mods));
-                    if let Some(page) = page {
-                        self.current_page = page;
+                        .and_then(|s| is_pane_shortcut(&event.logical_key, s.mods));
+                    if let Some(cmd) = cmd {
+                        let area = self.editor_area_logical();
+                        match cmd {
+                            PaneCmd::Split(d) => {
+                                self.pane_tree.split_focused(d);
+                                self.component_picker.open();
+                            }
+                            PaneCmd::Close => {
+                                self.pane_tree.close_focused();
+                            }
+                            PaneCmd::Focus(d) => {
+                                self.pane_tree.focus_dir(area, d);
+                            }
+                        }
                         if let Some(state) = self.state.as_ref() {
                             state.window.request_redraw();
                         }
-                        if page == AppPage::GitClient {
+                    }
+                    return;
+                }
+
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| is_quick_component_shortcut(&event.logical_key, s.mods).is_some())
+                {
+                    let kind = self
+                        .state
+                        .as_ref()
+                        .and_then(|s| is_quick_component_shortcut(&event.logical_key, s.mods));
+                    if let Some(kind) = kind {
+                        self.pane_tree.focus_or_spawn(kind);
+                        if kind == PaneKind::GitDiff {
                             self.schedule_winbar_refresh();
+                        }
+                        if let Some(state) = self.state.as_ref() {
+                            state.window.request_redraw();
                         }
                     }
                     return;
@@ -972,7 +1172,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        keyboard_to_nvim_blocked(s, self.current_page, picker_open)
+                        keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open)
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -990,7 +1190,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open))
+                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
                 {
                     return;
                 }
@@ -1016,7 +1216,47 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 state.cursor_pos = (position.x, position.y);
-                if mouse_to_nvim_blocked(state, self.current_page, picker_open) {
+                let cursor = cursor_logical(state);
+                let area = editor_area(&self.settings, &state.renderer);
+
+                // Active split drag: update ratio, skip focus change.
+                if let Some(drag) = self.pane_drag {
+                    let p = drag.parent_rect;
+                    let new_ratio = match drag.dir {
+                        SplitDir::Horizontal => (cursor.0 - p.x) / p.w.max(1.0),
+                        SplitDir::Vertical => (cursor.1 - p.y) / p.h.max(1.0),
+                    };
+                    self.pane_tree.set_split_ratio(drag.split_id, new_ratio);
+                    state.window.request_redraw();
+                    return;
+                }
+
+                // Hover over a gutter → set resize cursor.
+                let gutters = self.pane_tree.gutters(area, GUTTER_THICKNESS);
+                let hovered_gutter = gutters
+                    .iter()
+                    .find(|g| g.rect.contains(cursor.0, cursor.1))
+                    .copied();
+                if let Some(g) = hovered_gutter {
+                    let icon = match g.dir {
+                        SplitDir::Horizontal => winit::window::CursorIcon::EwResize,
+                        SplitDir::Vertical => winit::window::CursorIcon::NsResize,
+                    };
+                    state.window.set_cursor(icon);
+                } else {
+                    state.window.set_cursor(winit::window::CursorIcon::Default);
+                }
+
+                // Mouse-follow focus: hovered pane becomes focused.
+                if hovered_gutter.is_none() {
+                    if let Some(id) = self.pane_tree.hit_test(area, cursor.0, cursor.1) {
+                        if self.pane_tree.focused != id {
+                            self.pane_tree.focused = id;
+                            state.window.request_redraw();
+                        }
+                    }
+                }
+                if mouse_to_nvim_blocked(state, self.current_page, picker_open, focused_kind, comp_open) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -1040,7 +1280,35 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
 
-                if mouse_to_nvim_blocked(state, self.current_page, picker_open) {
+                // Gutter drag handling — runs even when an imgui pane has focus.
+                if button == MouseButton::Left {
+                    let cursor = cursor_logical(state);
+                    let area = editor_area(&self.settings, &state.renderer);
+                    match btn_state {
+                        ElementState::Pressed => {
+                            let gutters = self.pane_tree.gutters(area, GUTTER_THICKNESS);
+                            if let Some(g) =
+                                gutters.iter().find(|g| g.rect.contains(cursor.0, cursor.1))
+                            {
+                                self.pane_drag = Some(PaneDrag {
+                                    split_id: g.id,
+                                    dir: g.dir,
+                                    parent_rect: g.parent_rect,
+                                });
+                                state.window.request_redraw();
+                                return;
+                            }
+                        }
+                        ElementState::Released => {
+                            if self.pane_drag.take().is_some() {
+                                state.window.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if mouse_to_nvim_blocked(state, self.current_page, picker_open, focused_kind, comp_open) {
                     state.window.request_redraw();
                     return;
                 }
@@ -1087,7 +1355,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self
                     .state
                     .as_ref()
-                    .is_some_and(|s| mouse_to_nvim_blocked(s, self.current_page, picker_open))
+                    .is_some_and(|s| mouse_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
                 {
                     return;
                 }
@@ -1126,7 +1394,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (needs_anim, menu_action, context_action, project_selection) = {
+                let (needs_anim, menu_action, context_action, project_selection, component_sel) = {
                     let Some(state) = self.state.as_mut() else {
                         return;
                     };
@@ -1134,6 +1402,9 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.settings,
                         &mut self.menu_bar,
                         &mut self.layout,
+                        &self.pane_tree,
+                        &mut self.pane_anims,
+                        &mut self.component_picker,
                         self.current_page,
                         &mut self.git_client,
                         &mut self.project_picker,
@@ -1141,10 +1412,18 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
+                if let Some(kind) = component_sel {
+                    self.pane_tree.set_focused_kind(kind);
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                }
                 if let Some(path) = project_selection {
                     self.set_project(path);
                 }
                 let picker_open = self.project_picker.is_open();
+        let comp_open = self.component_picker.is_open();
+        let focused_kind = self.pane_tree.focused_kind();
                 if needs_anim {
                     if let Some(deadline) =
                         self.state.as_ref().and_then(|s| s.anim.render_deadline())
@@ -1177,6 +1456,8 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let picker_open = self.project_picker.is_open();
+        let comp_open = self.component_picker.is_open();
+        let focused_kind = self.pane_tree.focused_kind();
 
         // For git windows the event loop should stay in Wait mode when idle.
         // Redraws are triggered by the GitRefreshed user-event that the
@@ -1230,17 +1511,62 @@ fn is_project_picker_shortcut(key: &Key, mods: Mods) -> bool {
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p")) && mods.meta
 }
 
-fn is_page_shortcut(key: &Key, mods: Mods) -> Option<AppPage> {
+fn is_component_picker_shortcut(key: &Key, mods: Mods) -> bool {
     if mods.alt || mods.shift || mods.ctrl {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("t")) && mods.meta
+}
+
+enum PaneCmd {
+    Split(SplitDir),
+    Close,
+    Focus(FocusDir),
+}
+
+fn is_pane_shortcut(key: &Key, mods: Mods) -> Option<PaneCmd> {
+    if mods.alt || mods.ctrl || !mods.meta {
         return None;
     }
-    if !mods.meta {
+    // Cmd+Enter = split right; Cmd+Shift+Enter = split down.
+    if matches!(key, Key::Named(WinitNamed::Enter)) {
+        return Some(if mods.shift {
+            PaneCmd::Split(SplitDir::Vertical)
+        } else {
+            PaneCmd::Split(SplitDir::Horizontal)
+        });
+    }
+    // Cmd+W = close focused pane (no shift).
+    if !mods.shift && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("w")) {
+        return Some(PaneCmd::Close);
+    }
+    // Cmd+H/J/K/L = focus traversal (no shift).
+    if !mods.shift {
+        if let Key::Character(c) = key {
+            let d = match c.as_str() {
+                "h" | "H" => Some(FocusDir::Left),
+                "j" | "J" => Some(FocusDir::Down),
+                "k" | "K" => Some(FocusDir::Up),
+                "l" | "L" => Some(FocusDir::Right),
+                _ => None,
+            };
+            if let Some(d) = d {
+                return Some(PaneCmd::Focus(d));
+            }
+        }
+    }
+    None
+}
+
+/// Cmd+3 → GitDiff, Cmd+, → Settings: spawn-or-focus a pane of that kind.
+fn is_quick_component_shortcut(key: &Key, mods: Mods) -> Option<PaneKind> {
+    if mods.alt || mods.shift || mods.ctrl || !mods.meta {
         return None;
     }
     match key {
-        Key::Character(c) if c.as_str() == "1" => Some(AppPage::Editor),
-        Key::Character(c) if c.as_str() == "3" => Some(AppPage::GitClient),
-        Key::Character(c) if c.as_str() == "," => Some(AppPage::Settings),
+        Key::Character(c) if c.as_str() == "3" => Some(PaneKind::GitDiff),
+        Key::Character(c) if c.as_str() == "," => Some(PaneKind::Settings),
+        Key::Character(c) if c.as_str() == "1" => Some(PaneKind::Nvim),
         _ => None,
     }
 }
