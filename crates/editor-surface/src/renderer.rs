@@ -419,6 +419,7 @@ impl Renderer {
 
     /// Render nvim content into `target_view` (offscreen texture or swapchain view).
     /// Does not present — caller is responsible for presentation.
+    /// Returns nvim's background clear color so the caller can use it for the swapchain clear.
     pub fn render_to_view(
         &mut self,
         store: &GridStateStore,
@@ -429,7 +430,7 @@ impl Renderer {
         target_view: &wgpu::TextureView,
         target_w: u32,
         target_h: u32,
-    ) -> Result<()> {
+    ) -> Result<[f32; 4]> {
         let shake = anim.shake_offset();
         let (lw, lh) = self.logical_size();
         let globals = Globals {
@@ -497,12 +498,14 @@ impl Renderer {
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        Ok(())
+        Ok(lists.clear)
     }
 
     /// Acquire the swapchain frame, run `ui_cb` (ImGui) into it, and present.
+    /// `clear_color` should be nvim's background color (from `render_to_view` return value).
     pub fn present(
         &mut self,
+        clear_color: [f32; 4],
         mut ui_cb: impl FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
     ) -> Result<()> {
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -530,7 +533,12 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color[0] as f64,
+                            g: clear_color[1] as f64,
+                            b: clear_color[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

@@ -561,14 +561,16 @@ impl State {
         self.anim.update(dt, &self.store, cw, ch);
 
         // Step 1: render nvim into the offscreen texture (if on editor page).
+        // Render with offset [0,0] — the texture origin IS the nvim area origin.
+        let mut nvim_clear_color = [0.0f32; 4];
         if current_page == AppPage::Editor {
-            let editor_rect = [main_rect.x, main_rect.y, main_rect.w, main_rect.h];
+            let editor_rect = [0.0, 0.0, main_rect.w, main_rect.h];
             if let Some(tex_view) = self.imgui.nvim_texture_view_arc() {
                 let (tex_w, tex_h) = self
                     .imgui
                     .nvim_texture_size()
                     .unwrap_or((self.renderer.logical_size().0 as u32, self.renderer.logical_size().1 as u32));
-                if let Err(e) = self.renderer.render_to_view(
+                match self.renderer.render_to_view(
                     &self.store,
                     &mut self.anim,
                     overlay.as_deref(),
@@ -578,13 +580,16 @@ impl State {
                     tex_w,
                     tex_h,
                 ) {
-                    tracing::error!("nvim render error: {e}");
+                    Ok(clear) => nvim_clear_color = clear,
+                    Err(e) => tracing::error!("nvim render error: {e}"),
                 }
             }
         }
 
         // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
         let nvim_texture_id = self.imgui.nvim_texture_id();
+        let nvim_tex_size = self.imgui.nvim_texture_size().unwrap_or((1, 1));
+        let nvim_scale = self.renderer.scale();
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let mut project_selection = None;
@@ -600,7 +605,8 @@ impl State {
                 .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
                     if current_page == AppPage::Editor {
                         if let Some(tid) = nvim_texture_id {
-                            nvim_view::NvimView::new(tid).draw(ui, main_rect);
+                            let (tw, th) = nvim_tex_size;
+                            nvim_view::NvimView::new(tid, tw, th).draw(ui, main_rect, nvim_scale);
                         }
                         context_action = context_menu.draw(ui);
                     }
@@ -623,7 +629,7 @@ impl State {
         // Step 3: present — ImGui renders into the swapchain surface.
         let imgui = &mut self.imgui;
         let renderer = &mut self.renderer;
-        if let Err(e) = renderer.present(|device, queue, pass| {
+        if let Err(e) = renderer.present(nvim_clear_color, |device, queue, pass| {
             if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
                 tracing::warn!("imgui draw failed: {e:#}");
             }
