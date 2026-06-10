@@ -417,6 +417,135 @@ impl Renderer {
         Ok(())
     }
 
+    /// Render nvim content into `target_view` (offscreen texture or swapchain view).
+    /// Does not present — caller is responsible for presentation.
+    pub fn render_to_view(
+        &mut self,
+        store: &GridStateStore,
+        anim: &mut AnimationState,
+        overlay: Option<&str>,
+        editor_rect: [f32; 4],
+        hide_cursor: bool,
+        target_view: &wgpu::TextureView,
+        target_w: u32,
+        target_h: u32,
+    ) -> Result<()> {
+        let shake = anim.shake_offset();
+        let (lw, lh) = self.logical_size();
+        let globals = Globals {
+            resolution: [lw, lh],
+            offset: [editor_rect[0] + shake[0], editor_rect[1] + shake[1]],
+        };
+        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+
+        sync_float_cache(store, &mut self.float_cache);
+
+        let mut lists: DrawLists = FrameBuilder::build(
+            store,
+            anim,
+            &mut self.atlas,
+            &self.queue,
+            &self.float_cache,
+            hide_cursor,
+        );
+        for id in anim.fading_out_float_ids() {
+            if anim.float_opacity(id) <= 0.01 {
+                self.float_cache.remove(&id);
+            }
+        }
+        if let Some(text) = overlay {
+            self.push_overlay(&mut lists, text, editor_rect);
+        }
+
+        self.rect_buf.upload(&self.device, &self.queue, "rect-instances", &lists.rects);
+        self.quad_buf.upload(&self.device, &self.queue, "quad-instances", &lists.quads);
+        self.glyph_buf.upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nvim-pass") });
+        {
+            let clear = lists.clear;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nvim-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0] as f64,
+                            g: clear[1] as f64,
+                            b: clear[2] as f64,
+                            a: clear[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let editor_clip = editor_clip_rect(editor_rect);
+            if lists.batches.is_empty() {
+                draw_all_instances(&mut pass, self, &lists, target_w, target_h, editor_clip);
+            } else {
+                draw_batched(&mut pass, self, &lists, target_w, target_h, editor_clip);
+                draw_unbatched_tail(&mut pass, self, &lists, target_w, target_h, editor_clip);
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
+
+    /// Acquire the swapchain frame, run `ui_cb` (ImGui) into it, and present.
+    pub fn present(
+        &mut self,
+        mut ui_cb: impl FnMut(&wgpu::Device, &wgpu::Queue, &mut wgpu::RenderPass<'_>),
+    ) -> Result<()> {
+        use wgpu::CurrentSurfaceTexture as Cst;
+        let frame = match self.surface.get_current_texture() {
+            Cst::Success(f) | Cst::Suboptimal(f) => f,
+            Cst::Outdated | Cst::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                match self.surface.get_current_texture() {
+                    Cst::Success(f) | Cst::Suboptimal(f) => f,
+                    _ => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("present-pass") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("present-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            ui_cb(&self.device, &self.queue, &mut pass);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
     pub fn render(
         &mut self,
         store: &GridStateStore,

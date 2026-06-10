@@ -10,6 +10,7 @@ mod imgui_layer;
 mod imgui_theme;
 mod layout;
 mod menu_bar;
+mod nvim_view;
 mod project;
 mod project_picker;
 mod settings;
@@ -311,7 +312,14 @@ impl App {
 
         let t_imgui = Instant::now();
         let anim = AnimationState::new(self.settings.animation_config());
-        let imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
+        let mut imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
+        let phys_size = window.inner_size();
+        imgui.register_nvim_texture(
+            renderer.device(),
+            phys_size.width.max(1),
+            phys_size.height.max(1),
+            renderer.surface_format(),
+        );
         tracing::info!(
             "startup: imgui ready (+{:.1}ms, imgui={:.1}ms)",
             t0.elapsed().as_secs_f64() * 1000.0,
@@ -545,6 +553,38 @@ impl State {
         let main_rect = layout.compute(editor_area_rect);
         self.recompute_grid(settings, layout);
 
+        let cursor = cursor_logical(self);
+        let cursor_in_editor =
+            current_page == AppPage::Editor && main_rect.contains(cursor.0, cursor.1);
+        let hide_cursor = !cursor_in_editor;
+
+        self.anim.update(dt, &self.store, cw, ch);
+
+        // Step 1: render nvim into the offscreen texture (if on editor page).
+        if current_page == AppPage::Editor {
+            let editor_rect = [main_rect.x, main_rect.y, main_rect.w, main_rect.h];
+            if let Some(tex_view) = self.imgui.nvim_texture_view_arc() {
+                let (tex_w, tex_h) = self
+                    .imgui
+                    .nvim_texture_size()
+                    .unwrap_or((self.renderer.logical_size().0 as u32, self.renderer.logical_size().1 as u32));
+                if let Err(e) = self.renderer.render_to_view(
+                    &self.store,
+                    &mut self.anim,
+                    overlay.as_deref(),
+                    editor_rect,
+                    hide_cursor,
+                    &tex_view,
+                    tex_w,
+                    tex_h,
+                ) {
+                    tracing::error!("nvim render error: {e}");
+                }
+            }
+        }
+
+        // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
+        let nvim_texture_id = self.imgui.nvim_texture_id();
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
         let mut project_selection = None;
@@ -558,6 +598,12 @@ impl State {
         if let Err(e) =
             self.imgui
                 .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
+                    if current_page == AppPage::Editor {
+                        if let Some(tid) = nvim_texture_id {
+                            nvim_view::NvimView::new(tid).draw(ui, main_rect);
+                        }
+                        context_action = context_menu.draw(ui);
+                    }
                     if current_page == AppPage::GitClient {
                         git_wants_redraw |= git_client.draw(ui, main_rect);
                     }
@@ -568,63 +614,21 @@ impl State {
                             menu_action = settings_action;
                         }
                     }
-                    if current_page == AppPage::Editor {
-                        context_action = context_menu.draw(ui);
-                    }
                     project_selection = project_picker.draw(ui, dt);
                 })
         {
             tracing::warn!("imgui frame failed: {e:#}");
         }
 
-        let cursor = cursor_logical(self);
-        let cursor_in_editor =
-            current_page == AppPage::Editor && main_rect.contains(cursor.0, cursor.1);
-        let editor_render_rect = if current_page == AppPage::Editor {
-            Some([main_rect.x, main_rect.y, main_rect.w, main_rect.h])
-        } else {
-            None
-        };
-        let hide_cursor = !cursor_in_editor;
-
-        self.anim.update(dt, &self.store, cw, ch);
-
-        let anim = &mut self.anim;
+        // Step 3: present — ImGui renders into the swapchain surface.
         let imgui = &mut self.imgui;
         let renderer = &mut self.renderer;
-        if let Some(editor_rect) = editor_render_rect {
-            if let Err(e) = renderer.render(
-                store,
-                anim,
-                overlay.as_deref(),
-                editor_rect,
-                hide_cursor,
-                |device, queue, pass| {
-                    if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
-                        tracing::warn!("imgui draw failed: {e:#}");
-                    }
-                },
-            ) {
-                tracing::error!("render error: {e}");
+        if let Err(e) = renderer.present(|device, queue, pass| {
+            if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
+                tracing::warn!("imgui draw failed: {e:#}");
             }
-        } else if let Err(e) = renderer.render(
-            store,
-            anim,
-            overlay.as_deref(),
-            [
-                chrome_layout.editor_rect[0],
-                chrome_layout.editor_rect[1],
-                0.0,
-                0.0,
-            ],
-            true,
-            |device, queue, pass| {
-                if let Err(e) = imgui.draw_to_pass(device, queue, pass) {
-                    tracing::warn!("imgui draw failed: {e:#}");
-                }
-            },
-        ) {
-            tracing::error!("render error: {e}");
+        }) {
+            tracing::error!("present error: {e}");
         }
         self.frame_count += 1;
         let needs_anim = self.anim.is_animating()
@@ -833,6 +837,12 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
+                state.imgui.register_nvim_texture(
+                    state.renderer.device(),
+                    size.width.max(1),
+                    size.height.max(1),
+                    state.renderer.surface_format(),
+                );
                 state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }
@@ -843,6 +853,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = state.window.inner_size();
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
+                state.imgui.register_nvim_texture(
+                    state.renderer.device(),
+                    size.width.max(1),
+                    size.height.max(1),
+                    state.renderer.surface_format(),
+                );
                 state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }

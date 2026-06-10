@@ -11,7 +11,7 @@ use imgui::{Context, FontConfig, FontGlyphRanges, FontSource, Ui};
 use nvim_core::grid::GridStateStore;
 
 use crate::imgui_theme::apply_nvim_theme;
-use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
+use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig, Texture as ImguiTexture};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::event::{Event, WindowEvent};
 use winit::window::{Window, WindowId};
@@ -39,6 +39,11 @@ pub struct ImguiLayer {
     frame_ready: bool,
     font_size_px: f32,
     hidpi: f32,
+    nvim_texture_id: Option<imgui::TextureId>,
+    /// Shared view so callers can render into the texture without borrowing
+    /// the imgui texture map.
+    nvim_texture_view: Option<Arc<wgpu::TextureView>>,
+    nvim_texture_size: Option<(u32, u32)>,
 }
 
 impl ImguiLayer {
@@ -79,7 +84,86 @@ impl ImguiLayer {
             frame_ready: false,
             font_size_px,
             hidpi,
+            nvim_texture_id: None,
+            nvim_texture_view: None,
+            nvim_texture_size: None,
         }
+    }
+
+    /// Register (or re-register on resize) the nvim offscreen texture.
+    /// Keeps an `Arc` clone of the view so callers can render into it without
+    /// borrowing the imgui texture map at the same time.
+    pub fn register_nvim_texture(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> imgui::TextureId {
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let raw = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nvim-offscreen"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }));
+        let view = Arc::new(raw.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        let sampler_desc = wgpu::SamplerDescriptor {
+            label: Some("nvim-offscreen-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        };
+        let raw_cfg = imgui_wgpu::RawTextureConfig {
+            label: Some("nvim-offscreen"),
+            sampler_desc,
+        };
+        let texture = ImguiTexture::from_raw_parts(
+            device,
+            &self.renderer,
+            raw,
+            view.clone(),
+            None,
+            Some(&raw_cfg),
+            size,
+        );
+
+        self.nvim_texture_view = Some(view);
+        self.nvim_texture_size = Some((width, height));
+
+        if let Some(old_id) = self.nvim_texture_id {
+            self.renderer.textures.replace(old_id, texture);
+            old_id
+        } else {
+            let id = self.renderer.textures.insert(texture);
+            self.nvim_texture_id = Some(id);
+            id
+        }
+    }
+
+    /// TextureId for the nvim offscreen texture (for `ui.image()`).
+    pub fn nvim_texture_id(&self) -> Option<imgui::TextureId> {
+        self.nvim_texture_id
+    }
+
+    /// Cloned `Arc` to the offscreen view — safe to hold while also mutably
+    /// borrowing the renderer, since it doesn't touch the imgui texture map.
+    pub fn nvim_texture_view_arc(&self) -> Option<Arc<wgpu::TextureView>> {
+        self.nvim_texture_view.clone()
+    }
+
+    /// Physical pixel dimensions of the registered nvim texture.
+    pub fn nvim_texture_size(&self) -> Option<(u32, u32)> {
+        self.nvim_texture_size
     }
 
     pub fn handle_event(&mut self, window: &Window, window_id: WindowId, event: &WindowEvent) {
