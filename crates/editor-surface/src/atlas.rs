@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use etagere::{size2, AtlasAllocator};
 use fontdue::{Font, FontSettings};
 
-use crate::fonts::load_editor_font;
+use crate::fonts::{load_editor_font, load_unicode_fallback_font};
 use crate::nerd_glyphs::is_nerd_glyph;
 
 static SYMBOLS_NERD_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
@@ -33,6 +33,9 @@ pub struct GlyphAtlas {
     /// Bundled Symbols Nerd Font Mono for icon fallback when the primary font
     /// lacks Nerd Font glyphs.
     symbols: Font,
+    /// System Unicode fallback (e.g. Menlo) for common symbols/dingbats that
+    /// neither the primary font nor Symbols Nerd Font covers (e.g. U+279C, U+2717).
+    unicode_fallback: Option<Font>,
     /// Logical font size in px.
     pub size_px: f32,
     pub scale: f32,
@@ -58,10 +61,12 @@ impl GlyphAtlas {
     ) -> Result<Self> {
         let font = load_editor_font(font_family)?;
         let symbols = load_symbols_font()?;
+        let unicode_fallback = load_unicode_fallback_font();
         let (texture, view, sampler) = create_atlas_texture(device);
         let mut atlas = GlyphAtlas {
             font,
             symbols,
+            unicode_fallback,
             size_px,
             scale,
             cell_w: 0.0,
@@ -154,6 +159,11 @@ impl GlyphAtlas {
         }
         if is_nerd_glyph(ch) && font_has_glyph(&self.symbols, ch) {
             return &self.symbols;
+        }
+        if let Some(fb) = &self.unicode_fallback {
+            if font_has_glyph(fb, ch) {
+                return fb;
+            }
         }
         &self.font
     }

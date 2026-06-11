@@ -79,11 +79,15 @@ impl TermSession {
             cell_height: cell_h,
         };
 
+        let mut env = std::collections::HashMap::new();
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
+
         let options = Options {
             shell: shell.map(|s| Shell::new(s, vec![])),
             working_directory: std::env::current_dir().ok(),
             drain_on_exit: true,
-            env: std::collections::HashMap::new(),
+            env,
         };
 
         let pty = tty::new(&options, window_size, 0)?;

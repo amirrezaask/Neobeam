@@ -71,6 +71,45 @@ pub fn estimate_cell_size(
     Ok((cell_w, cell_h))
 }
 
+/// Load a system Unicode fallback font that covers common non-ASCII symbol ranges
+/// (dingbats, arrows, etc.) that patched Nerd Fonts don't include.
+/// Tries a prioritized list; returns the first one that loads successfully.
+pub fn load_unicode_fallback_font() -> Option<Font> {
+    let db = system_font_db();
+    let candidates = [
+        "Menlo",
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Courier New",
+    ];
+    for name in candidates {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(name)],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        };
+        if let Some(id) = db.query(&query) {
+            let font = db
+                .with_face_data(id, |data, index| {
+                    Font::from_bytes(
+                        data,
+                        FontSettings {
+                            collection_index: index,
+                            ..FontSettings::default()
+                        },
+                    )
+                    .ok()
+                })
+                .flatten();
+            if font.is_some() {
+                return font;
+            }
+        }
+    }
+    None
+}
+
 /// Monospace font family names installed on this system, sorted alphabetically.
 pub fn list_monospace_fonts() -> Vec<String> {
     let db = system_font_db();

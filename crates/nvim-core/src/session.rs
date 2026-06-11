@@ -38,6 +38,10 @@ fn nvim_executable() -> PathBuf {
 fn nvim_embed_command(working_dir: Option<&PathBuf>) -> Command {
     let mut cmd = Command::new(nvim_executable());
     cmd.arg("--embed");
+    // Tell neovim it's inside a true-color terminal so it skips DSR background-color
+    // probing (the E1568 "Terminal did not respond" warning).
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
