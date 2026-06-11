@@ -34,6 +34,9 @@ impl NvimView {
             (rect.w * scale) / self.tex_w as f32,
             (rect.h * scale) / self.tex_h as f32,
         ];
+        let _pad = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
+        let _border = ui.push_style_var(imgui::StyleVar::WindowBorderSize(0.0));
+        let _spacing = ui.push_style_var(imgui::StyleVar::ItemSpacing([0.0, 0.0]));
         ui.window("##nvim_view")
             .position([rect.x, rect.y], imgui::Condition::Always)
             .size([rect.w, rect.h], imgui::Condition::Always)

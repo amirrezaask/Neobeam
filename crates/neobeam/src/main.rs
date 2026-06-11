@@ -32,7 +32,7 @@ use app_page::AppPage;
 use arboard::Clipboard;
 use component_picker::ComponentPicker;
 use context_menu::{ContextMenu, ContextMenuAction, ContextMenuCommand};
-use editor_surface::{AnimationState, ChromeLayout, Renderer};
+use editor_surface::{AnimationState, ChromeLayout, Renderer, TermScrollStore};
 use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use layout::{Rect, SimpleLayout};
@@ -79,6 +79,8 @@ struct State {
     session: NvimSession,
     store: GridStateStore,
     anim: AnimationState,
+    term_anims: TermScrollStore,
+    term_last_gen: HashMap<PaneId, u64>,
     last_frame: Instant,
     frame_count: u64,
     #[cfg(debug_assertions)]
@@ -425,6 +427,8 @@ impl App {
             }
             if let Some(state) = self.state.as_mut() {
                 state.imgui.remove_terminal_texture(id.0);
+                state.term_anims.remove(id.0);
+                state.term_last_gen.remove(&id);
             }
         }
         for id in live {
@@ -566,6 +570,8 @@ impl App {
             session,
             store: GridStateStore::new(),
             anim,
+            term_anims: TermScrollStore::new(),
+            term_last_gen: HashMap::new(),
             last_frame: Instant::now(),
             frame_count: 0,
             #[cfg(debug_assertions)]
@@ -872,8 +878,9 @@ impl State {
                 }
             }
         }
-        if current_page == AppPage::Editor {
+        let term_anim_active = if current_page == AppPage::Editor {
             let physical_size = self.window.inner_size();
+            let focused_pane = pane_tree.focused;
             for leaf in target_leaves
                 .iter()
                 .filter(|leaf| leaf.kind == PaneKind::Terminal)
@@ -885,6 +892,36 @@ impl State {
                 let cols = ((term_rect.w / cw).floor() as u16).max(1);
                 let rows = ((term_rect.h / ch).floor() as u16).max(1);
                 session.resize(cols, rows);
+                let gen = session.generation();
+                let animating = self
+                    .term_anims
+                    .get(leaf.id.0)
+                    .is_some_and(|s| s.is_animating(&self.anim.cfg));
+                let dirty = self.term_last_gen.get(&leaf.id) != Some(&gen);
+                if dirty {
+                    self.term_anims
+                        .sync(leaf.id.0, session.grid.snapshot(), &self.anim.cfg);
+                    self.term_last_gen.insert(leaf.id, gen);
+                } else if !animating {
+                    continue;
+                }
+            }
+            let anim_active = self.term_anims.animate_all(&self.anim.cfg, dt, cw, ch);
+            for leaf in target_leaves
+                .iter()
+                .filter(|leaf| leaf.kind == PaneKind::Terminal)
+            {
+                let Some(session) = term_sessions.get(&leaf.id) else {
+                    continue;
+                };
+                let gen = session.generation();
+                let animating = self
+                    .term_anims
+                    .get(leaf.id.0)
+                    .is_some_and(|s| s.is_animating(&self.anim.cfg));
+                if self.term_last_gen.get(&leaf.id) != Some(&gen) && !animating {
+                    continue;
+                }
                 let desired = (physical_size.width.max(1), physical_size.height.max(1));
                 if self.imgui.terminal_texture_size(leaf.id.0) != Some(desired) {
                     self.imgui.register_terminal_texture(
@@ -898,16 +935,24 @@ impl State {
                 let Some(tex_view) = self.imgui.terminal_texture_view_arc(leaf.id.0) else {
                     continue;
                 };
+                let Some(term_anim) = self.term_anims.get(leaf.id.0) else {
+                    continue;
+                };
+                let term_focused = leaf.id == focused_pane;
                 if let Err(e) = self.renderer.render_term_to_view(
-                    &session.grid,
+                    term_anim,
                     &tex_view,
                     desired.0,
                     desired.1,
+                    term_focused,
                 ) {
                     tracing::error!("terminal render error: {e}");
                 }
             }
-        }
+            anim_active
+        } else {
+            false
+        };
 
         // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
         let nvim_texture_id = self.imgui.nvim_texture_id();
@@ -1044,7 +1089,9 @@ impl State {
         let needs_anim = self.anim.is_animating()
             || (!hide_cursor && self.anim.is_blinking(&self.store))
             || self.anim.render_deadline().is_some()
-            || pane_anim_active;
+            || pane_anim_active
+            || term_anim_active
+            || self.term_anims.is_animating(&self.anim.cfg);
         if self.context_menu.open
             || project_picker.is_open()
             || component_picker.is_open()
@@ -2094,6 +2141,7 @@ impl ApplicationHandler<UserEvent> for App {
             || (self.current_page == AppPage::Editor
                 && imgui_captures_input(state, self.current_page, picker_open))
             || state.anim.is_animating()
+            || state.term_anims.is_animating(&state.anim.cfg)
             || (self.current_page == AppPage::Editor && state.anim.is_blinking(&state.store));
 
         if needs_continuous {

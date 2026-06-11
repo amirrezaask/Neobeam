@@ -527,10 +527,11 @@ impl Renderer {
     /// Uses the same GPU pipelines as `render_to_view`; no new shaders needed.
     pub fn render_term_to_view(
         &mut self,
-        grid: &terminal_core::TermGrid<terminal_core::TermListener>,
+        state: &crate::term_scroll::TermScrollState,
         target_view: &wgpu::TextureView,
         target_w: u32,
         target_h: u32,
+        focused: bool,
     ) -> Result<[f32; 4]> {
         let (lw, lh) = self.logical_size();
         let globals = Globals {
@@ -543,12 +544,13 @@ impl Renderer {
         let cell_w = self.atlas.cell_w;
         let cell_h = self.atlas.cell_h;
         let lists = crate::term_frame::TermFrameBuilder::build(
-            grid,
+            state,
             &mut self.atlas,
             &self.queue,
             [0.0, 0.0],
             cell_w,
             cell_h,
+            focused,
         );
 
         self.rect_buf.upload(

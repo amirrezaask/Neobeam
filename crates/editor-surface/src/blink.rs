@@ -135,3 +135,78 @@ impl Default for BlinkStatus {
         Self::new()
     }
 }
+
+/// Standalone cursor blink for terminal panes (530 ms on / off).
+pub struct TerminalBlink {
+    state: BlinkState,
+    transition_time: Instant,
+    cursor_key: (usize, usize),
+}
+
+impl TerminalBlink {
+    const ON_MS: u32 = 530;
+    const OFF_MS: u32 = 530;
+
+    pub fn new() -> Self {
+        Self {
+            state: BlinkState::On,
+            transition_time: Instant::now() + Duration::from_millis(Self::ON_MS as u64),
+            cursor_key: (usize::MAX, usize::MAX),
+        }
+    }
+
+    fn delay(&self) -> Duration {
+        let ms = match self.state {
+            BlinkState::Waiting => 0,
+            BlinkState::Off => Self::OFF_MS,
+            BlinkState::On => Self::ON_MS,
+        };
+        Duration::from_millis(ms as u64)
+    }
+
+    pub fn update(&mut self, cursor: (usize, usize)) -> ShouldRender {
+        let now = Instant::now();
+        if cursor != self.cursor_key {
+            self.cursor_key = cursor;
+            self.state = BlinkState::On;
+            self.transition_time = now + Duration::from_millis(Self::ON_MS as u64);
+        }
+
+        if self.transition_time <= now {
+            self.state = match self.state {
+                BlinkState::Waiting | BlinkState::On => BlinkState::Off,
+                BlinkState::Off => BlinkState::On,
+            };
+            self.transition_time = now + self.delay();
+            return ShouldRender::Immediately;
+        }
+
+        ShouldRender::Deadline(self.transition_time)
+    }
+
+    pub fn opacity(&self) -> f32 {
+        if self.state == BlinkState::Off {
+            0.0
+        } else {
+            1.0
+        }
+    }
+
+    pub fn should_render(&self) -> bool {
+        self.opacity() > 0.01
+    }
+
+    pub fn blink_deadline(&self) -> Option<Instant> {
+        if self.transition_time > Instant::now() {
+            Some(self.transition_time)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for TerminalBlink {
+    fn default() -> Self {
+        Self::new()
+    }
+}

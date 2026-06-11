@@ -1,5 +1,6 @@
 //! PTY spawning and event loop management.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -22,6 +23,7 @@ pub type RedrawCallback = Arc<dyn Fn() + Send + Sync>;
 pub struct TermListener {
     cb: RedrawCallback,
     metadata: Arc<Mutex<TermMetadata>>,
+    generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -42,6 +44,7 @@ impl EventListener for TermListener {
             _ => {}
         }
         drop(metadata);
+        self.generation.fetch_add(1, Ordering::Relaxed);
         (self.cb)();
     }
 }
@@ -52,6 +55,7 @@ pub struct TermSession {
     cols: u16,
     rows: u16,
     metadata: Arc<Mutex<TermMetadata>>,
+    generation: Arc<AtomicU64>,
     /// Shared terminal state; hand this to the renderer.
     pub grid: Arc<TermGrid<TermListener>>,
 }
@@ -78,9 +82,11 @@ impl TermSession {
         let pty = tty::new(&options, window_size, 0)?;
 
         let metadata = Arc::new(Mutex::new(TermMetadata::default()));
+        let generation = Arc::new(AtomicU64::new(0));
         let listener = TermListener {
             cb,
             metadata: metadata.clone(),
+            generation: generation.clone(),
         };
         let size = TermSize::new(cols as usize, rows as usize);
         let term = Term::new(Config::default(), &size, listener.clone());
@@ -101,8 +107,14 @@ impl TermSession {
             cols,
             rows,
             metadata,
+            generation,
             grid,
         })
+    }
+
+    /// Monotonic counter bumped on PTY output, scroll, and resize.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Send bytes to the PTY (keyboard input, paste, etc.).
@@ -130,6 +142,7 @@ impl TermSession {
 
     pub fn scroll(&self, lines: i32) {
         self.grid.scroll(lines);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn selection_text(&self) -> Option<String> {
@@ -167,6 +180,7 @@ impl TermSession {
         }
         self.cols = cols;
         self.rows = rows;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let _ = self.sender.send(Msg::Resize(WindowSize {
             num_cols: cols,
             num_lines: rows,

@@ -9,11 +9,11 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as VteColor, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color as VteColor, CursorShape as VteCursorShape, NamedColor, Rgb};
 use std::sync::Arc;
 
 /// RGBA color resolved from a terminal cell's color attribute.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermColor {
     pub r: u8,
     pub g: u8,
@@ -32,7 +32,7 @@ impl TermColor {
 }
 
 /// Minimal cell data exposed to the renderer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermCell {
     pub ch: char,
     pub zerowidth: Vec<char>,
@@ -59,6 +59,43 @@ pub enum Underline {
     Curl,
     Dotted,
     Dashed,
+}
+
+pub type TermRow = Vec<TermCell>;
+
+/// Terminal cursor shape (mirrors VTE / DECSCUSR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TermCursorShape {
+    #[default]
+    Block,
+    Underline,
+    Beam,
+    HollowBlock,
+    Hidden,
+}
+
+impl TermCursorShape {
+    pub fn from_vte(shape: VteCursorShape) -> Self {
+        match shape {
+            VteCursorShape::Block => Self::Block,
+            VteCursorShape::Underline => Self::Underline,
+            VteCursorShape::Beam => Self::Beam,
+            VteCursorShape::HollowBlock => Self::HollowBlock,
+            VteCursorShape::Hidden => Self::Hidden,
+        }
+    }
+}
+
+/// Consistent copy of all terminal state needed by the renderer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermViewport {
+    pub rows: Vec<TermRow>,
+    pub cursor: (usize, usize),
+    pub cursor_visible: bool,
+    pub cursor_shape: TermCursorShape,
+    pub default_fg: TermColor,
+    pub default_bg: TermColor,
+    pub display_offset: usize,
 }
 
 /// Resolve a `vte::ansi::Color` to an RGB triple, consulting the color table.
@@ -209,6 +246,95 @@ pub struct TermGrid<L: EventListener> {
 }
 
 impl<L: EventListener> TermGrid<L> {
+    /// Snapshot the complete visible viewport while holding the terminal lock once.
+    pub fn snapshot(&self) -> TermViewport {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let colors = content.colors;
+        let display_offset = content.display_offset as i32;
+        let default_fg = resolve_color(VteColor::Named(NamedColor::Foreground), colors, true);
+        let default_bg = resolve_color(VteColor::Named(NamedColor::Background), colors, false);
+        let cols = term.grid().columns();
+        let row_count = term.grid().screen_lines();
+        let blank = TermCell {
+            ch: ' ',
+            zerowidth: Vec::new(),
+            fg: default_fg,
+            bg: default_bg,
+            bold: false,
+            italic: false,
+            dim: false,
+            hidden: false,
+            inverse: false,
+            strikeout: false,
+            wide: false,
+            spacer: false,
+            underline: Underline::None,
+            underline_color: None,
+            selected: false,
+        };
+        let mut rows = vec![vec![blank; cols]; row_count];
+
+        for cell in content.display_iter {
+            let row = cell.point.line.0 + display_offset;
+            let col = cell.point.column.0;
+            if row < 0 || row as usize >= rows.len() || col >= cols {
+                continue;
+            }
+            let fg = resolve_color(cell.fg, colors, true);
+            let bg = resolve_color(cell.bg, colors, false);
+            rows[row as usize][col] = TermCell {
+                ch: cell.c,
+                zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
+                fg,
+                bg,
+                bold: cell.flags.contains(Flags::BOLD),
+                italic: cell.flags.contains(Flags::ITALIC),
+                dim: cell.flags.contains(Flags::DIM),
+                hidden: cell.flags.contains(Flags::HIDDEN),
+                inverse: cell.flags.contains(Flags::INVERSE),
+                strikeout: cell.flags.contains(Flags::STRIKEOUT),
+                wide: cell.flags.contains(Flags::WIDE_CHAR),
+                spacer: cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                underline: if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+                    Underline::Double
+                } else if cell.flags.contains(Flags::UNDERCURL) {
+                    Underline::Curl
+                } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
+                    Underline::Dotted
+                } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
+                    Underline::Dashed
+                } else if cell.flags.contains(Flags::UNDERLINE) {
+                    Underline::Single
+                } else {
+                    Underline::None
+                },
+                underline_color: cell
+                    .underline_color()
+                    .map(|color| resolve_color(color, colors, true)),
+                selected: content
+                    .selection
+                    .is_some_and(|selection| selection.contains(cell.point)),
+            };
+        }
+
+        let cursor_shape = TermCursorShape::from_vte(content.cursor.shape);
+        TermViewport {
+            rows,
+            cursor: (
+                content.cursor.point.line.0.max(0) as usize,
+                content.cursor.point.column.0,
+            ),
+            cursor_visible: cursor_shape != TermCursorShape::Hidden,
+            cursor_shape,
+            default_fg,
+            default_bg,
+            display_offset: content.display_offset,
+        }
+    }
+
     /// Call `f` with every visible cell, in row-major order.
     pub fn with_cells<F>(&self, mut f: F)
     where

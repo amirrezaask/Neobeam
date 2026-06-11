@@ -14,6 +14,7 @@ pub mod renderer;
 pub mod ring_buffer;
 pub mod spring;
 pub mod term_frame;
+pub mod term_scroll;
 pub mod window_render;
 
 pub use animation::{AnimationConfig, AnimationState};
@@ -28,3 +29,4 @@ pub use frame::{
 };
 pub use renderer::Renderer;
 pub use spring::Spring;
+pub use term_scroll::{TermScrollState, TermScrollStore};
