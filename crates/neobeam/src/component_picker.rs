@@ -9,6 +9,7 @@ const ITEMS: &[(PaneKind, &str, &str)] = &[
     (PaneKind::Nvim, "Editor", "Neovim editor surface"),
     (PaneKind::GitDiff, "Git", "Git status and diff viewer"),
     (PaneKind::Settings, "Settings", "Neobeam settings"),
+    (PaneKind::Terminal, "Terminal", "Embedded shell"),
 ];
 
 pub struct ComponentPicker {
@@ -21,7 +22,11 @@ pub struct ComponentPicker {
 
 impl ComponentPicker {
     pub fn new() -> Self {
-        Self { open: false, selected: 0, swallow_frames: 0 }
+        Self {
+            open: false,
+            selected: 0,
+            swallow_frames: 0,
+        }
     }
 
     pub fn open(&mut self) {

@@ -5,6 +5,7 @@ members = [
     "crates/editor-surface",
     "crates/git-core",
     "crates/neobeam",
+    "crates/terminal-core",
 ]
 
 [workspace.package]

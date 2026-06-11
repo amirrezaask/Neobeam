@@ -13,8 +13,8 @@ use winit::window::Window;
 use crate::animation::AnimationState;
 use crate::atlas::GlyphAtlas;
 use crate::frame::{
-    DrawBatch, DrawLists, FloatCache, FrameBuilder, GlyphInstance, QuadInstance, RectInstance,
-    ScissorRect, sync_float_cache,
+    sync_float_cache, DrawBatch, DrawLists, FloatCache, FrameBuilder, GlyphInstance, QuadInstance,
+    RectInstance, ScissorRect,
 };
 
 #[repr(C)]
@@ -40,7 +40,13 @@ impl InstanceBuffer {
         InstanceBuffer { buffer, capacity }
     }
 
-    fn upload<T: Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &[T]) {
+    fn upload<T: Pod>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &str,
+        data: &[T],
+    ) {
         let bytes: &[u8] = bytemuck::cast_slice(data);
         if bytes.len() as u64 > self.capacity {
             let new_cap = (bytes.len() as u64).next_power_of_two().max(1024);
@@ -180,7 +186,8 @@ impl Renderer {
 
         // Atlas (group 1).
         let atlas = GlyphAtlas::new(&device, font_family, font_size, line_height, scale)?;
-        let atlas_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let atlas_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atlas-layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -362,7 +369,10 @@ impl Renderer {
     }
 
     pub fn logical_size(&self) -> (f32, f32) {
-        (self.config.width as f32 / self.scale, self.config.height as f32 / self.scale)
+        (
+            self.config.width as f32 / self.scale,
+            self.config.height as f32 / self.scale,
+        )
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -390,7 +400,12 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         if (scale - self.scale).abs() > f32::EPSILON {
             self.scale = scale;
-            self.atlas.reconfigure(&self.device, self.atlas.size_px, self.atlas.line_height, scale);
+            self.atlas.reconfigure(
+                &self.device,
+                self.atlas.size_px,
+                self.atlas.line_height,
+                scale,
+            );
             self.atlas_bind_group =
                 make_atlas_bind_group(&self.device, &self.atlas_bind_group_layout, &self.atlas);
         }
@@ -398,7 +413,8 @@ impl Renderer {
 
     /// Change font size/family/line-height; resets the atlas (§13.7).
     pub fn set_font(&mut self, size_px: f32, line_height: f32) {
-        self.atlas.reconfigure(&self.device, size_px, line_height, self.scale);
+        self.atlas
+            .reconfigure(&self.device, size_px, line_height, self.scale);
         self.atlas_bind_group =
             make_atlas_bind_group(&self.device, &self.atlas_bind_group_layout, &self.atlas);
     }
@@ -437,7 +453,8 @@ impl Renderer {
             resolution: [lw, lh],
             offset: [editor_rect[0] + shake[0], editor_rect[1] + shake[1]],
         };
-        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        self.queue
+            .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         sync_float_cache(store, &mut self.float_cache);
 
@@ -458,13 +475,18 @@ impl Renderer {
             self.push_overlay(&mut lists, text, editor_rect);
         }
 
-        self.rect_buf.upload(&self.device, &self.queue, "rect-instances", &lists.rects);
-        self.quad_buf.upload(&self.device, &self.queue, "quad-instances", &lists.quads);
-        self.glyph_buf.upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
+        self.rect_buf
+            .upload(&self.device, &self.queue, "rect-instances", &lists.rects);
+        self.quad_buf
+            .upload(&self.device, &self.queue, "quad-instances", &lists.quads);
+        self.glyph_buf
+            .upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nvim-pass") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nvim-pass"),
+            });
         {
             let clear = lists.clear;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -501,6 +523,82 @@ impl Renderer {
         Ok(lists.clear)
     }
 
+    /// Render a terminal pane's cell grid into an offscreen texture view.
+    /// Uses the same GPU pipelines as `render_to_view`; no new shaders needed.
+    pub fn render_term_to_view(
+        &mut self,
+        grid: &terminal_core::TermGrid<terminal_core::TermListener>,
+        target_view: &wgpu::TextureView,
+        target_w: u32,
+        target_h: u32,
+    ) -> Result<[f32; 4]> {
+        let (lw, lh) = self.logical_size();
+        let globals = Globals {
+            resolution: [lw, lh],
+            offset: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+
+        let cell_w = self.atlas.cell_w;
+        let cell_h = self.atlas.cell_h;
+        let lists = crate::term_frame::TermFrameBuilder::build(
+            grid,
+            &mut self.atlas,
+            &self.queue,
+            [0.0, 0.0],
+            cell_w,
+            cell_h,
+        );
+
+        self.rect_buf.upload(
+            &self.device,
+            &self.queue,
+            "term-rect-instances",
+            &lists.rects,
+        );
+        self.glyph_buf.upload(
+            &self.device,
+            &self.queue,
+            "term-glyph-instances",
+            &lists.glyphs,
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("term-pass"),
+            });
+        {
+            let clear = lists.clear;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("term-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear[0] as f64,
+                            g: clear[1] as f64,
+                            b: clear[2] as f64,
+                            a: clear[3] as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let clip = editor_clip_rect([0.0, 0.0, lw, lh]);
+            draw_all_instances(&mut pass, self, &lists, target_w, target_h, clip);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(lists.clear)
+    }
+
     /// Acquire the swapchain frame, run `ui_cb` (ImGui) into it, and present.
     /// `clear_color` should be nvim's background color (from `render_to_view` return value).
     pub fn present(
@@ -520,11 +618,15 @@ impl Renderer {
             }
             _ => return Ok(()),
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("present-pass") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("present-pass"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present-pass"),
@@ -569,7 +671,8 @@ impl Renderer {
             resolution: [lw, lh],
             offset: [editor_rect[0] + shake[0], editor_rect[1] + shake[1]],
         };
-        self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        self.queue
+            .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         sync_float_cache(store, &mut self.float_cache);
 
@@ -592,9 +695,12 @@ impl Renderer {
         // Atlas may have grown into a new texture? It only resets on font/dpi
         // change (handled elsewhere); the bind group stays valid here.
 
-        self.rect_buf.upload(&self.device, &self.queue, "rect-instances", &lists.rects);
-        self.quad_buf.upload(&self.device, &self.queue, "quad-instances", &lists.quads);
-        self.glyph_buf.upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
+        self.rect_buf
+            .upload(&self.device, &self.queue, "rect-instances", &lists.rects);
+        self.quad_buf
+            .upload(&self.device, &self.queue, "quad-instances", &lists.quads);
+        self.glyph_buf
+            .upload(&self.device, &self.queue, "glyph-instances", &lists.glyphs);
 
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -609,11 +715,15 @@ impl Renderer {
             // Timeout / Occluded / Validation: skip this frame.
             _ => return Ok(()),
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("encoder"),
+            });
         {
             let clear = lists.clear;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -727,7 +837,12 @@ fn combine_scissor(batch: Option<ScissorRect>, clip: Option<ScissorRect>) -> Opt
     }
 }
 
-fn scissor_physical(s: ScissorRect, scale: f32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
+fn scissor_physical(
+    s: ScissorRect,
+    scale: f32,
+    target_w: u32,
+    target_h: u32,
+) -> (u32, u32, u32, u32) {
     let x = (s.x as f32 * scale).round() as u32;
     let y = (s.y as f32 * scale).round() as u32;
     let w = (s.w as f32 * scale).round() as u32;
@@ -735,7 +850,14 @@ fn scissor_physical(s: ScissorRect, scale: f32, target_w: u32, target_h: u32) ->
     clamp_scissor(x, y, w.max(1), h.max(1), target_w, target_h)
 }
 
-fn clamp_scissor(x: u32, y: u32, w: u32, h: u32, target_w: u32, target_h: u32) -> (u32, u32, u32, u32) {
+fn clamp_scissor(
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> (u32, u32, u32, u32) {
     let x = x.min(target_w.saturating_sub(1));
     let y = y.min(target_h.saturating_sub(1));
     let w = w.min(target_w.saturating_sub(x)).max(1);
@@ -766,21 +888,39 @@ fn draw_all_instances(
     editor_clip: Option<ScissorRect>,
 ) {
     if !lists.rects.is_empty() {
-        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
+        apply_scissor(
+            pass,
+            combine_scissor(None, editor_clip),
+            r.scale,
+            target_w,
+            target_h,
+        );
         pass.set_pipeline(&r.rect_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
         pass.draw(0..6, 0..lists.rects.len() as u32);
     }
     if !lists.quads.is_empty() {
-        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
+        apply_scissor(
+            pass,
+            combine_scissor(None, editor_clip),
+            r.scale,
+            target_w,
+            target_h,
+        );
         pass.set_pipeline(&r.quad_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
         pass.draw(0..6, 0..lists.quads.len() as u32);
     }
     if !lists.glyphs.is_empty() {
-        apply_scissor(pass, combine_scissor(None, editor_clip), r.scale, target_w, target_h);
+        apply_scissor(
+            pass,
+            combine_scissor(None, editor_clip),
+            r.scale,
+            target_w,
+            target_h,
+        );
         pass.set_pipeline(&r.glyph_pipeline);
         pass.set_bind_group(0, &r.globals_bind_group, &[]);
         pass.set_bind_group(1, &r.atlas_bind_group, &[]);
@@ -800,7 +940,11 @@ fn draw_batched(
     let scale = r.scale;
     for batch in &lists.batches {
         match batch {
-            DrawBatch::Rects { start, count, scissor } => {
+            DrawBatch::Rects {
+                start,
+                count,
+                scissor,
+            } => {
                 if *count == 0 {
                     continue;
                 }
@@ -813,7 +957,11 @@ fn draw_batched(
                 pass.set_vertex_buffer(0, r.rect_buf.buffer.slice(..));
                 pass.draw(0..6, *start..(*start + *count));
             }
-            DrawBatch::Quads { start, count, scissor } => {
+            DrawBatch::Quads {
+                start,
+                count,
+                scissor,
+            } => {
                 if *count == 0 {
                     continue;
                 }
@@ -826,7 +974,11 @@ fn draw_batched(
                 pass.set_vertex_buffer(0, r.quad_buf.buffer.slice(..));
                 pass.draw(0..6, *start..(*start + *count));
             }
-            DrawBatch::Glyphs { start, count, scissor } => {
+            DrawBatch::Glyphs {
+                start,
+                count,
+                scissor,
+            } => {
                 if *count == 0 {
                     continue;
                 }

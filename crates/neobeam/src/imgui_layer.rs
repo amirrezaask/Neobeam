@@ -44,6 +44,9 @@ pub struct ImguiLayer {
     /// the imgui texture map.
     nvim_texture_view: Option<Arc<wgpu::TextureView>>,
     nvim_texture_size: Option<(u32, u32)>,
+    terminal_texture_id: Option<imgui::TextureId>,
+    terminal_texture_view: Option<Arc<wgpu::TextureView>>,
+    terminal_texture_size: Option<(u32, u32)>,
 }
 
 impl ImguiLayer {
@@ -70,11 +73,7 @@ impl ImguiLayer {
                 ..RendererConfig::new_srgb()
             },
         );
-        imgui_renderer.reload_font_texture(
-            &mut ctx,
-            editor.device(),
-            editor.queue(),
-        );
+        imgui_renderer.reload_font_texture(&mut ctx, editor.device(), editor.queue());
 
         ImguiLayer {
             ctx,
@@ -87,6 +86,9 @@ impl ImguiLayer {
             nvim_texture_id: None,
             nvim_texture_view: None,
             nvim_texture_size: None,
+            terminal_texture_id: None,
+            terminal_texture_view: None,
+            terminal_texture_size: None,
         }
     }
 
@@ -100,7 +102,11 @@ impl ImguiLayer {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> imgui::TextureId {
-        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
         let raw = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("nvim-offscreen"),
             size,
@@ -166,6 +172,77 @@ impl ImguiLayer {
         self.nvim_texture_size
     }
 
+    /// Register (or replace on resize) the terminal offscreen texture.
+    pub fn register_terminal_texture(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> imgui::TextureId {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let raw = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terminal-offscreen"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }));
+        let view = Arc::new(raw.create_view(&wgpu::TextureViewDescriptor::default()));
+        let raw_cfg = imgui_wgpu::RawTextureConfig {
+            label: Some("terminal-offscreen"),
+            sampler_desc: wgpu::SamplerDescriptor {
+                label: Some("terminal-offscreen-sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                ..Default::default()
+            },
+        };
+        let texture = ImguiTexture::from_raw_parts(
+            device,
+            &self.renderer,
+            raw,
+            view.clone(),
+            None,
+            Some(&raw_cfg),
+            size,
+        );
+
+        self.terminal_texture_view = Some(view);
+        self.terminal_texture_size = Some((width, height));
+        if let Some(old_id) = self.terminal_texture_id {
+            self.renderer.textures.replace(old_id, texture);
+            old_id
+        } else {
+            let id = self.renderer.textures.insert(texture);
+            self.terminal_texture_id = Some(id);
+            id
+        }
+    }
+
+    pub fn terminal_texture_id(&self) -> Option<imgui::TextureId> {
+        self.terminal_texture_id
+    }
+
+    pub fn terminal_texture_view_arc(&self) -> Option<Arc<wgpu::TextureView>> {
+        self.terminal_texture_view.clone()
+    }
+
+    pub fn terminal_texture_size(&self) -> Option<(u32, u32)> {
+        self.terminal_texture_size
+    }
+
     pub fn handle_event(&mut self, window: &Window, window_id: WindowId, event: &WindowEvent) {
         self.platform.handle_event(
             self.ctx.io_mut(),
@@ -228,9 +305,7 @@ impl ImguiLayer {
         self.sync_font_size(window.as_ref(), font_size_px, device, queue);
 
         let now = Instant::now();
-        self.ctx
-            .io_mut()
-            .update_delta_time(now - self.last_frame);
+        self.ctx.io_mut().update_delta_time(now - self.last_frame);
         self.last_frame = now;
 
         self.discard_frame();

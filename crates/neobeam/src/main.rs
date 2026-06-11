@@ -18,6 +18,7 @@ mod project;
 mod project_picker;
 mod settings;
 mod shell_env;
+mod terminal_view;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -35,8 +36,6 @@ use git_client::GitClient;
 use imgui_layer::ImguiLayer;
 use layout::{Rect, SimpleLayout};
 use menu_bar::{MenuBar, MenuBarAction};
-use pane::{FocusDir, PaneKind, PaneTree, SplitDir, SplitId};
-use pane_anim::PaneAnimStore;
 use nvim_core::grid::GridStateStore;
 use nvim_core::input::{
     encode_key, mods_string, KeyInput, Mods, MouseAction, MouseButton as CoreButton, NamedKey,
@@ -44,9 +43,12 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimBoot, NvimSession, SessionConfig, WinbarInfo};
 use nvim_core::Value;
+use pane::{FocusDir, PaneKind, PaneTree, SplitDir, SplitId};
+use pane_anim::PaneAnimStore;
 use project::Project;
 use project_picker::ProjectPicker;
 use settings::{spawn_watcher, Settings};
+use terminal_core::input::{encode as encode_term_key, TermKey};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -65,6 +67,8 @@ enum UserEvent {
     WinbarUpdated(WinbarInfo),
     /// Async colorscheme query finished during startup.
     ColorschemeUpdated(Option<String>),
+    /// Terminal content changed; schedule a redraw.
+    TermRedraw,
 }
 
 struct State {
@@ -113,6 +117,8 @@ struct App {
     /// Background nvim boot started in `App::new`.
     nvim_boot: Option<tokio::task::JoinHandle<Result<NvimBoot>>>,
     startup_t0: Instant,
+    /// Active terminal session (one per app for now).
+    term_session: Option<terminal_core::TermSession>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,7 +157,10 @@ fn imgui_captures_input(state: &State, current_page: AppPage, project_picker_ope
 }
 
 fn is_pane_kind_imgui(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::GitDiff | PaneKind::Settings | PaneKind::Empty)
+    matches!(
+        kind,
+        PaneKind::GitDiff | PaneKind::Settings | PaneKind::Terminal | PaneKind::Empty
+    )
 }
 
 fn mouse_to_nvim_blocked(
@@ -240,7 +249,36 @@ impl App {
             state: None,
             nvim_boot: Some(nvim_boot),
             startup_t0,
+            term_session: None,
         })
+    }
+
+    fn ensure_terminal_session(&mut self) {
+        if self.term_session.is_some() {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let (cw, ch) = state.renderer.cell_size();
+        let area = editor_area(&self.settings, &state.renderer);
+        let rect = self
+            .pane_tree
+            .layout(area)
+            .into_iter()
+            .find(|leaf| leaf.kind == PaneKind::Terminal)
+            .map(|leaf| leaf.rect)
+            .unwrap_or(area);
+        let cols = ((rect.w / cw).floor() as u16).max(1);
+        let rows = ((rect.h / ch).floor() as u16).max(1);
+        let proxy = self.proxy.clone();
+        let redraw = Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::TermRedraw);
+        });
+        match terminal_core::TermSession::spawn(cols, rows, None, redraw) {
+            Ok(session) => self.term_session = Some(session),
+            Err(e) => tracing::error!("terminal spawn failed: {e:#}"),
+        }
     }
 
     /// Defer theme/winbar RPCs until after the first frame is scheduled.
@@ -260,6 +298,9 @@ impl App {
     /// macOS delivers window events after `exit()` if the `Window` outlives the
     /// loop; winit then logs "no handler was set" (winit#3915).
     fn teardown(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(session) = self.term_session.take() {
+            session.shutdown();
+        }
         if let Some(mut state) = self.state.take() {
             state.session.kill();
         }
@@ -356,6 +397,12 @@ impl App {
         let mut imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
         let phys_size = window.inner_size();
         imgui.register_nvim_texture(
+            renderer.device(),
+            phys_size.width.max(1),
+            phys_size.height.max(1),
+            renderer.surface_format(),
+        );
+        imgui.register_terminal_texture(
             renderer.device(),
             phys_size.width.max(1),
             phys_size.height.max(1),
@@ -565,6 +612,7 @@ impl State {
         current_page: AppPage,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
+        mut term_session: Option<&mut terminal_core::TermSession>,
     ) -> (
         bool,
         MenuBarAction,
@@ -625,7 +673,11 @@ impl State {
                     .get(l.id)
                     .map(|a| a.render_rect())
                     .unwrap_or(l.rect);
-                pane::LeafLayout { id: l.id, kind: l.kind, rect }
+                pane::LeafLayout {
+                    id: l.id,
+                    kind: l.kind,
+                    rect,
+                }
             })
             .collect();
         // Nvim grid follows the TARGET rect (not animated) so animation
@@ -649,16 +701,16 @@ impl State {
 
         self.anim.update(dt, &self.store, cw, ch);
 
-        // Step 1: render nvim into the offscreen texture (if on editor page).
+        // Step 1: render GPU-backed pane contents into offscreen textures.
         // Render with offset [0,0] — the texture origin IS the nvim area origin.
         let mut nvim_clear_color = [0.0f32; 4];
         if current_page == AppPage::Editor {
             let editor_rect = [0.0, 0.0, nvim_anim_rect.w, nvim_anim_rect.h];
             if let Some(tex_view) = self.imgui.nvim_texture_view_arc() {
-                let (tex_w, tex_h) = self
-                    .imgui
-                    .nvim_texture_size()
-                    .unwrap_or((self.renderer.logical_size().0 as u32, self.renderer.logical_size().1 as u32));
+                let (tex_w, tex_h) = self.imgui.nvim_texture_size().unwrap_or((
+                    self.renderer.logical_size().0 as u32,
+                    self.renderer.logical_size().1 as u32,
+                ));
                 match self.renderer.render_to_view(
                     &self.store,
                     &mut self.anim,
@@ -674,10 +726,36 @@ impl State {
                 }
             }
         }
+        if current_page == AppPage::Editor {
+            if let (Some(session), Some(term_rect), Some(tex_view)) = (
+                term_session.as_deref_mut(),
+                target_leaves
+                    .iter()
+                    .find(|leaf| leaf.kind == PaneKind::Terminal)
+                    .map(|leaf| leaf.rect),
+                self.imgui.terminal_texture_view_arc(),
+            ) {
+                let cols = ((term_rect.w / cw).floor() as u16).max(1);
+                let rows = ((term_rect.h / ch).floor() as u16).max(1);
+                session.resize(cols, rows);
+                let (tex_w, tex_h) = self.imgui.terminal_texture_size().unwrap_or((
+                    self.renderer.logical_size().0 as u32,
+                    self.renderer.logical_size().1 as u32,
+                ));
+                if let Err(e) =
+                    self.renderer
+                        .render_term_to_view(&session.grid, &tex_view, tex_w, tex_h)
+                {
+                    tracing::error!("terminal render error: {e}");
+                }
+            }
+        }
 
         // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
         let nvim_texture_id = self.imgui.nvim_texture_id();
         let nvim_tex_size = self.imgui.nvim_texture_size().unwrap_or((1, 1));
+        let terminal_texture_id = self.imgui.terminal_texture_id();
+        let terminal_tex_size = self.imgui.terminal_texture_size().unwrap_or((1, 1));
         let nvim_scale = self.renderer.scale();
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
@@ -705,20 +783,25 @@ impl State {
                                 PaneKind::Nvim => {
                                     if let Some(tid) = nvim_texture_id {
                                         let (tw, th) = nvim_tex_size;
-                                        nvim_view::NvimView::new(tid, tw, th).draw(
-                                            ui, leaf.rect, nvim_scale,
-                                        );
+                                        nvim_view::NvimView::new(tid, tw, th)
+                                            .draw(ui, leaf.rect, nvim_scale);
                                     }
                                 }
                                 PaneKind::GitDiff => {
                                     git_wants_redraw |= git_client.draw(ui, leaf.rect);
                                 }
                                 PaneKind::Settings => {
-                                    let settings_action = menu_bar.draw_settings_page(
-                                        ui, settings, session, leaf.rect,
-                                    );
+                                    let settings_action = menu_bar
+                                        .draw_settings_page(ui, settings, session, leaf.rect);
                                     if menu_action == MenuBarAction::None {
                                         menu_action = settings_action;
+                                    }
+                                }
+                                PaneKind::Terminal => {
+                                    if let Some(tid) = terminal_texture_id {
+                                        let (tw, th) = terminal_tex_size;
+                                        terminal_view::TerminalView::new(tid, tw, th)
+                                            .draw(ui, leaf.rect, nvim_scale);
                                     }
                                 }
                                 PaneKind::Empty => {
@@ -846,10 +929,8 @@ fn draw_split_gutters(ui: &imgui::Ui, gutters: &[crate::pane::SplitGutter], mous
     let hot = accent(ui);
     for g in gutters {
         let r = g.rect;
-        let inside = mouse[0] >= r.x
-            && mouse[0] <= r.x + r.w
-            && mouse[1] >= r.y
-            && mouse[1] <= r.y + r.h;
+        let inside =
+            mouse[0] >= r.x && mouse[0] <= r.x + r.w && mouse[1] >= r.y && mouse[1] <= r.y + r.h;
         let color = if inside { hot } else { normal };
         match g.dir {
             SplitDir::Horizontal => {
@@ -931,6 +1012,44 @@ fn map_named(n: WinitNamed) -> Option<NamedKey> {
         WinitNamed::F12 => NamedKey::F(12),
         _ => return None,
     })
+}
+
+fn map_term_key(key: &Key, shift: bool) -> Option<TermKey> {
+    match key {
+        Key::Character(text) => text.chars().next().map(TermKey::Char),
+        Key::Named(WinitNamed::Space) => Some(TermKey::Char(' ')),
+        Key::Named(WinitNamed::Enter) => Some(TermKey::Enter),
+        Key::Named(WinitNamed::Backspace) => Some(TermKey::Backspace),
+        Key::Named(WinitNamed::Delete) => Some(TermKey::Delete),
+        Key::Named(WinitNamed::Escape) => Some(TermKey::Escape),
+        Key::Named(WinitNamed::Tab) => Some(if shift {
+            TermKey::BackTab
+        } else {
+            TermKey::Tab
+        }),
+        Key::Named(WinitNamed::ArrowUp) => Some(TermKey::Up),
+        Key::Named(WinitNamed::ArrowDown) => Some(TermKey::Down),
+        Key::Named(WinitNamed::ArrowLeft) => Some(TermKey::Left),
+        Key::Named(WinitNamed::ArrowRight) => Some(TermKey::Right),
+        Key::Named(WinitNamed::Home) => Some(TermKey::Home),
+        Key::Named(WinitNamed::End) => Some(TermKey::End),
+        Key::Named(WinitNamed::PageUp) => Some(TermKey::PageUp),
+        Key::Named(WinitNamed::PageDown) => Some(TermKey::PageDown),
+        Key::Named(WinitNamed::Insert) => Some(TermKey::Insert),
+        Key::Named(WinitNamed::F1) => Some(TermKey::F(1)),
+        Key::Named(WinitNamed::F2) => Some(TermKey::F(2)),
+        Key::Named(WinitNamed::F3) => Some(TermKey::F(3)),
+        Key::Named(WinitNamed::F4) => Some(TermKey::F(4)),
+        Key::Named(WinitNamed::F5) => Some(TermKey::F(5)),
+        Key::Named(WinitNamed::F6) => Some(TermKey::F(6)),
+        Key::Named(WinitNamed::F7) => Some(TermKey::F(7)),
+        Key::Named(WinitNamed::F8) => Some(TermKey::F(8)),
+        Key::Named(WinitNamed::F9) => Some(TermKey::F(9)),
+        Key::Named(WinitNamed::F10) => Some(TermKey::F(10)),
+        Key::Named(WinitNamed::F11) => Some(TermKey::F(11)),
+        Key::Named(WinitNamed::F12) => Some(TermKey::F(12)),
+        _ => None,
+    }
 }
 
 fn map_button(b: MouseButton) -> Option<CoreButton> {
@@ -1021,10 +1140,18 @@ impl ApplicationHandler<UserEvent> for App {
                 tracing::info!("nvim exited; closing");
                 self.teardown(event_loop);
             }
+            UserEvent::TermRedraw => {
+                if let Some(state) = self.state.as_ref() {
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(session) = self.term_session.take() {
+            session.shutdown();
+        }
         if let Some(mut state) = self.state.take() {
             state.session.kill();
         }
@@ -1041,8 +1168,6 @@ impl ApplicationHandler<UserEvent> for App {
                 .imgui
                 .handle_event(state.window.as_ref(), window_id, &event);
             let picker_open = self.project_picker.is_open();
-        let comp_open = self.component_picker.is_open();
-        let focused_kind = self.pane_tree.focused_kind();
             let redraw = state.context_menu.open
                 || picker_open
                 || imgui_captures_input(state, self.current_page, picker_open);
@@ -1069,6 +1194,12 @@ impl ApplicationHandler<UserEvent> for App {
                     size.height.max(1),
                     state.renderer.surface_format(),
                 );
+                state.imgui.register_terminal_texture(
+                    state.renderer.device(),
+                    size.width.max(1),
+                    size.height.max(1),
+                    state.renderer.surface_format(),
+                );
                 state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }
@@ -1080,6 +1211,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
                 state.imgui.register_nvim_texture(
+                    state.renderer.device(),
+                    size.width.max(1),
+                    size.height.max(1),
+                    state.renderer.surface_format(),
+                );
+                state.imgui.register_terminal_texture(
                     state.renderer.device(),
                     size.width.max(1),
                     size.height.max(1),
@@ -1108,11 +1245,15 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
-                {
+                if focused_kind != PaneKind::Terminal && self.state.as_ref().is_some_and(|s| {
+                    keyboard_to_nvim_blocked(
+                        s,
+                        self.current_page,
+                        picker_open,
+                        focused_kind,
+                        comp_open,
+                    )
+                }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -1123,7 +1264,13 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Preedit(text, _) => state.ime_active = !text.is_empty(),
                     Ime::Commit(text) => {
                         state.ime_active = false;
+                        if focused_kind == PaneKind::Terminal {
+                            if let Some(session) = self.term_session.as_ref() {
+                                session.paste(text);
+                            }
+                        } else {
                         state.session.paste(text);
+                    }
                     }
                     Ime::Disabled => state.ime_active = false,
                 }
@@ -1207,11 +1354,9 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| is_quick_component_shortcut(&event.logical_key, s.mods).is_some())
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    is_quick_component_shortcut(&event.logical_key, s.mods).is_some()
+                }) {
                     let kind = self
                         .state
                         .as_ref()
@@ -1228,13 +1373,49 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                if focused_kind == PaneKind::Terminal && !picker_open && !comp_open {
+                    let Some(state) = self.state.as_ref() else {
+                        return;
+                    };
+                    if is_paste_shortcut(&event.logical_key, state.mods) {
+                        if let (Some(text), Some(session)) =
+                            (read_clipboard_text(), self.term_session.as_ref())
+                        {
+                            session.paste(text);
+                        }
+                    } else if state.mods.meta {
+                        // Super/Command shortcuts belong to the GUI, not the PTY.
+                    } else if let (Some(key), Some(session)) = (
+                        map_term_key(&event.logical_key, state.mods.shift),
+                        self.term_session.as_ref(),
+                    ) {
+                        if let Some(bytes) = encode_term_key(
+                            key,
+                            state.mods.shift,
+                            state.mods.ctrl,
+                            state.mods.alt,
+                            session.app_cursor_mode(),
+                        ) {
+                            session.write(bytes);
+                        }
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
+
                 let paste_shortcut = self
                     .state
                     .as_ref()
                     .is_some_and(|s| is_paste_shortcut(&event.logical_key, s.mods));
                 if paste_shortcut {
                     let imgui_wants_kb = self.state.as_ref().is_some_and(|s| {
-                        keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open)
+                        keyboard_to_nvim_blocked(
+                            s,
+                            self.current_page,
+                            picker_open,
+                            focused_kind,
+                            comp_open,
+                        )
                     });
                     if !imgui_wants_kb {
                         if let Some(text) = read_clipboard_text() {
@@ -1249,11 +1430,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| keyboard_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    keyboard_to_nvim_blocked(
+                        s,
+                        self.current_page,
+                        picker_open,
+                        focused_kind,
+                        comp_open,
+                    )
+                }) {
                     return;
                 }
 
@@ -1318,7 +1503,13 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                if mouse_to_nvim_blocked(state, self.current_page, picker_open, focused_kind, comp_open) {
+                if mouse_to_nvim_blocked(
+                    state,
+                    self.current_page,
+                    picker_open,
+                    focused_kind,
+                    comp_open,
+                ) {
                     return;
                 }
                 if let Some(btn) = state.mouse_down {
@@ -1370,7 +1561,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                if mouse_to_nvim_blocked(state, self.current_page, picker_open, focused_kind, comp_open) {
+                if mouse_to_nvim_blocked(
+                    state,
+                    self.current_page,
+                    picker_open,
+                    focused_kind,
+                    comp_open,
+                ) {
                     state.window.request_redraw();
                     return;
                 }
@@ -1414,11 +1611,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| mouse_to_nvim_blocked(s, self.current_page, picker_open, focused_kind, comp_open))
-                {
+                if self.state.as_ref().is_some_and(|s| {
+                    mouse_to_nvim_blocked(
+                        s,
+                        self.current_page,
+                        picker_open,
+                        focused_kind,
+                        comp_open,
+                    )
+                }) {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -1470,12 +1671,16 @@ impl ApplicationHandler<UserEvent> for App {
                         self.current_page,
                         &mut self.git_client,
                         &mut self.project_picker,
+                        self.term_session.as_mut(),
                     )
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
                 if let Some(kind) = component_sel {
                     self.pane_tree.set_focused_kind(kind);
+                    if kind == PaneKind::Terminal {
+                        self.ensure_terminal_session();
+                    }
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }
@@ -1484,8 +1689,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.set_project(path);
                 }
                 let picker_open = self.project_picker.is_open();
-        let comp_open = self.component_picker.is_open();
-        let focused_kind = self.pane_tree.focused_kind();
                 if needs_anim {
                     if let Some(deadline) =
                         self.state.as_ref().and_then(|s| s.anim.render_deadline())
@@ -1518,8 +1721,6 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let picker_open = self.project_picker.is_open();
-        let comp_open = self.component_picker.is_open();
-        let focused_kind = self.pane_tree.focused_kind();
 
         // For git windows the event loop should stay in Wait mode when idle.
         // Redraws are triggered by the GitRefreshed user-event that the

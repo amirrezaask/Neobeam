@@ -26,6 +26,7 @@ pub enum PaneKind {
     Nvim,
     GitDiff,
     Settings,
+    Terminal,
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +109,14 @@ impl PaneTree {
     }
 
     fn gutters_node(node: &PaneNode, area: Rect, thickness: f32, out: &mut Vec<SplitGutter>) {
-        let PaneNode::Split { id, dir, ratio, a, b } = node else {
+        let PaneNode::Split {
+            id,
+            dir,
+            ratio,
+            a,
+            b,
+        } = node
+        else {
             return;
         };
         let r = ratio.clamp(0.05, 0.95);
@@ -117,22 +125,57 @@ impl PaneTree {
                 let wa = area.w * r;
                 let g_x = area.x + wa - thickness * 0.5;
                 (
-                    Rect { x: area.x, y: area.y, w: wa, h: area.h },
-                    Rect { x: area.x + wa, y: area.y, w: area.w - wa, h: area.h },
-                    Rect { x: g_x, y: area.y, w: thickness, h: area.h },
+                    Rect {
+                        x: area.x,
+                        y: area.y,
+                        w: wa,
+                        h: area.h,
+                    },
+                    Rect {
+                        x: area.x + wa,
+                        y: area.y,
+                        w: area.w - wa,
+                        h: area.h,
+                    },
+                    Rect {
+                        x: g_x,
+                        y: area.y,
+                        w: thickness,
+                        h: area.h,
+                    },
                 )
             }
             SplitDir::Vertical => {
                 let ha = area.h * r;
                 let g_y = area.y + ha - thickness * 0.5;
                 (
-                    Rect { x: area.x, y: area.y, w: area.w, h: ha },
-                    Rect { x: area.x, y: area.y + ha, w: area.w, h: area.h - ha },
-                    Rect { x: area.x, y: g_y, w: area.w, h: thickness },
+                    Rect {
+                        x: area.x,
+                        y: area.y,
+                        w: area.w,
+                        h: ha,
+                    },
+                    Rect {
+                        x: area.x,
+                        y: area.y + ha,
+                        w: area.w,
+                        h: area.h - ha,
+                    },
+                    Rect {
+                        x: area.x,
+                        y: g_y,
+                        w: area.w,
+                        h: thickness,
+                    },
                 )
             }
         };
-        out.push(SplitGutter { id: *id, dir: *dir, rect: gutter, parent_rect: area });
+        out.push(SplitGutter {
+            id: *id,
+            dir: *dir,
+            rect: gutter,
+            parent_rect: area,
+        });
         Self::gutters_node(a, ra, thickness, out);
         Self::gutters_node(b, rb, thickness, out);
     }
@@ -145,7 +188,9 @@ impl PaneTree {
     fn set_ratio_in(node: &mut PaneNode, target: SplitId, new_ratio: f32) -> bool {
         match node {
             PaneNode::Leaf { .. } => false,
-            PaneNode::Split { id, ratio, a, b, .. } => {
+            PaneNode::Split {
+                id, ratio, a, b, ..
+            } => {
                 if *id == target {
                     *ratio = new_ratio;
                     true
@@ -164,21 +209,43 @@ impl PaneTree {
                 kind: *kind,
                 rect: area,
             }),
-            PaneNode::Split { dir, ratio, a, b, .. } => {
+            PaneNode::Split {
+                dir, ratio, a, b, ..
+            } => {
                 let r = ratio.clamp(0.05, 0.95);
                 let (ra, rb) = match dir {
                     SplitDir::Horizontal => {
                         let wa = area.w * r;
                         (
-                            Rect { x: area.x, y: area.y, w: wa, h: area.h },
-                            Rect { x: area.x + wa, y: area.y, w: area.w - wa, h: area.h },
+                            Rect {
+                                x: area.x,
+                                y: area.y,
+                                w: wa,
+                                h: area.h,
+                            },
+                            Rect {
+                                x: area.x + wa,
+                                y: area.y,
+                                w: area.w - wa,
+                                h: area.h,
+                            },
                         )
                     }
                     SplitDir::Vertical => {
                         let ha = area.h * r;
                         (
-                            Rect { x: area.x, y: area.y, w: area.w, h: ha },
-                            Rect { x: area.x, y: area.y + ha, w: area.w, h: area.h - ha },
+                            Rect {
+                                x: area.x,
+                                y: area.y,
+                                w: area.w,
+                                h: ha,
+                            },
+                            Rect {
+                                x: area.x,
+                                y: area.y + ha,
+                                w: area.w,
+                                h: area.h - ha,
+                            },
                         )
                     }
                 };
@@ -208,8 +275,14 @@ impl PaneTree {
     ) -> bool {
         match node {
             PaneNode::Leaf { id, kind } if *id == target => {
-                let existing = PaneNode::Leaf { id: *id, kind: *kind };
-                let inserted = PaneNode::Leaf { id: new_id, kind: PaneKind::Empty };
+                let existing = PaneNode::Leaf {
+                    id: *id,
+                    kind: *kind,
+                };
+                let inserted = PaneNode::Leaf {
+                    id: new_id,
+                    kind: PaneKind::Empty,
+                };
                 *node = PaneNode::Split {
                     id: split_id,
                     dir,
@@ -284,7 +357,10 @@ impl PaneTree {
         if let Some(a_was_target) = child_match {
             if let PaneNode::Split { a, b, .. } = std::mem::replace(
                 node,
-                PaneNode::Leaf { id: PaneId(0), kind: PaneKind::Empty },
+                PaneNode::Leaf {
+                    id: PaneId(0),
+                    kind: PaneKind::Empty,
+                },
             ) {
                 let keep = if a_was_target { *b } else { *a };
                 *node = keep;
@@ -397,7 +473,12 @@ mod tests {
     use super::*;
 
     fn area() -> Rect {
-        Rect { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 }
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 800.0,
+        }
     }
 
     #[test]

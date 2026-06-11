@@ -11,6 +11,7 @@ etagere = "0.3.0"
 fontdb = "0.23.0"
 fontdue = "0.9.3"
 nvim-core = { version = "0.1.0", path = "../nvim-core" }
+terminal-core = { version = "0.1.0", path = "../terminal-core" }
 pollster = "0.4.0"
 tracing = "0.1.44"
 wgpu = "29.0.3"
