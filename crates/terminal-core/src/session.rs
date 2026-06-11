@@ -62,14 +62,21 @@ pub struct TermSession {
 
 impl TermSession {
     /// Spawn a shell and start the PTY reader thread.
-    pub fn spawn(cols: u16, rows: u16, shell: Option<String>, cb: RedrawCallback) -> Result<Self> {
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        cell_w: u16,
+        cell_h: u16,
+        shell: Option<String>,
+        cb: RedrawCallback,
+    ) -> Result<Self> {
         tty::setup_env();
 
         let window_size = WindowSize {
             num_cols: cols,
             num_lines: rows,
-            cell_width: 8,
-            cell_height: 16,
+            cell_width: cell_w,
+            cell_height: cell_h,
         };
 
         let options = Options {
@@ -92,11 +99,7 @@ impl TermSession {
         let term = Term::new(Config::default(), &size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let grid = Arc::new(TermGrid {
-            term: term.clone(),
-            cols,
-            rows,
-        });
+        let grid = Arc::new(TermGrid { term: term.clone() });
 
         let event_loop = EventLoop::new(term, listener, pty, true, false)?;
         let sender = event_loop.channel();
@@ -115,6 +118,14 @@ impl TermSession {
     /// Monotonic counter bumped on PTY output, scroll, and resize.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.rows
     }
 
     /// Send bytes to the PTY (keyboard input, paste, etc.).
@@ -174,18 +185,26 @@ impl TermSession {
     }
 
     /// Resize the PTY and terminal grid.
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
         if self.cols == cols && self.rows == rows {
             return;
         }
         self.cols = cols;
         self.rows = rows;
         self.generation.fetch_add(1, Ordering::Relaxed);
+        // alacritty's event loop only forwards resize to the PTY (SIGWINCH).
+        // The Term's grid must be resized directly, or snapshot keeps returning
+        // the spawn dimensions forever.
+        {
+            let size = TermSize::new(cols as usize, rows as usize);
+            let mut term = self.grid.term.lock();
+            term.resize(size);
+        }
         let _ = self.sender.send(Msg::Resize(WindowSize {
             num_cols: cols,
             num_lines: rows,
-            cell_width: 8,
-            cell_height: 16,
+            cell_width: cell_w,
+            cell_height: cell_h,
         }));
     }
 

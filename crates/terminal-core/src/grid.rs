@@ -241,8 +241,6 @@ fn indexed_fallback(idx: u8) -> Option<Rgb> {
 /// matches whatever listener the session creates.
 pub struct TermGrid<L: EventListener> {
     pub term: Arc<FairMutex<Term<L>>>,
-    pub cols: u16,
-    pub rows: u16,
 }
 
 impl<L: EventListener> TermGrid<L> {

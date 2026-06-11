@@ -385,6 +385,7 @@ impl App {
             return;
         };
         let (cw, ch) = state.renderer.cell_size();
+        let scale = state.renderer.scale();
         let area = editor_area(&self.settings, &state.renderer);
         let rect = self
             .pane_tree
@@ -395,11 +396,13 @@ impl App {
             .unwrap_or(area);
         let cols = ((rect.w / cw).floor() as u16).max(1);
         let rows = ((rect.h / ch).floor() as u16).max(1);
+        let cell_w_px = (cw * scale).round() as u16;
+        let cell_h_px = (ch * scale).round() as u16;
         let proxy = self.proxy.clone();
         let redraw = Arc::new(move || {
             let _ = proxy.send_event(UserEvent::TermRedraw);
         });
-        match terminal_core::TermSession::spawn(cols, rows, None, redraw) {
+        match terminal_core::TermSession::spawn(cols, rows, cell_w_px, cell_h_px, None, redraw) {
             Ok(session) => {
                 self.term_sessions.insert(pane_id, session);
             }
@@ -879,7 +882,6 @@ impl State {
             }
         }
         let term_anim_active = if current_page == AppPage::Editor {
-            let physical_size = self.window.inner_size();
             let focused_pane = pane_tree.focused;
             for leaf in target_leaves
                 .iter()
@@ -891,7 +893,10 @@ impl State {
                 let term_rect = leaf.rect;
                 let cols = ((term_rect.w / cw).floor() as u16).max(1);
                 let rows = ((term_rect.h / ch).floor() as u16).max(1);
-                session.resize(cols, rows);
+                let scale = self.renderer.scale();
+                let cell_w_px = (cw * scale).round() as u16;
+                let cell_h_px = (ch * scale).round() as u16;
+                session.resize(cols, rows, cell_w_px, cell_h_px);
                 let gen = session.generation();
                 let animating = self
                     .term_anims
@@ -922,7 +927,11 @@ impl State {
                 if self.term_last_gen.get(&leaf.id) != Some(&gen) && !animating {
                     continue;
                 }
-                let desired = (physical_size.width.max(1), physical_size.height.max(1));
+                let scale = self.renderer.scale();
+                let desired = (
+                    (leaf.rect.w * scale).ceil().max(1.0) as u32,
+                    (leaf.rect.h * scale).ceil().max(1.0) as u32,
+                );
                 if self.imgui.terminal_texture_size(leaf.id.0) != Some(desired) {
                     self.imgui.register_terminal_texture(
                         leaf.id.0,
@@ -944,6 +953,8 @@ impl State {
                     &tex_view,
                     desired.0,
                     desired.1,
+                    leaf.rect.w,
+                    leaf.rect.h,
                     term_focused,
                 ) {
                     tracing::error!("terminal render error: {e}");
@@ -957,17 +968,11 @@ impl State {
         // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
         let nvim_texture_id = self.imgui.nvim_texture_id();
         let nvim_tex_size = self.imgui.nvim_texture_size().unwrap_or((1, 1));
-        let terminal_textures: HashMap<PaneId, (imgui::TextureId, (u32, u32))> = target_leaves
+        let terminal_textures: HashMap<PaneId, imgui::TextureId> = target_leaves
             .iter()
             .filter(|leaf| leaf.kind == PaneKind::Terminal)
             .filter_map(|leaf| {
-                Some((
-                    leaf.id,
-                    (
-                        self.imgui.terminal_texture_id(leaf.id.0)?,
-                        self.imgui.terminal_texture_size(leaf.id.0)?,
-                    ),
-                ))
+                Some((leaf.id, self.imgui.terminal_texture_id(leaf.id.0)?))
             })
             .collect();
         let pane_alpha: HashMap<PaneId, f32> = leaves
@@ -1028,11 +1033,10 @@ impl State {
                                     }
                                 }
                                 PaneKind::Terminal => {
-                                    if let Some((tid, (tw, th))) = terminal_textures.get(&leaf.id) {
-                                        terminal_view::TerminalView::new(*tid, *tw, *th).draw(
+                                    if let Some(tid) = terminal_textures.get(&leaf.id) {
+                                        terminal_view::TerminalView::new(*tid).draw(
                                             ui,
                                             leaf.rect,
-                                            nvim_scale,
                                             pane_alpha.get(&leaf.id).copied().unwrap_or(1.0),
                                             is_focused,
                                             terminal_metadata
@@ -1041,6 +1045,7 @@ impl State {
                                             terminal_metadata
                                                 .get(&leaf.id)
                                                 .is_some_and(|metadata| metadata.exited),
+                                            leaf.id.0,
                                         );
                                     }
                                 }
@@ -1380,7 +1385,6 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
-                self.reconcile_terminal_sessions();
                 self.schedule_startup_metadata();
                 tracing::info!(
                     "startup: init complete (+{:.1}ms)",
@@ -1494,35 +1498,35 @@ impl ApplicationHandler<UserEvent> for App {
                 self.teardown(event_loop);
             }
             WindowEvent::Resized(size) => {
-                let Some(state) = self.state.as_mut() else {
-                    return;
-                };
-                let scale = state.window.scale_factor() as f32;
-                state.renderer.resize(size.width, size.height, scale);
-                state.imgui.register_nvim_texture(
-                    state.renderer.device(),
-                    size.width.max(1),
-                    size.height.max(1),
-                    state.renderer.surface_format(),
-                );
-                state.recompute_grid(&self.settings, &self.layout);
-                state.window.request_redraw();
+                if let Some(state) = self.state.as_mut() {
+                    let scale = state.window.scale_factor() as f32;
+                    state.renderer.resize(size.width, size.height, scale);
+                    state.imgui.register_nvim_texture(
+                        state.renderer.device(),
+                        size.width.max(1),
+                        size.height.max(1),
+                        state.renderer.surface_format(),
+                    );
+                    state.recompute_grid(&self.settings, &self.layout);
+                    state.window.request_redraw();
+                }
+                self.reconcile_terminal_sessions();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                let Some(state) = self.state.as_mut() else {
-                    return;
-                };
-                let size = state.window.inner_size();
-                let scale = state.window.scale_factor() as f32;
-                state.renderer.resize(size.width, size.height, scale);
-                state.imgui.register_nvim_texture(
-                    state.renderer.device(),
-                    size.width.max(1),
-                    size.height.max(1),
-                    state.renderer.surface_format(),
-                );
-                state.recompute_grid(&self.settings, &self.layout);
-                state.window.request_redraw();
+                if let Some(state) = self.state.as_mut() {
+                    let size = state.window.inner_size();
+                    let scale = state.window.scale_factor() as f32;
+                    state.renderer.resize(size.width, size.height, scale);
+                    state.imgui.register_nvim_texture(
+                        state.renderer.device(),
+                        size.width.max(1),
+                        size.height.max(1),
+                        state.renderer.surface_format(),
+                    );
+                    state.recompute_grid(&self.settings, &self.layout);
+                    state.window.request_redraw();
+                }
+                self.reconcile_terminal_sessions();
             }
             WindowEvent::Focused(focused) => {
                 let Some(state) = self.state.as_mut() else {

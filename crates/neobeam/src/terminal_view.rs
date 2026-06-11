@@ -4,28 +4,22 @@ use crate::layout::Rect;
 
 pub struct TerminalView {
     pub texture_id: TextureId,
-    pub tex_w: u32,
-    pub tex_h: u32,
 }
 
 impl TerminalView {
-    pub fn new(texture_id: TextureId, tex_w: u32, tex_h: u32) -> Self {
-        Self {
-            texture_id,
-            tex_w,
-            tex_h,
-        }
+    pub fn new(texture_id: TextureId) -> Self {
+        Self { texture_id }
     }
 
     pub fn draw(
         &self,
         ui: &Ui,
         rect: Rect,
-        scale: f32,
         alpha: f32,
         focused: bool,
         title: Option<&str>,
         exited: bool,
+        pane_id: u32,
     ) {
         let flags = WindowFlags::NO_TITLE_BAR
             | WindowFlags::NO_RESIZE
@@ -37,21 +31,19 @@ impl TerminalView {
             | WindowFlags::NO_DECORATION
             | WindowFlags::NO_BACKGROUND
             | WindowFlags::NO_INPUTS;
-        let uv1 = [
-            (rect.w * scale) / self.tex_w as f32,
-            (rect.h * scale) / self.tex_h as f32,
-        ];
         let _pad = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
         let _border = ui.push_style_var(imgui::StyleVar::WindowBorderSize(0.0));
         let _spacing = ui.push_style_var(imgui::StyleVar::ItemSpacing([0.0, 0.0]));
-        let id = format!("##term_view_{}_{}", rect.x as i32, rect.y as i32);
-        ui.window(&id)
+        let mut id_buf = [0u8; 24];
+        let id_str = format_id(&mut id_buf, pane_id);
+        ui.window(id_str)
             .position([rect.x, rect.y], imgui::Condition::Always)
             .size([rect.w, rect.h], imgui::Condition::Always)
             .flags(flags)
             .build(|| {
+                // Texture is sized exactly to this pane — sample the full texture.
                 Image::new(self.texture_id, [rect.w, rect.h])
-                    .uv1(uv1)
+                    .uv1([1.0, 1.0])
                     .tint_col([1.0, 1.0, 1.0, alpha])
                     .build(ui);
             });
@@ -83,4 +75,12 @@ impl TerminalView {
             );
         }
     }
+}
+
+fn format_id<'a>(buf: &'a mut [u8; 24], pane_id: u32) -> &'a str {
+    use std::io::Write as _;
+    let mut c = std::io::Cursor::new(buf.as_mut());
+    let _ = write!(c, "##term_{}\0", pane_id);
+    let pos = c.position() as usize;
+    std::str::from_utf8(&c.into_inner()[..pos.saturating_sub(1)]).unwrap_or("##term")
 }

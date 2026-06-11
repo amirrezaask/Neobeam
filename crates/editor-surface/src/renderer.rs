@@ -531,11 +531,12 @@ impl Renderer {
         target_view: &wgpu::TextureView,
         target_w: u32,
         target_h: u32,
+        pane_lw: f32,
+        pane_lh: f32,
         focused: bool,
     ) -> Result<[f32; 4]> {
-        let (lw, lh) = self.logical_size();
         let globals = Globals {
-            resolution: [lw, lh],
+            resolution: [pane_lw, pane_lh],
             offset: [0.0, 0.0],
         };
         self.queue
@@ -594,7 +595,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let clip = editor_clip_rect([0.0, 0.0, lw, lh]);
+            let clip = editor_clip_rect([0.0, 0.0, pane_lw, pane_lh]);
             draw_all_instances(&mut pass, self, &lists, target_w, target_h, clip);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
