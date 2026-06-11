@@ -1,9 +1,13 @@
-//! Git change discovery and file content fetch via `git` subprocess.
+//! Git change discovery and file content fetch.
+//!
+//! Status + per-file content come from `git-core` (libgit2). Network ops
+//! (push/pull/fetch) and patch apply remain `git` subprocess for now.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use git_core as gc;
 
 #[derive(Clone, Debug)]
 pub struct ChangedFile {
@@ -24,20 +28,11 @@ pub enum FileContent {
 
 
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
-    let cwd = cwd.to_str()?;
-    let output = Command::new("git")
-        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if root.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(root))
-    }
+    gc::discover(cwd).map(|p| {
+        // discover returns workdir with trailing slash; strip for parity.
+        let s = p.to_string_lossy();
+        PathBuf::from(s.trim_end_matches(std::path::MAIN_SEPARATOR))
+    })
 }
 
 pub fn stage_file(repo: &Path, path: &str) -> Result<(), String> {
@@ -193,60 +188,32 @@ fn git_file_op(repo: &Path, args: &[&str], action: &str) -> Result<(), String> {
 }
 
 pub fn list_changed_files(repo: &Path) -> Vec<ChangedFile> {
-    let mut map: HashMap<String, ChangedFile> = HashMap::new();
-
-    for (status, path) in git_name_status(repo, true) {
-        map.entry(path.clone())
-            .and_modify(|f| {
-                f.staged = true;
-                f.status = status;
-            })
-            .or_insert(ChangedFile {
-                path,
-                status,
-                staged: true,
-                unstaged: false,
-            });
-    }
-
-    for (status, path) in git_name_status(repo, false) {
-        map.entry(path.clone())
-            .and_modify(|f| {
-                f.unstaged = true;
-                if !f.staged {
-                    f.status = status;
-                }
-            })
-            .or_insert(ChangedFile {
-                path,
-                status,
-                staged: false,
-                unstaged: true,
-            });
-    }
-
-    // Untracked (new) files don't show up in `git diff`; list them explicitly.
-    for path in git_untracked_files(repo) {
-        map.entry(path.clone())
-            .and_modify(|f| {
-                f.unstaged = true;
-            })
-            .or_insert(ChangedFile {
-                path,
-                status: 'A',
-                staged: false,
-                unstaged: true,
-            });
-    }
-
-    let mut files: Vec<_> = map.into_values().collect();
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    files
+    let Ok(r) = gc::Repo::open(repo) else {
+        return Vec::new();
+    };
+    let Ok(items) = gc::status::list_changed(&r) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ChangedFile> = items
+        .into_iter()
+        .map(|c| ChangedFile {
+            path: c.path,
+            status: c.status.glyph(),
+            staged: c.staged,
+            unstaged: c.unstaged,
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 /// Fetch HEAD vs working-tree content for JetBrains-style diff display.
 pub fn fetch_head_vs_worktree(repo: &Path, path: &str) -> FileContent {
-    let old = git_show_bytes(repo, &format!("HEAD:{path}"));
+    let r = match gc::Repo::open(repo) {
+        Ok(r) => r,
+        Err(_) => return FileContent::Error("not a git repository".into()),
+    };
+    let old = r.read_head_blob(path);
     let wt = repo.join(path);
     let new = std::fs::read(&wt).ok();
 
@@ -280,81 +247,6 @@ pub fn fetch_head_vs_worktree(repo: &Path, path: &str) -> FileContent {
                 }
             }
         }
-    }
-}
-
-fn git_name_status(repo: &Path, cached: bool) -> Vec<(char, String)> {
-    let Some(repo_str) = repo.to_str() else {
-        return Vec::new();
-    };
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_str);
-    if cached {
-        cmd.args(["diff", "--cached", "--name-status"]);
-    } else {
-        cmd.args(["diff", "--name-status"]);
-    }
-    let Ok(output) = cmd.output() else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse_name_status(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_name_status(text: &str) -> Vec<(char, String)> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split('\t');
-        let status_part = parts.next().unwrap_or("");
-        let path = if status_part.starts_with('R') || status_part.starts_with('C') {
-            parts.nth(1).unwrap_or("").to_string()
-        } else {
-            parts.next().unwrap_or("").to_string()
-        };
-        let status = status_part.chars().next().unwrap_or('?');
-        if !path.is_empty() {
-            out.push((status, path));
-        }
-    }
-    out
-}
-
-fn git_untracked_files(repo: &Path) -> Vec<String> {
-    let Some(repo_str) = repo.to_str() else {
-        return Vec::new();
-    };
-    let Ok(output) = Command::new("git")
-        .args(["-C", repo_str, "ls-files", "--others", "--exclude-standard"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-fn git_show_bytes(repo: &Path, spec: &str) -> Option<Vec<u8>> {
-    let repo_str = repo.to_str()?;
-    let output = Command::new("git")
-        .args(["-C", repo_str, "show", spec])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(output.stdout)
-    } else {
-        None
     }
 }
 

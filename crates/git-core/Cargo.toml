@@ -1,0 +1,10 @@
+[package]
+name = "git-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+thiserror = "2"

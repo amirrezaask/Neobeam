@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nvim-core",
     "crates/editor-surface",
+    "crates/git-core",
     "crates/neobeam",
 ]
 

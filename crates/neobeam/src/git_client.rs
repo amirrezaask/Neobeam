@@ -21,11 +21,15 @@ use imgui::{Condition, StyleColor, Ui, WindowFlags};
 use similar::udiff::UnifiedDiffHunk;
 use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 
+use git_core::{Commit, Graph};
+
 use crate::git_diff::{
     commit_staged, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
     push as git_push, repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file,
     unstage_hunk, ChangedFile, FileContent,
 };
+
+const LOG_LIMIT: usize = 500;
 
 const MAX_DIFF_LINES: usize = 2000;
 const COMMIT_AREA_HEIGHT: f32 = 88.0;
@@ -67,6 +71,36 @@ enum DiffContent {
     Lines(DiffLines),
     Binary,
     Message(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GitTab {
+    #[default]
+    LocalChanges,
+    Log,
+    Branches,
+    Stash,
+    Console,
+}
+
+impl GitTab {
+    const ALL: [GitTab; 5] = [
+        GitTab::LocalChanges,
+        GitTab::Log,
+        GitTab::Branches,
+        GitTab::Stash,
+        GitTab::Console,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            GitTab::LocalChanges => "Local Changes",
+            GitTab::Log => "Log",
+            GitTab::Branches => "Branches",
+            GitTab::Stash => "Stash",
+            GitTab::Console => "Console",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,9 +167,23 @@ struct DiffResponse {
     content: DiffContent,
 }
 
+/// Request sent to the background log thread.
+struct LogRequest {
+    repo: PathBuf,
+    generation: u64,
+}
+
+/// Result delivered by the background log thread.
+struct LogResponse {
+    generation: u64,
+    commits: Vec<Commit>,
+    graph: Graph,
+}
+
 // ---------------------------------------------------------------------------
 
 pub struct GitClient {
+    active_tab: GitTab,
     sidebar_width: f32,
     view_mode: ViewMode,
     files: Vec<ChangedFile>,
@@ -163,6 +211,15 @@ pub struct GitClient {
     diff_rx: mpsc::Receiver<DiffResponse>,
     diff_pending: bool,
     last_content_rect: Option<Rect>,
+
+    // Log tab.
+    log_tx: mpsc::SyncSender<LogRequest>,
+    log_rx: mpsc::Receiver<LogResponse>,
+    log_pending: bool,
+    log_generation: u64,
+    log_commits: Vec<Commit>,
+    log_graph: Graph,
+    log_selected: Option<usize>,
 }
 
 impl GitClient {
@@ -225,7 +282,39 @@ impl GitClient {
             })
             .expect("git-diff thread");
 
+        // ── Log thread ────────────────────────────────────────────────────
+        let (log_tx, log_rx_thread) = mpsc::sync_channel::<LogRequest>(1);
+        let (log_tx_thread, log_rx) = mpsc::sync_channel::<LogResponse>(1);
+        let on_change_log = on_change.clone();
+        std::thread::Builder::new()
+            .name("git-log".into())
+            .spawn(move || {
+                while let Ok(req) = log_rx_thread.recv() {
+                    let resp = match git_core::Repo::open(&req.repo) {
+                        Ok(r) => {
+                            let commits =
+                                git_core::walk_log(&r, LOG_LIMIT).unwrap_or_default();
+                            let graph = git_core::graph::build(&commits);
+                            LogResponse {
+                                generation: req.generation,
+                                commits,
+                                graph,
+                            }
+                        }
+                        Err(_) => LogResponse {
+                            generation: req.generation,
+                            commits: Vec::new(),
+                            graph: Graph::default(),
+                        },
+                    };
+                    let _ = log_tx_thread.try_send(resp);
+                    on_change_log();
+                }
+            })
+            .expect("git-log thread");
+
         GitClient {
+            active_tab: GitTab::default(),
             sidebar_width: 220.0,
             view_mode: ViewMode::default(),
             files: Vec::new(),
@@ -245,6 +334,13 @@ impl GitClient {
             diff_rx,
             diff_pending: false,
             last_content_rect: None,
+            log_tx,
+            log_rx,
+            log_pending: false,
+            log_generation: 0,
+            log_commits: Vec::new(),
+            log_graph: Graph::default(),
+            log_selected: None,
         }
     }
 
@@ -260,6 +356,11 @@ impl GitClient {
         self.cached_diff = None;
         self.repo_root = None;
         self.error = None;
+        self.log_commits.clear();
+        self.log_graph = Graph::default();
+        self.log_selected = None;
+        self.log_generation = self.log_generation.wrapping_add(1);
+        self.log_pending = false;
         let _ = self.refresh_wake.try_send(());
     }
 
@@ -298,6 +399,15 @@ impl GitClient {
             wants_redraw = true;
         }
 
+        if let Ok(resp) = self.log_rx.try_recv() {
+            if resp.generation == self.log_generation {
+                self.log_commits = resp.commits;
+                self.log_graph = resp.graph;
+            }
+            self.log_pending = false;
+            wants_redraw = true;
+        }
+
         if let Ok(resp) = self.diff_rx.try_recv() {
             if self.selected.as_ref().is_some_and(|s| s.path == resp.path)
                 && resp.generation == self.generation
@@ -331,16 +441,246 @@ impl GitClient {
             .movable(false)
             .resizable(false)
             .build(|| {
-                self.draw_toolbar(ui);
+                self.draw_tab_bar(ui);
                 ui.separator();
                 if let Some(err) = &self.error {
                     ui.text_colored([1.0, 0.45, 0.45, 1.0], err);
-                    return;
                 }
-                self.draw_body(ui);
+                match self.active_tab {
+                    GitTab::LocalChanges => {
+                        self.draw_toolbar(ui);
+                        ui.separator();
+                        self.draw_body(ui);
+                    }
+                    GitTab::Log => self.draw_log_tab(ui),
+                    GitTab::Branches => self.draw_branches_tab(ui),
+                    GitTab::Stash => self.draw_stash_tab(ui),
+                    GitTab::Console => self.draw_console_tab(ui),
+                }
             });
 
         wants_redraw
+    }
+
+    fn draw_tab_bar(&mut self, ui: &Ui) {
+        for (i, tab) in GitTab::ALL.iter().enumerate() {
+            if i > 0 {
+                ui.same_line();
+            }
+            let selected = self.active_tab == *tab;
+            let _col = if selected {
+                Some(ui.push_style_color(
+                    StyleColor::Button,
+                    ui.style_color(StyleColor::ButtonActive),
+                ))
+            } else {
+                None
+            };
+            if ui.button(tab.label()) {
+                self.active_tab = *tab;
+            }
+        }
+    }
+
+    fn draw_log_tab(&mut self, ui: &Ui) {
+        // Kick off a load on first use (or after invalidation).
+        if self.log_commits.is_empty() && !self.log_pending {
+            self.trigger_log_load();
+        }
+
+        if self.log_commits.is_empty() {
+            if self.log_pending {
+                ui.text_disabled("Loading log…");
+            } else if self.repo_root.is_none() {
+                ui.text_disabled("Not a git repository.");
+            } else {
+                ui.text_disabled("No commits.");
+            }
+            return;
+        }
+
+        let avail = ui.content_region_avail();
+        let detail_w = (avail[0] * 0.35).max(200.0).min(avail[0] - 200.0);
+        let list_w = avail[0] - detail_w - 4.0;
+        let list_h = avail[1];
+
+        ui.child_window("##log_list")
+            .size([list_w.max(200.0), list_h])
+            .border(true)
+            .horizontal_scrollbar(true)
+            .build(|| {
+                self.draw_log_list(ui);
+            });
+
+        ui.same_line();
+
+        ui.child_window("##log_detail")
+            .size([detail_w, list_h])
+            .border(true)
+            .build(|| {
+                self.draw_log_detail(ui);
+            });
+    }
+
+    fn trigger_log_load(&mut self) {
+        let Some(repo) = self.repo_root.clone() else {
+            return;
+        };
+        self.log_generation = self.log_generation.wrapping_add(1);
+        let req = LogRequest {
+            repo,
+            generation: self.log_generation,
+        };
+        if self.log_tx.try_send(req).is_ok() {
+            self.log_pending = true;
+        }
+    }
+
+    fn draw_log_list(&mut self, ui: &Ui) {
+        const ROW_H: f32 = 22.0;
+        const LANE_W: f32 = 14.0;
+        const DOT_R: f32 = 4.0;
+        const GRAPH_PAD: f32 = 6.0;
+
+        let lane_count = self.log_graph.width.max(1) as f32;
+        let graph_px = GRAPH_PAD * 2.0 + lane_count * LANE_W;
+
+        let n = self.log_commits.len();
+        let origin = ui.cursor_screen_pos();
+        let avail = ui.content_region_avail();
+        let total_h = ROW_H * n as f32;
+
+        // Reserve the area so the scrollbar sizes correctly.
+        ui.dummy([avail[0].max(graph_px + 200.0), total_h]);
+
+        let draw = ui.get_window_draw_list();
+        let edge_col = ui.style_color(StyleColor::PlotLines);
+        let text_col = ui.style_color(StyleColor::Text);
+        let dim_col = ui.style_color(StyleColor::TextDisabled);
+        let sel_col = ui.style_color(StyleColor::HeaderActive);
+
+        let lane_x = |lane: u32| origin[0] + GRAPH_PAD + (lane as f32 + 0.5) * LANE_W;
+        let row_y = |row: u32| origin[1] + (row as f32 + 0.5) * ROW_H;
+
+        // Draw edges first so dots sit on top.
+        let palette = lane_palette();
+        for e in &self.log_graph.edges {
+            let p0 = [lane_x(e.from_lane), row_y(e.from_row)];
+            let p3 = [lane_x(e.to_lane), row_y(e.to_row)];
+            let dy = (p3[1] - p0[1]).abs() * 0.5;
+            let p1 = [p0[0], p0[1] + dy];
+            let p2 = [p3[0], p3[1] - dy];
+            let col = palette[(e.from_lane as usize) % palette.len()];
+            draw.add_bezier_curve(p0, p1, p2, p3, col)
+                .thickness(1.6)
+                .build();
+            // Subtle desaturated halo so curves stand out on bg.
+            let _ = edge_col;
+        }
+
+        // Dots + commit text.
+        for (i, node) in self.log_graph.nodes.iter().enumerate() {
+            let c = &self.log_commits[node.commit_idx];
+            let y_top = origin[1] + i as f32 * ROW_H;
+            let cy = y_top + ROW_H * 0.5;
+            let cx = lane_x(node.lane);
+
+            // Hover/selection band.
+            let mouse = ui.io().mouse_pos;
+            let hovered = mouse[1] >= y_top
+                && mouse[1] < y_top + ROW_H
+                && mouse[0] >= origin[0]
+                && mouse[0] <= origin[0] + avail[0];
+            let selected = self.log_selected == Some(node.commit_idx);
+            if selected || hovered {
+                let bg = if selected { sel_col } else {
+                    let mut c = sel_col;
+                    c[3] *= 0.35;
+                    c
+                };
+                draw.add_rect(
+                    [origin[0], y_top],
+                    [origin[0] + avail[0], y_top + ROW_H],
+                    bg,
+                )
+                .filled(true)
+                .build();
+                if hovered && ui.is_mouse_clicked(imgui::MouseButton::Left) {
+                    self.log_selected = Some(node.commit_idx);
+                }
+            }
+
+            // Lane dot.
+            let dot_col = palette[(node.lane as usize) % palette.len()];
+            draw.add_circle([cx, cy], DOT_R, dot_col)
+                .filled(true)
+                .num_segments(16)
+                .build();
+            draw.add_circle([cx, cy], DOT_R + 1.0, [0.0, 0.0, 0.0, 0.6])
+                .thickness(1.0)
+                .num_segments(16)
+                .build();
+
+            // Text columns.
+            let text_x = origin[0] + graph_px;
+            let short = &c.short_id;
+            let summary = &c.summary;
+            let author = &c.author_name;
+            draw.add_text(
+                [text_x, y_top + 3.0],
+                dim_col,
+                short,
+            );
+            draw.add_text(
+                [text_x + 60.0, y_top + 3.0],
+                text_col,
+                summary,
+            );
+            // Author on the right side of this row.
+            let author_x = origin[0] + avail[0] - 8.0 - measure_text_w(author);
+            draw.add_text(
+                [author_x.max(text_x + 60.0 + measure_text_w(summary) + 16.0), y_top + 3.0],
+                dim_col,
+                author,
+            );
+        }
+    }
+
+    fn draw_log_detail(&mut self, ui: &Ui) {
+        let Some(idx) = self.log_selected else {
+            ui.text_disabled("Select a commit to view details.");
+            return;
+        };
+        let Some(c) = self.log_commits.get(idx).cloned() else {
+            return;
+        };
+        ui.text(&c.short_id);
+        ui.same_line();
+        ui.text_disabled(&c.id);
+        ui.separator();
+        ui.text_wrapped(&c.summary);
+        ui.separator();
+        ui.text_disabled(&format!("Author: {} <{}>", c.author_name, c.author_email));
+        ui.text_disabled(&format!("Time:   {}", c.time));
+        if !c.parents.is_empty() {
+            ui.separator();
+            ui.text_disabled("Parents:");
+            for p in &c.parents {
+                ui.text_disabled(&format!("  {}", &p[..7.min(p.len())]));
+            }
+        }
+    }
+
+    fn draw_branches_tab(&mut self, ui: &Ui) {
+        ui.text_disabled("Branches — local + remote refs coming soon.");
+    }
+
+    fn draw_stash_tab(&mut self, ui: &Ui) {
+        ui.text_disabled("Stash — coming soon.");
+    }
+
+    fn draw_console_tab(&mut self, ui: &Ui) {
+        ui.text_disabled("Console — git command output coming soon.");
     }
 
     fn draw_toolbar(&mut self, ui: &Ui) {
@@ -496,6 +836,9 @@ impl GitClient {
                 self.commit_message.clear();
                 self.cached_diff = None;
                 self.generation = self.generation.wrapping_add(1);
+                self.log_commits.clear();
+                self.log_graph = Graph::default();
+                self.log_selected = None;
                 self.trigger_refresh_now();
             }
             Err(e) => self.error = Some(e),
@@ -1075,6 +1418,24 @@ fn draw_diff_half(
     if line.segments.is_empty() {
         ui.new_line();
     }
+}
+
+fn lane_palette() -> [[f32; 4]; 8] {
+    [
+        [0.45, 0.68, 1.00, 1.0], // blue
+        [0.55, 0.85, 0.55, 1.0], // green
+        [0.95, 0.65, 0.35, 1.0], // orange
+        [0.85, 0.55, 0.90, 1.0], // purple
+        [0.95, 0.55, 0.55, 1.0], // red
+        [0.55, 0.85, 0.85, 1.0], // teal
+        [0.95, 0.85, 0.40, 1.0], // yellow
+        [0.70, 0.70, 0.85, 1.0], // lilac
+    ]
+}
+
+fn measure_text_w(s: &str) -> f32 {
+    // imgui doesn't expose font here without a Ui; approximate with 7px per char.
+    s.chars().count() as f32 * 7.0
 }
 
 fn segment_color(seg: &DiffSegment, default: [f32; 4], colors: &DiffColors) -> [f32; 4] {
