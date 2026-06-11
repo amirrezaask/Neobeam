@@ -21,6 +21,7 @@ mod shell_env;
 mod terminal_view;
 
 use std::io::IsTerminal;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimBoot, NvimSession, SessionConfig, WinbarInfo};
 use nvim_core::Value;
-use pane::{FocusDir, PaneKind, PaneTree, SplitDir, SplitId};
+use pane::{FocusDir, PaneId, PaneKind, PaneTree, SplitDir, SplitId};
 use pane_anim::PaneAnimStore;
 use project::Project;
 use project_picker::ProjectPicker;
@@ -117,8 +118,8 @@ struct App {
     /// Background nvim boot started in `App::new`.
     nvim_boot: Option<tokio::task::JoinHandle<Result<NvimBoot>>>,
     startup_t0: Instant,
-    /// Active terminal session (one per app for now).
-    term_session: Option<terminal_core::TermSession>,
+    /// Independent PTY session for every terminal pane.
+    term_sessions: HashMap<PaneId, terminal_core::TermSession>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -249,12 +250,12 @@ impl App {
             state: None,
             nvim_boot: Some(nvim_boot),
             startup_t0,
-            term_session: None,
+            term_sessions: HashMap::new(),
         })
     }
 
-    fn ensure_terminal_session(&mut self) {
-        if self.term_session.is_some() {
+    fn ensure_terminal_session(&mut self, pane_id: PaneId) {
+        if self.term_sessions.contains_key(&pane_id) {
             return;
         }
         let Some(state) = self.state.as_ref() else {
@@ -266,7 +267,7 @@ impl App {
             .pane_tree
             .layout(area)
             .into_iter()
-            .find(|leaf| leaf.kind == PaneKind::Terminal)
+            .find(|leaf| leaf.id == pane_id)
             .map(|leaf| leaf.rect)
             .unwrap_or(area);
         let cols = ((rect.w / cw).floor() as u16).max(1);
@@ -276,8 +277,37 @@ impl App {
             let _ = proxy.send_event(UserEvent::TermRedraw);
         });
         match terminal_core::TermSession::spawn(cols, rows, None, redraw) {
-            Ok(session) => self.term_session = Some(session),
+            Ok(session) => {
+                self.term_sessions.insert(pane_id, session);
+            }
             Err(e) => tracing::error!("terminal spawn failed: {e:#}"),
+        }
+    }
+
+    fn reconcile_terminal_sessions(&mut self) {
+        let live: HashSet<PaneId> = self
+            .pane_tree
+            .layout(self.editor_area_logical())
+            .into_iter()
+            .filter(|leaf| leaf.kind == PaneKind::Terminal)
+            .map(|leaf| leaf.id)
+            .collect();
+        let stale: Vec<PaneId> = self
+            .term_sessions
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        for id in stale {
+            if let Some(session) = self.term_sessions.remove(&id) {
+                session.shutdown();
+            }
+            if let Some(state) = self.state.as_mut() {
+                state.imgui.remove_terminal_texture(id.0);
+            }
+        }
+        for id in live {
+            self.ensure_terminal_session(id);
         }
     }
 
@@ -298,7 +328,7 @@ impl App {
     /// macOS delivers window events after `exit()` if the `Window` outlives the
     /// loop; winit then logs "no handler was set" (winit#3915).
     fn teardown(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(session) = self.term_session.take() {
+        for (_, session) in self.term_sessions.drain() {
             session.shutdown();
         }
         if let Some(mut state) = self.state.take() {
@@ -397,12 +427,6 @@ impl App {
         let mut imgui = ImguiLayer::new(&window, &renderer, self.settings.font_size);
         let phys_size = window.inner_size();
         imgui.register_nvim_texture(
-            renderer.device(),
-            phys_size.width.max(1),
-            phys_size.height.max(1),
-            renderer.surface_format(),
-        );
-        imgui.register_terminal_texture(
             renderer.device(),
             phys_size.width.max(1),
             phys_size.height.max(1),
@@ -612,7 +636,7 @@ impl State {
         current_page: AppPage,
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
-        mut term_session: Option<&mut terminal_core::TermSession>,
+        term_sessions: &mut HashMap<PaneId, terminal_core::TermSession>,
     ) -> (
         bool,
         MenuBarAction,
@@ -727,24 +751,31 @@ impl State {
             }
         }
         if current_page == AppPage::Editor {
-            if let (Some(session), Some(term_rect), Some(tex_view)) = (
-                term_session.as_deref_mut(),
-                target_leaves
-                    .iter()
-                    .find(|leaf| leaf.kind == PaneKind::Terminal)
-                    .map(|leaf| leaf.rect),
-                self.imgui.terminal_texture_view_arc(),
-            ) {
+            let physical_size = self.window.inner_size();
+            for leaf in target_leaves.iter().filter(|leaf| leaf.kind == PaneKind::Terminal) {
+                let Some(session) = term_sessions.get_mut(&leaf.id) else {
+                    continue;
+                };
+                let term_rect = leaf.rect;
                 let cols = ((term_rect.w / cw).floor() as u16).max(1);
                 let rows = ((term_rect.h / ch).floor() as u16).max(1);
                 session.resize(cols, rows);
-                let (tex_w, tex_h) = self.imgui.terminal_texture_size().unwrap_or((
-                    self.renderer.logical_size().0 as u32,
-                    self.renderer.logical_size().1 as u32,
-                ));
+                let desired = (physical_size.width.max(1), physical_size.height.max(1));
+                if self.imgui.terminal_texture_size(leaf.id.0) != Some(desired) {
+                    self.imgui.register_terminal_texture(
+                        leaf.id.0,
+                        self.renderer.device(),
+                        desired.0,
+                        desired.1,
+                        self.renderer.surface_format(),
+                    );
+                }
+                let Some(tex_view) = self.imgui.terminal_texture_view_arc(leaf.id.0) else {
+                    continue;
+                };
                 if let Err(e) =
                     self.renderer
-                        .render_term_to_view(&session.grid, &tex_view, tex_w, tex_h)
+                        .render_term_to_view(&session.grid, &tex_view, desired.0, desired.1)
                 {
                     tracing::error!("terminal render error: {e}");
                 }
@@ -754,8 +785,19 @@ impl State {
         // Step 2: build ImGui frame (nvim shown as Image widget, plus all chrome).
         let nvim_texture_id = self.imgui.nvim_texture_id();
         let nvim_tex_size = self.imgui.nvim_texture_size().unwrap_or((1, 1));
-        let terminal_texture_id = self.imgui.terminal_texture_id();
-        let terminal_tex_size = self.imgui.terminal_texture_size().unwrap_or((1, 1));
+        let terminal_textures: HashMap<PaneId, (imgui::TextureId, (u32, u32))> = target_leaves
+            .iter()
+            .filter(|leaf| leaf.kind == PaneKind::Terminal)
+            .filter_map(|leaf| {
+                Some((
+                    leaf.id,
+                    (
+                        self.imgui.terminal_texture_id(leaf.id.0)?,
+                        self.imgui.terminal_texture_size(leaf.id.0)?,
+                    ),
+                ))
+            })
+            .collect();
         let nvim_scale = self.renderer.scale();
         let mut menu_action = MenuBarAction::None;
         let mut context_action = ContextMenuAction::None;
@@ -798,9 +840,8 @@ impl State {
                                     }
                                 }
                                 PaneKind::Terminal => {
-                                    if let Some(tid) = terminal_texture_id {
-                                        let (tw, th) = terminal_tex_size;
-                                        terminal_view::TerminalView::new(tid, tw, th)
+                                    if let Some((tid, (tw, th))) = terminal_textures.get(&leaf.id) {
+                                        terminal_view::TerminalView::new(*tid, *tw, *th)
                                             .draw(ui, leaf.rect, nvim_scale);
                                     }
                                 }
@@ -1149,7 +1190,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(session) = self.term_session.take() {
+        for (_, session) in self.term_sessions.drain() {
             session.shutdown();
         }
         if let Some(mut state) = self.state.take() {
@@ -1194,12 +1235,6 @@ impl ApplicationHandler<UserEvent> for App {
                     size.height.max(1),
                     state.renderer.surface_format(),
                 );
-                state.imgui.register_terminal_texture(
-                    state.renderer.device(),
-                    size.width.max(1),
-                    size.height.max(1),
-                    state.renderer.surface_format(),
-                );
                 state.recompute_grid(&self.settings, &self.layout);
                 state.window.request_redraw();
             }
@@ -1211,12 +1246,6 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = state.window.scale_factor() as f32;
                 state.renderer.resize(size.width, size.height, scale);
                 state.imgui.register_nvim_texture(
-                    state.renderer.device(),
-                    size.width.max(1),
-                    size.height.max(1),
-                    state.renderer.surface_format(),
-                );
-                state.imgui.register_terminal_texture(
                     state.renderer.device(),
                     size.width.max(1),
                     size.height.max(1),
@@ -1265,7 +1294,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Ime::Commit(text) => {
                         state.ime_active = false;
                         if focused_kind == PaneKind::Terminal {
-                            if let Some(session) = self.term_session.as_ref() {
+                            if let Some(session) = self.term_sessions.get(&self.pane_tree.focused) {
                                 session.paste(text);
                             }
                         } else {
@@ -1347,6 +1376,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.pane_tree.focus_dir(area, d);
                             }
                         }
+                        self.reconcile_terminal_sessions();
                         if let Some(state) = self.state.as_ref() {
                             state.window.request_redraw();
                         }
@@ -1363,6 +1393,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(|s| is_quick_component_shortcut(&event.logical_key, s.mods));
                     if let Some(kind) = kind {
                         self.pane_tree.focus_or_spawn(kind);
+                        self.reconcile_terminal_sessions();
                         if kind == PaneKind::GitDiff {
                             self.schedule_winbar_refresh();
                         }
@@ -1379,7 +1410,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if is_paste_shortcut(&event.logical_key, state.mods) {
                         if let (Some(text), Some(session)) =
-                            (read_clipboard_text(), self.term_session.as_ref())
+                            (read_clipboard_text(), self.term_sessions.get(&self.pane_tree.focused))
                         {
                             session.paste(text);
                         }
@@ -1387,7 +1418,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // Super/Command shortcuts belong to the GUI, not the PTY.
                     } else if let (Some(key), Some(session)) = (
                         map_term_key(&event.logical_key, state.mods.shift),
-                        self.term_session.as_ref(),
+                        self.term_sessions.get(&self.pane_tree.focused),
                     ) {
                         if let Some(bytes) = encode_term_key(
                             key,
@@ -1671,16 +1702,14 @@ impl ApplicationHandler<UserEvent> for App {
                         self.current_page,
                         &mut self.git_client,
                         &mut self.project_picker,
-                        self.term_session.as_mut(),
+                        &mut self.term_sessions,
                     )
                 };
                 self.handle_menu_action(menu_action);
                 self.handle_context_menu_action(context_action);
                 if let Some(kind) = component_sel {
                     self.pane_tree.set_focused_kind(kind);
-                    if kind == PaneKind::Terminal {
-                        self.ensure_terminal_session();
-                    }
+                    self.reconcile_terminal_sessions();
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }

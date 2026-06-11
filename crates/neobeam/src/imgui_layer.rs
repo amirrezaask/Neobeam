@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use arboard::Clipboard;
@@ -44,9 +45,13 @@ pub struct ImguiLayer {
     /// the imgui texture map.
     nvim_texture_view: Option<Arc<wgpu::TextureView>>,
     nvim_texture_size: Option<(u32, u32)>,
-    terminal_texture_id: Option<imgui::TextureId>,
-    terminal_texture_view: Option<Arc<wgpu::TextureView>>,
-    terminal_texture_size: Option<(u32, u32)>,
+    terminal_textures: HashMap<u32, TerminalTexture>,
+}
+
+struct TerminalTexture {
+    id: imgui::TextureId,
+    view: Arc<wgpu::TextureView>,
+    size: (u32, u32),
 }
 
 impl ImguiLayer {
@@ -86,9 +91,7 @@ impl ImguiLayer {
             nvim_texture_id: None,
             nvim_texture_view: None,
             nvim_texture_size: None,
-            terminal_texture_id: None,
-            terminal_texture_view: None,
-            terminal_texture_size: None,
+            terminal_textures: HashMap::new(),
         }
     }
 
@@ -175,6 +178,7 @@ impl ImguiLayer {
     /// Register (or replace on resize) the terminal offscreen texture.
     pub fn register_terminal_texture(
         &mut self,
+        pane_id: u32,
         device: &wgpu::Device,
         width: u32,
         height: u32,
@@ -219,28 +223,40 @@ impl ImguiLayer {
             size,
         );
 
-        self.terminal_texture_view = Some(view);
-        self.terminal_texture_size = Some((width, height));
-        if let Some(old_id) = self.terminal_texture_id {
+        let id = if let Some(old) = self.terminal_textures.get(&pane_id) {
+            let old_id = old.id;
             self.renderer.textures.replace(old_id, texture);
             old_id
         } else {
-            let id = self.renderer.textures.insert(texture);
-            self.terminal_texture_id = Some(id);
-            id
+            self.renderer.textures.insert(texture)
+        };
+        self.terminal_textures.insert(
+            pane_id,
+            TerminalTexture {
+                id,
+                view,
+                size: (width, height),
+            },
+        );
+        id
+    }
+
+    pub fn terminal_texture_id(&self, pane_id: u32) -> Option<imgui::TextureId> {
+        self.terminal_textures.get(&pane_id).map(|texture| texture.id)
+    }
+
+    pub fn terminal_texture_view_arc(&self, pane_id: u32) -> Option<Arc<wgpu::TextureView>> {
+        self.terminal_textures.get(&pane_id).map(|texture| texture.view.clone())
+    }
+
+    pub fn terminal_texture_size(&self, pane_id: u32) -> Option<(u32, u32)> {
+        self.terminal_textures.get(&pane_id).map(|texture| texture.size)
+    }
+
+    pub fn remove_terminal_texture(&mut self, pane_id: u32) {
+        if let Some(texture) = self.terminal_textures.remove(&pane_id) {
+            self.renderer.textures.remove(texture.id);
         }
-    }
-
-    pub fn terminal_texture_id(&self) -> Option<imgui::TextureId> {
-        self.terminal_texture_id
-    }
-
-    pub fn terminal_texture_view_arc(&self) -> Option<Arc<wgpu::TextureView>> {
-        self.terminal_texture_view.clone()
-    }
-
-    pub fn terminal_texture_size(&self) -> Option<(u32, u32)> {
-        self.terminal_texture_size
     }
 
     pub fn handle_event(&mut self, window: &Window, window_id: WindowId, event: &WindowEvent) {
