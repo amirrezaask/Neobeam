@@ -113,7 +113,13 @@ impl Grid {
 }
 
 /// Resolve absolute row/col for a float from its anchor (§4.9).
-pub fn resolve_float_position(anchor: Anchor, row: f64, col: f64, width: u32, height: u32) -> (i32, i32) {
+pub fn resolve_float_position(
+    anchor: Anchor,
+    row: f64,
+    col: f64,
+    width: u32,
+    height: u32,
+) -> (i32, i32) {
     let row = row as i32;
     let col = col as i32;
     let h = height as i32;
@@ -148,7 +154,11 @@ pub struct Cursor {
 
 impl Default for Cursor {
     fn default() -> Self {
-        Cursor { grid: 1, row: 0, col: 0 }
+        Cursor {
+            grid: 1,
+            row: 0,
+            col: 0,
+        }
     }
 }
 
@@ -175,7 +185,9 @@ impl ViewportMargins {
             return ViewportMargins::default();
         }
         let top = self.top.min(height.saturating_sub(1));
-        let bottom = self.bottom.min(height.saturating_sub(top).saturating_sub(1));
+        let bottom = self
+            .bottom
+            .min(height.saturating_sub(top).saturating_sub(1));
         ViewportMargins {
             top,
             bottom,
@@ -258,7 +270,9 @@ impl GridStateStore {
     }
 
     pub fn cursor_shape(&self) -> CursorShape {
-        self.current_mode().map(|m| m.cursor_shape).unwrap_or(CursorShape::Block)
+        self.current_mode()
+            .map(|m| m.cursor_shape)
+            .unwrap_or(CursorShape::Block)
     }
 
     /// Screen cell origin `(row, col)` for a grid, defaulting to `(0, 0)`.
@@ -280,7 +294,11 @@ impl GridStateStore {
 
     pub fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::GridResize { grid, width, height } => {
+            UiEvent::GridResize {
+                grid,
+                width,
+                height,
+            } => {
                 self.grids
                     .entry(grid)
                     .and_modify(|g| g.resize(width, height))
@@ -304,7 +322,13 @@ impl GridStateStore {
                 self.windows.remove(&grid);
                 self.viewport_margins.remove(&grid);
             }
-            UiEvent::WinPos { grid, row, col, width, height } => {
+            UiEvent::WinPos {
+                grid,
+                row,
+                col,
+                width,
+                height,
+            } => {
                 self.windows.insert(
                     grid,
                     WindowMeta {
@@ -338,7 +362,12 @@ impl GridStateStore {
                     },
                 );
             }
-            UiEvent::GridLine { grid, row, col_start, cells } => {
+            UiEvent::GridLine {
+                grid,
+                row,
+                col_start,
+                cells,
+            } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     let mut col = col_start;
                     for dc in cells {
@@ -359,7 +388,15 @@ impl GridStateStore {
             UiEvent::GridCursorGoto { grid, row, col } => {
                 self.cursor = Cursor { grid, row, col };
             }
-            UiEvent::GridScroll { grid, top, bot, left, right, rows, .. } => {
+            UiEvent::GridScroll {
+                grid,
+                top,
+                bot,
+                left,
+                right,
+                rows,
+                ..
+            } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
                     g.scroll(top, bot, left, right, rows);
                 }
@@ -367,11 +404,21 @@ impl GridStateStore {
                     *self.grid_scroll_pending.entry(grid).or_insert(0) += rows;
                 }
             }
-            UiEvent::DefaultColorsSet { fg, bg, sp, bg_none } => {
+            UiEvent::DefaultColorsSet {
+                fg,
+                bg,
+                sp,
+                bg_none,
+            } => {
                 // When the background is unset, keep a black value for color math
                 // (reverse video, cursor glyph fallback) but flag it transparent.
                 let bg = if bg_none { 0x000000 } else { bg };
-                self.default_colors = DefaultColors { fg, bg, sp, bg_none };
+                self.default_colors = DefaultColors {
+                    fg,
+                    bg,
+                    sp,
+                    bg_none,
+                };
             }
             UiEvent::HlAttrDefine { id, attr } => {
                 self.highlights.insert(id, attr);
@@ -383,8 +430,18 @@ impl GridStateStore {
                 self.mode_idx = mode_idx;
             }
             UiEvent::Busy(b) => self.busy = b,
-            UiEvent::WinViewportMargins { grid, top, bottom, left, right } => {
-                let target = if self.grids.contains_key(&grid) { grid } else { 1 };
+            UiEvent::WinViewportMargins {
+                grid,
+                top,
+                bottom,
+                left,
+                right,
+            } => {
+                let target = if self.grids.contains_key(&grid) {
+                    grid
+                } else {
+                    1
+                };
                 let height = self.grids.get(&target).map(|g| g.height).unwrap_or(0);
                 self.viewport_margins.insert(
                     target,
@@ -410,7 +467,11 @@ impl GridStateStore {
                 // `ext_multigrid` enabled each window owns its grid, so `grid`
                 // usually resolves directly. The fallback to grid 1 covers any
                 // legacy/non-multigrid viewport handles without content.
-                let target = if self.grids.contains_key(&grid) { grid } else { 1 };
+                let target = if self.grids.contains_key(&grid) {
+                    grid
+                } else {
+                    1
+                };
                 // Viewport is the authoritative scroll signal; once we have one
                 // for the target grid, suppress the grid_scroll fallback so the
                 // delta is never double-counted.
@@ -447,8 +508,14 @@ impl GridStateStore {
             } => {
                 let old = self.windows.get(&grid);
                 let g = self.grids.get(&grid);
-                let width = old.map(|w| w.width).or_else(|| g.map(|g| g.width)).unwrap_or(0);
-                let height = old.map(|w| w.height).or_else(|| g.map(|g| g.height)).unwrap_or(0);
+                let width = old
+                    .map(|w| w.width)
+                    .or_else(|| g.map(|g| g.width))
+                    .unwrap_or(0);
+                let height = old
+                    .map(|w| w.height)
+                    .or_else(|| g.map(|g| g.height))
+                    .unwrap_or(0);
                 let (anchor_row_base, anchor_col_base) = self
                     .windows
                     .get(&anchor_grid)

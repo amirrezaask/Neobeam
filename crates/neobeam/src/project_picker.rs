@@ -79,12 +79,7 @@ fn scan_projects() -> Vec<(String, PathBuf)> {
     items
 }
 
-fn collect_git_repos(
-    root: &Path,
-    current: &Path,
-    depth: usize,
-    out: &mut Vec<(String, PathBuf)>,
-) {
+fn collect_git_repos(root: &Path, current: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }

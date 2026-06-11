@@ -70,8 +70,12 @@ pub fn new_cursor_vfxs(modes: &[VfxMode]) -> Vec<Box<dyn CursorVfx>> {
     modes
         .iter()
         .filter_map(|mode| match mode {
-            VfxMode::Highlight(m) => Some(Box::new(PointHighlight::new(m.clone())) as Box<dyn CursorVfx>),
-            VfxMode::Trail(m) => Some(Box::new(ParticleTrail::new(m.clone())) as Box<dyn CursorVfx>),
+            VfxMode::Highlight(m) => {
+                Some(Box::new(PointHighlight::new(m.clone())) as Box<dyn CursorVfx>)
+            }
+            VfxMode::Trail(m) => {
+                Some(Box::new(ParticleTrail::new(m.clone())) as Box<dyn CursorVfx>)
+            }
             VfxMode::Disabled => None,
         })
         .collect()
@@ -257,11 +261,14 @@ impl CursorVfx for ParticleTrail {
 
         if dest[0] != self.previous_dest[0] || dest[1] != self.previous_dest[1] {
             if !immediate {
-                let travel = [dest[0] - self.previous_dest[0], dest[1] - self.previous_dest[1]];
+                let travel = [
+                    dest[0] - self.previous_dest[0],
+                    dest[1] - self.previous_dest[1],
+                ];
                 let travel_distance = (travel[0] * travel[0] + travel[1] * travel[1]).sqrt();
 
-                let f_particle_count = ((travel_distance / cursor_h) * cfg.vfx_particle_density)
-                    + self.count_reminder;
+                let f_particle_count =
+                    ((travel_distance / cursor_h) * cfg.vfx_particle_density) + self.count_reminder;
                 let particle_count = f_particle_count as usize;
                 self.count_reminder = f_particle_count - particle_count as f32;
 
@@ -303,9 +310,7 @@ impl CursorVfx for ParticleTrail {
                             self.previous_dest[1] + travel[1] * t,
                         ],
                         TrailMode::PixieDust | TrailMode::Torpedo => [
-                            self.previous_dest[0]
-                                + travel[0] * self.rng.next_f32()
-                                + 0.0,
+                            self.previous_dest[0] + travel[0] * self.rng.next_f32() + 0.0,
                             self.previous_dest[1]
                                 + travel[1] * self.rng.next_f32()
                                 + cursor_h * 0.5,

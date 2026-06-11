@@ -186,33 +186,54 @@ mod tests {
 
     #[test]
     fn plain_char() {
-        assert_eq!(encode_key(&KeyInput::Char('a'), Mods::default()).unwrap(), "a");
+        assert_eq!(
+            encode_key(&KeyInput::Char('a'), Mods::default()).unwrap(),
+            "a"
+        );
     }
 
     #[test]
     fn lt_escape() {
-        assert_eq!(encode_key(&KeyInput::Char('<'), Mods::default()).unwrap(), "<lt>");
+        assert_eq!(
+            encode_key(&KeyInput::Char('<'), Mods::default()).unwrap(),
+            "<lt>"
+        );
     }
 
     #[test]
     fn bslash_escape() {
-        assert_eq!(encode_key(&KeyInput::Char('\\'), Mods::default()).unwrap(), "<Bslash>");
+        assert_eq!(
+            encode_key(&KeyInput::Char('\\'), Mods::default()).unwrap(),
+            "<Bslash>"
+        );
     }
 
     #[test]
     fn ctrl_char() {
-        let m = Mods { ctrl: true, ..Default::default() };
+        let m = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
         assert_eq!(encode_key(&KeyInput::Char('a'), m).unwrap(), "<C-a>");
     }
 
     #[test]
     fn named_with_shift() {
-        let m = Mods { shift: true, ..Default::default() };
-        assert_eq!(encode_key(&KeyInput::Named(NamedKey::Tab), m).unwrap(), "<S-Tab>");
+        let m = Mods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key(&KeyInput::Named(NamedKey::Tab), m).unwrap(),
+            "<S-Tab>"
+        );
     }
 
     #[test]
     fn fkey() {
-        assert_eq!(encode_key(&KeyInput::Named(NamedKey::F(5)), Mods::default()).unwrap(), "<F5>");
+        assert_eq!(
+            encode_key(&KeyInput::Named(NamedKey::F(5)), Mods::default()).unwrap(),
+            "<F5>"
+        );
     }
 }

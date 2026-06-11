@@ -112,7 +112,6 @@ impl Settings {
         }
         cfg
     }
-
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -126,16 +125,16 @@ pub fn config_path() -> Option<PathBuf> {
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| {
-                directories::BaseDirs::new().map(|d| d.home_dir().join(".config"))
-            })?;
+            .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".config")))?;
         Some(config_home.join("neobeam").join("settings.json"))
     }
 }
 
 impl Settings {
     pub fn load() -> Self {
-        let Some(path) = config_path() else { return Settings::default() };
+        let Some(path) = config_path() else {
+            return Settings::default();
+        };
         match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Settings::default(),
@@ -165,21 +164,26 @@ impl Settings {
 /// Watch `settings.json` and invoke `on_change` after writes settle (debounced).
 pub fn spawn_watcher(mut on_change: impl FnMut() + Send + 'static) {
     let Some(path) = config_path() else { return };
-    let Some(parent) = path.parent().map(|p| p.to_path_buf()) else { return };
+    let Some(parent) = path.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
     let settings_path = path;
 
     std::thread::spawn(move || {
         use std::time::Duration;
 
-        use notify_debouncer_mini::{new_debouncer, DebounceEventResult, notify::RecursiveMode};
+        use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
 
         let watch_target = settings_path.clone();
-        let mut debouncer = match new_debouncer(Duration::from_millis(300), move |res: DebounceEventResult| {
-            let Ok(events) = res else { return };
-            if events.iter().any(|e| e.path == watch_target) {
-                on_change();
-            }
-        }) {
+        let mut debouncer = match new_debouncer(
+            Duration::from_millis(300),
+            move |res: DebounceEventResult| {
+                let Ok(events) = res else { return };
+                if events.iter().any(|e| e.path == watch_target) {
+                    on_change();
+                }
+            },
+        ) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("settings watcher failed to start: {e}");

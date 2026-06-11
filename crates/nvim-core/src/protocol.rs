@@ -88,37 +88,118 @@ pub enum Anchor {
 /// the adapter.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    GridResize { grid: i64, width: u32, height: u32 },
-    GridClear { grid: i64 },
-    GridLine { grid: i64, row: u32, col_start: u32, cells: Vec<DecodedCell> },
-    GridCursorGoto { grid: i64, row: u32, col: u32 },
-    GridScroll { grid: i64, top: i64, bot: i64, left: i64, right: i64, rows: i64, cols: i64 },
-    GridDestroy { grid: i64 },
-    DefaultColorsSet { fg: u32, bg: u32, sp: u32, bg_none: bool },
-    HlAttrDefine { id: u32, attr: HlAttr },
-    ModeInfoSet { cursor_style_enabled: bool, mode_infos: Vec<ModeInfo> },
-    ModeChange { mode_idx: usize },
-    OptionSet { name: String, value: Value },
+    GridResize {
+        grid: i64,
+        width: u32,
+        height: u32,
+    },
+    GridClear {
+        grid: i64,
+    },
+    GridLine {
+        grid: i64,
+        row: u32,
+        col_start: u32,
+        cells: Vec<DecodedCell>,
+    },
+    GridCursorGoto {
+        grid: i64,
+        row: u32,
+        col: u32,
+    },
+    GridScroll {
+        grid: i64,
+        top: i64,
+        bot: i64,
+        left: i64,
+        right: i64,
+        rows: i64,
+        cols: i64,
+    },
+    GridDestroy {
+        grid: i64,
+    },
+    DefaultColorsSet {
+        fg: u32,
+        bg: u32,
+        sp: u32,
+        bg_none: bool,
+    },
+    HlAttrDefine {
+        id: u32,
+        attr: HlAttr,
+    },
+    ModeInfoSet {
+        cursor_style_enabled: bool,
+        mode_infos: Vec<ModeInfo>,
+    },
+    ModeChange {
+        mode_idx: usize,
+    },
+    OptionSet {
+        name: String,
+        value: Value,
+    },
     Busy(bool),
-    WinViewport { grid: i64, topline: i64, botline: i64, curline: i64, curcol: i64, line_count: i64, scroll_delta: i64 },
+    WinViewport {
+        grid: i64,
+        topline: i64,
+        botline: i64,
+        curline: i64,
+        curcol: i64,
+        line_count: i64,
+        scroll_delta: i64,
+    },
     /// Rows/cols excluded from the scrollable viewport (winbar, float borders, …).
-    WinViewportMargins { grid: i64, top: u32, bottom: u32, left: u32, right: u32 },
-    WinPos { grid: i64, row: i32, col: i32, width: u32, height: u32 },
-    WinFloatPos { grid: i64, anchor: Anchor, anchor_grid: i64, anchor_row: f64, anchor_col: f64, z_index: i64, focusable: bool },
-    WinClose { grid: i64 },
-    WinHide { grid: i64 },
-    MsgSetPos { grid: i64, row: i32 },
+    WinViewportMargins {
+        grid: i64,
+        top: u32,
+        bottom: u32,
+        left: u32,
+        right: u32,
+    },
+    WinPos {
+        grid: i64,
+        row: i32,
+        col: i32,
+        width: u32,
+        height: u32,
+    },
+    WinFloatPos {
+        grid: i64,
+        anchor: Anchor,
+        anchor_grid: i64,
+        anchor_row: f64,
+        anchor_col: f64,
+        z_index: i64,
+        focusable: bool,
+    },
+    WinClose {
+        grid: i64,
+    },
+    WinHide {
+        grid: i64,
+    },
+    MsgSetPos {
+        grid: i64,
+        row: i32,
+    },
     Flush,
 }
 
 #[inline]
 fn as_u32(v: &Value) -> u32 {
-    v.as_u64().map(|x| x as u32).or_else(|| v.as_i64().map(|x| x as u32)).unwrap_or(0)
+    v.as_u64()
+        .map(|x| x as u32)
+        .or_else(|| v.as_i64().map(|x| x as u32))
+        .unwrap_or(0)
 }
 
 #[inline]
 fn as_i64(v: &Value) -> i64 {
-    v.as_i64().or_else(|| v.as_u64().map(|x| x as i64)).unwrap_or(0)
+    v.as_i64()
+        .or_else(|| v.as_u64().map(|x| x as i64))
+        .unwrap_or(0)
 }
 
 #[inline]
@@ -130,8 +211,12 @@ fn as_str(v: &Value) -> &str {
 pub fn parse_redraw(args: &[Value]) -> Vec<UiEvent> {
     let mut out = Vec::with_capacity(args.len());
     for group in args {
-        let Some(arr) = group.as_array() else { continue };
-        let Some((name, tuples)) = arr.split_first() else { continue };
+        let Some(arr) = group.as_array() else {
+            continue;
+        };
+        let Some((name, tuples)) = arr.split_first() else {
+            continue;
+        };
         let Some(name) = name.as_str() else { continue };
         for tuple in tuples {
             let Some(p) = tuple.as_array() else { continue };
@@ -148,8 +233,12 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
             width: as_u32(&p[1]),
             height: as_u32(&p[2]),
         }),
-        "grid_clear" if !p.is_empty() => out.push(UiEvent::GridClear { grid: as_i64(&p[0]) }),
-        "grid_destroy" if !p.is_empty() => out.push(UiEvent::GridDestroy { grid: as_i64(&p[0]) }),
+        "grid_clear" if !p.is_empty() => out.push(UiEvent::GridClear {
+            grid: as_i64(&p[0]),
+        }),
+        "grid_destroy" if !p.is_empty() => out.push(UiEvent::GridDestroy {
+            grid: as_i64(&p[0]),
+        }),
         "grid_cursor_goto" if p.len() >= 3 => out.push(UiEvent::GridCursorGoto {
             grid: as_i64(&p[0]),
             row: as_u32(&p[1]),
@@ -186,7 +275,9 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
             attr: parse_hl_attr(&p[1]),
         }),
         "mode_info_set" if p.len() >= 2 => out.push(parse_mode_info_set(p)),
-        "mode_change" if p.len() >= 2 => out.push(UiEvent::ModeChange { mode_idx: as_i64(&p[1]) as usize }),
+        "mode_change" if p.len() >= 2 => out.push(UiEvent::ModeChange {
+            mode_idx: as_i64(&p[1]) as usize,
+        }),
         "option_set" if p.len() >= 2 => out.push(UiEvent::OptionSet {
             name: as_str(&p[0]).to_string(),
             value: p[1].clone(),
@@ -230,8 +321,12 @@ fn parse_event(name: &str, p: &[Value], out: &mut Vec<UiEvent>) {
             z_index: p.get(7).map(as_i64).unwrap_or(0),
             focusable: p.get(6).and_then(|v| v.as_bool()).unwrap_or(true),
         }),
-        "win_close" if !p.is_empty() => out.push(UiEvent::WinClose { grid: as_i64(&p[0]) }),
-        "win_hide" if !p.is_empty() => out.push(UiEvent::WinHide { grid: as_i64(&p[0]) }),
+        "win_close" if !p.is_empty() => out.push(UiEvent::WinClose {
+            grid: as_i64(&p[0]),
+        }),
+        "win_hide" if !p.is_empty() => out.push(UiEvent::WinHide {
+            grid: as_i64(&p[0]),
+        }),
         "msg_set_pos" if p.len() >= 2 => out.push(UiEvent::MsgSetPos {
             grid: as_i64(&p[0]),
             row: as_i64(&p[1]) as i32,
@@ -256,7 +351,11 @@ fn parse_grid_line_cells(v: &Value) -> Option<Vec<DecodedCell>> {
         // hl_id omitted -> carry forward
         let hl_id = if c.len() >= 2 { as_u32(&c[1]) } else { last_hl };
         last_hl = hl_id;
-        let repeat = if c.len() >= 3 { as_u32(&c[2]).max(1) } else { 1 };
+        let repeat = if c.len() >= 3 {
+            as_u32(&c[2]).max(1)
+        } else {
+            1
+        };
 
         // Empty text after a non-empty cell = double-width continuation.
         if text.is_empty() {
@@ -331,5 +430,8 @@ fn parse_mode_info_set(p: &[Value]) -> UiEvent {
             modes.push(info);
         }
     }
-    UiEvent::ModeInfoSet { cursor_style_enabled, mode_infos: modes }
+    UiEvent::ModeInfoSet {
+        cursor_style_enabled,
+        mode_infos: modes,
+    }
 }

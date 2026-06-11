@@ -52,7 +52,12 @@ pub fn list_changed(repo: &Repo) -> Result<Vec<ChangedFile>, GitError> {
                 continue;
             }
             let (kind, staged, unstaged) = classify(st);
-            out.push(ChangedFile { path, status: kind, staged, unstaged });
+            out.push(ChangedFile {
+                path,
+                status: kind,
+                staged,
+                unstaged,
+            });
         }
         Ok(out)
     })

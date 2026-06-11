@@ -1,7 +1,7 @@
 //! Editor right-click context menu (Dear ImGui popup → Neovim commands).
 
-use imgui::{Condition, Ui};
 use imgui::sys;
+use imgui::{Condition, Ui};
 
 const POPUP_ID: &str = "editor_context";
 
@@ -143,10 +143,6 @@ impl ContextMenu {
 
 fn set_popup_pos(pos: [f32; 2]) {
     unsafe {
-        sys::igSetNextWindowPos(
-            pos.into(),
-            Condition::Appearing as i32,
-            [0.0, 0.0].into(),
-        );
+        sys::igSetNextWindowPos(pos.into(), Condition::Appearing as i32, [0.0, 0.0].into());
     }
 }

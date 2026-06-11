@@ -11,7 +11,11 @@ pub struct NvimView {
 
 impl NvimView {
     pub fn new(texture_id: TextureId, tex_w: u32, tex_h: u32) -> Self {
-        Self { texture_id, tex_w, tex_h }
+        Self {
+            texture_id,
+            tex_w,
+            tex_h,
+        }
     }
 
     pub fn draw(&self, ui: &Ui, rect: Rect, scale: f32) {

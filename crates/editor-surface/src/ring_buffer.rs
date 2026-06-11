@@ -21,7 +21,10 @@ impl<T: Clone> RingBuffer<T> {
     pub fn new(size: usize, default_value: T) -> Self {
         let mut elements = Vec::new();
         elements.resize(size, default_value);
-        Self { current_index: 0, elements }
+        Self {
+            current_index: 0,
+            elements,
+        }
     }
 
     pub fn clone_from_iter<'a, I>(&'a mut self, iter: I)
@@ -45,12 +48,18 @@ impl<T: Clone> RingBuffer<T> {
 
     pub fn iter_range<R: RangeBounds<isize>>(&self, range: R) -> RingBufferIter<'_, T> {
         let range = self.get_bounds(range);
-        RingBufferIter { ring_buffer: self, range }
+        RingBufferIter {
+            ring_buffer: self,
+            range,
+        }
     }
 
     pub fn iter_range_mut<R: RangeBounds<isize>>(&mut self, range: R) -> RingBufferIterMut<'_, T> {
         let range = self.get_bounds(range);
-        RingBufferIterMut { ring_buffer: self, range }
+        RingBufferIterMut {
+            ring_buffer: self,
+            range,
+        }
     }
 
     pub fn len(&self) -> usize {

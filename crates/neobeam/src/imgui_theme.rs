@@ -67,7 +67,11 @@ impl Rgb {
 }
 
 impl Rgb {
-    const WHITE: Self = Rgb { r: 255, g: 255, b: 255 };
+    const WHITE: Self = Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
     const BLACK: Self = Rgb { r: 0, g: 0, b: 0 };
 }
 
@@ -303,11 +307,20 @@ pub fn section_label_color(ui: &Ui) -> [f32; 4] {
 pub fn error_text(ui: &Ui) -> [f32; 4] {
     let bg = rgb_window_bg(ui);
     if is_dark(ui) {
-        Rgb { r: 255, g: 115, b: 115 }.to_rgba(1.0)
+        Rgb {
+            r: 255,
+            g: 115,
+            b: 115,
+        }
+        .to_rgba(1.0)
     } else {
-        Rgb { r: 200, g: 40, b: 40 }
-            .blend(bg, 0.05)
-            .to_rgba(1.0)
+        Rgb {
+            r: 200,
+            g: 40,
+            b: 40,
+        }
+        .blend(bg, 0.05)
+        .to_rgba(1.0)
     }
 }
 
@@ -355,7 +368,11 @@ fn diff_pair(ui: &Ui, hue: f32) -> (Rgb, Rgb, Rgb) {
 }
 
 fn diff_bg_alpha(ui: &Ui) -> f32 {
-    if is_dark(ui) { 0.55 } else { 0.30 }
+    if is_dark(ui) {
+        0.55
+    } else {
+        0.30
+    }
 }
 
 pub fn diff_delete_bg(ui: &Ui) -> [f32; 4] {

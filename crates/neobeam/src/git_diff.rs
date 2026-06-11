@@ -26,7 +26,6 @@ pub enum FileContent {
     Error(String),
 }
 
-
 pub fn repo_root(cwd: &Path) -> Option<PathBuf> {
     gc::discover(cwd).map(|p| {
         // discover returns workdir with trailing slash; strip for parity.
@@ -85,7 +84,13 @@ pub fn unstage_hunk(repo: &Path, patch: &str) -> Result<(), String> {
     git_apply(
         repo,
         patch,
-        &["apply", "--cached", "-R", "--recount", "--whitespace=nowarn"],
+        &[
+            "apply",
+            "--cached",
+            "-R",
+            "--recount",
+            "--whitespace=nowarn",
+        ],
     )
 }
 
@@ -99,7 +104,13 @@ fn git_apply_check(repo: &Path, patch: &str, reverse: bool) -> bool {
     let Some(repo_str) = repo.to_str() else {
         return false;
     };
-    let mut args = vec!["apply", "--cached", "--check", "--recount", "--whitespace=nowarn"];
+    let mut args = vec![
+        "apply",
+        "--cached",
+        "--check",
+        "--recount",
+        "--whitespace=nowarn",
+    ];
     if reverse {
         args.push("-R");
     }

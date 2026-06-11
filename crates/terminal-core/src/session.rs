@@ -1,13 +1,14 @@
 //! PTY spawning and event loop management.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options, Shell};
 use anyhow::Result;
 
@@ -20,16 +21,28 @@ pub type RedrawCallback = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct TermListener {
     cb: RedrawCallback,
+    metadata: Arc<Mutex<TermMetadata>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TermMetadata {
+    pub title: Option<String>,
+    pub bell_count: u64,
+    pub exited: bool,
 }
 
 impl EventListener for TermListener {
     fn send_event(&self, event: Event) {
+        let mut metadata = self.metadata.lock().expect("terminal metadata poisoned");
         match event {
-            Event::Wakeup | Event::Bell | Event::Title(_) | Event::ChildExit(_) => {
-                (self.cb)();
-            }
+            Event::Title(title) => metadata.title = Some(title),
+            Event::ResetTitle => metadata.title = None,
+            Event::Bell => metadata.bell_count += 1,
+            Event::ChildExit(_) | Event::Exit => metadata.exited = true,
             _ => {}
         }
+        drop(metadata);
+        (self.cb)();
     }
 }
 
@@ -38,6 +51,7 @@ pub struct TermSession {
     sender: EventLoopSender,
     cols: u16,
     rows: u16,
+    metadata: Arc<Mutex<TermMetadata>>,
     /// Shared terminal state; hand this to the renderer.
     pub grid: Arc<TermGrid<TermListener>>,
 }
@@ -63,7 +77,11 @@ impl TermSession {
 
         let pty = tty::new(&options, window_size, 0)?;
 
-        let listener = TermListener { cb };
+        let metadata = Arc::new(Mutex::new(TermMetadata::default()));
+        let listener = TermListener {
+            cb,
+            metadata: metadata.clone(),
+        };
         let size = TermSize::new(cols as usize, rows as usize);
         let term = Term::new(Config::default(), &size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -82,6 +100,7 @@ impl TermSession {
             sender,
             cols,
             rows,
+            metadata,
             grid,
         })
     }
@@ -107,6 +126,38 @@ impl TermSession {
 
     pub fn app_cursor_mode(&self) -> bool {
         self.grid.mode_enabled(TermMode::APP_CURSOR)
+    }
+
+    pub fn scroll(&self, lines: i32) {
+        self.grid.scroll(lines);
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.grid.selection_text()
+    }
+
+    pub fn start_selection(&self, row: usize, col: usize, semantic: bool) {
+        let ty = if semantic {
+            SelectionType::Semantic
+        } else {
+            SelectionType::Simple
+        };
+        self.grid.start_selection(row, col, ty);
+    }
+
+    pub fn update_selection(&self, row: usize, col: usize) {
+        self.grid.update_selection(row, col);
+    }
+
+    pub fn clear_selection(&self) {
+        self.grid.clear_selection();
+    }
+
+    pub fn metadata(&self) -> TermMetadata {
+        self.metadata
+            .lock()
+            .expect("terminal metadata poisoned")
+            .clone()
     }
 
     /// Resize the PTY and terminal grid.

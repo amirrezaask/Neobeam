@@ -28,7 +28,9 @@ pub fn unstage_file(repo: &Repo, path: &str) -> Result<(), GitError> {
             }
         };
         let obj = head.peel(git2::ObjectType::Commit)?;
-        let commit = obj.as_commit().ok_or(GitError::Other("HEAD not commit".into()))?;
+        let commit = obj
+            .as_commit()
+            .ok_or(GitError::Other("HEAD not commit".into()))?;
         r.reset_default(Some(commit.as_object()), [path])?;
         Ok(())
     })

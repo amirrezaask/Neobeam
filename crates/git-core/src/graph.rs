@@ -53,7 +53,10 @@ pub fn build(commits: &[Commit]) -> Graph {
 
     for (row, c) in commits.iter().enumerate() {
         // Find this commit's lane (a parent slot reserved by an earlier child).
-        let lane = match lanes.iter().position(|l| l.as_deref() == Some(c.id.as_str())) {
+        let lane = match lanes
+            .iter()
+            .position(|l| l.as_deref() == Some(c.id.as_str()))
+        {
             Some(p) => p,
             None => {
                 // Root of a branch: take first free lane (or append).
@@ -133,11 +136,7 @@ mod tests {
 
     #[test]
     fn linear_history_single_lane() {
-        let cs = vec![
-            cmt("C", &["B"]),
-            cmt("B", &["A"]),
-            cmt("A", &[]),
-        ];
+        let cs = vec![cmt("C", &["B"]), cmt("B", &["A"]), cmt("A", &[])];
         let g = build(&cs);
         assert_eq!(g.width, 1);
         assert!(g.nodes.iter().all(|n| n.lane == 0));

@@ -12,8 +12,8 @@
 //! new data arrived (so the caller knows to `request_redraw`).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::layout::Rect;
@@ -24,9 +24,9 @@ use similar::{ChangeTag, DiffOp, InlineChange, TextDiff};
 use git_core::{Commit, Graph};
 
 use crate::git_diff::{
-    commit_staged, fetch_head_vs_worktree, hunk_is_staged, list_changed_files,
-    push as git_push, repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file,
-    unstage_hunk, ChangedFile, FileContent,
+    commit_staged, fetch_head_vs_worktree, hunk_is_staged, list_changed_files, push as git_push,
+    repo_root, restore_hunk_worktree, stage_file, stage_hunk, unstage_file, unstage_hunk,
+    ChangedFile, FileContent,
 };
 
 const LOG_LIMIT: usize = 500;
@@ -256,7 +256,10 @@ impl GitClient {
                         .unwrap_or_default();
                     // Drop result if the main thread is not keeping up; we
                     // will refresh again soon anyway.
-                    let _ = refresh_tx.try_send(RefreshResult { repo_root: repo, files });
+                    let _ = refresh_tx.try_send(RefreshResult {
+                        repo_root: repo,
+                        files,
+                    });
                     on_change_refresh();
                 }
             })
@@ -292,8 +295,7 @@ impl GitClient {
                 while let Ok(req) = log_rx_thread.recv() {
                     let resp = match git_core::Repo::open(&req.repo) {
                         Ok(r) => {
-                            let commits =
-                                git_core::walk_log(&r, LOG_LIMIT).unwrap_or_default();
+                            let commits = git_core::walk_log(&r, LOG_LIMIT).unwrap_or_default();
                             let graph = git_core::graph::build(&commits);
                             LogResponse {
                                 generation: req.generation,
@@ -469,14 +471,15 @@ impl GitClient {
                 ui.same_line();
             }
             let selected = self.active_tab == *tab;
-            let _col = if selected {
-                Some(ui.push_style_color(
-                    StyleColor::Button,
-                    ui.style_color(StyleColor::ButtonActive),
-                ))
-            } else {
-                None
-            };
+            let _col =
+                if selected {
+                    Some(ui.push_style_color(
+                        StyleColor::Button,
+                        ui.style_color(StyleColor::ButtonActive),
+                    ))
+                } else {
+                    None
+                };
             if ui.button(tab.label()) {
                 self.active_tab = *tab;
             }
@@ -575,7 +578,8 @@ impl GitClient {
         let row_y = |row: u32| origin[1] + (row as f32 + 0.5) * ROW_H;
 
         // Draw edges first so dots sit on top.
-        let palette: [[f32; 4]; 8] = std::array::from_fn(|i| crate::imgui_theme::git_lane_color(ui, i));
+        let palette: [[f32; 4]; 8] =
+            std::array::from_fn(|i| crate::imgui_theme::git_lane_color(ui, i));
         let dot_shadow = crate::imgui_theme::git_lane_dot_shadow(ui);
         for e in &self.log_graph.edges {
             let p0 = [lane_x(e.from_lane), row_y(e.from_row)];
@@ -606,7 +610,9 @@ impl GitClient {
                 && mouse[0] <= origin[0] + avail[0];
             let selected = self.log_selected == Some(node.commit_idx);
             if selected || hovered {
-                let bg = if selected { sel_col } else {
+                let bg = if selected {
+                    sel_col
+                } else {
                     let mut c = sel_col;
                     c[3] *= 0.35;
                     c
@@ -639,20 +645,15 @@ impl GitClient {
             let short = &c.short_id;
             let summary = &c.summary;
             let author = &c.author_name;
-            draw.add_text(
-                [text_x, y_top + 3.0],
-                dim_col,
-                short,
-            );
-            draw.add_text(
-                [text_x + 60.0, y_top + 3.0],
-                text_col,
-                summary,
-            );
+            draw.add_text([text_x, y_top + 3.0], dim_col, short);
+            draw.add_text([text_x + 60.0, y_top + 3.0], text_col, summary);
             // Author on the right side of this row.
             let author_x = origin[0] + avail[0] - 8.0 - measure_text_w(author);
             draw.add_text(
-                [author_x.max(text_x + 60.0 + measure_text_w(summary) + 16.0), y_top + 3.0],
+                [
+                    author_x.max(text_x + 60.0 + measure_text_w(summary) + 16.0),
+                    y_top + 3.0,
+                ],
                 dim_col,
                 author,
             );
@@ -701,12 +702,9 @@ impl GitClient {
         ui.same_line();
         let mut view_idx = self.view_mode.index();
         ui.set_next_item_width(130.0);
-        if ui.combo(
-            "##view_mode",
-            &mut view_idx,
-            &ViewMode::ALL,
-            |m| std::borrow::Cow::Borrowed(m.label()),
-        ) {
+        if ui.combo("##view_mode", &mut view_idx, &ViewMode::ALL, |m| {
+            std::borrow::Cow::Borrowed(m.label())
+        }) {
             self.view_mode = ViewMode::from_index(view_idx);
         }
 
@@ -723,11 +721,7 @@ impl GitClient {
         }
         if hunk_count > 0 {
             ui.same_line();
-            ui.text_disabled(format!(
-                "Hunk {}/{}",
-                self.current_hunk + 1,
-                hunk_count
-            ));
+            ui.text_disabled(format!("Hunk {}/{}", self.current_hunk + 1, hunk_count));
         }
 
         ui.same_line_with_spacing(0.0, 16.0);
@@ -778,11 +772,9 @@ impl GitClient {
         if ui.is_item_hovered() || ui.is_item_active() {
             let draw = ui.get_window_draw_list();
             let col = ui.style_color(StyleColor::SeparatorActive);
-            draw.add_line(
-                cursor,
-                [cursor[0], cursor[1] + list_h],
-                col,
-            ).thickness(splitter_w).build();
+            draw.add_line(cursor, [cursor[0], cursor[1] + list_h], col)
+                .thickness(splitter_w)
+                .build();
         }
         drop(splitter_id);
 
@@ -888,10 +880,7 @@ impl GitClient {
         }
 
         ui.same_line();
-        let selected = self
-            .selected
-            .as_ref()
-            .is_some_and(|s| s.path == file.path);
+        let selected = self.selected.as_ref().is_some_and(|s| s.path == file.path);
         let label = format!("{} {}##file_sel_{}", file.status, file.path, file.path);
         if ui.selectable_config(&label).selected(selected).build() && !selected {
             self.selected = Some(SelectedEntry {
@@ -957,16 +946,10 @@ impl GitClient {
         }
     }
 
-    fn draw_hunked_diff(
-        &mut self,
-        ui: &Ui,
-        diff: &DiffLines,
-        path: &str,
-        colors: &DiffColors,
-    ) {
-        let scroll_to_line = self.scroll_to_hunk.and_then(|h| {
-            diff.hunks.get(h).map(|hk| hk.start_line)
-        });
+    fn draw_hunked_diff(&mut self, ui: &Ui, diff: &DiffLines, path: &str, colors: &DiffColors) {
+        let scroll_to_line = self
+            .scroll_to_hunk
+            .and_then(|h| diff.hunks.get(h).map(|hk| hk.start_line));
 
         for hunk in &diff.hunks {
             if hunk.start_line >= MAX_DIFF_LINES {
@@ -1085,9 +1068,10 @@ impl GitClient {
             return;
         };
 
-        let needs_load = self.cached_diff.as_ref().is_none_or(|c| {
-            c.path != file.path || c.generation != self.generation
-        });
+        let needs_load = self
+            .cached_diff
+            .as_ref()
+            .is_none_or(|c| c.path != file.path || c.generation != self.generation);
         if needs_load && !self.diff_pending {
             self.trigger_diff_load(&file);
         }
@@ -1331,9 +1315,8 @@ fn draw_side_by_side(
 
     ui.columns(2, "##sxs_diff", true);
     for (left, right) in rows {
-        let row_has_scroll_target = scroll_to_line.is_some_and(|target| {
-            left == Some(target) || right == Some(target)
-        });
+        let row_has_scroll_target =
+            scroll_to_line.is_some_and(|target| left == Some(target) || right == Some(target));
         if row_has_scroll_target {
             ui.set_scroll_here_y_with_ratio(0.0);
             *scroll_done = None;
@@ -1382,13 +1365,7 @@ fn build_side_rows(lines: &[DiffLine]) -> Vec<(Option<usize>, Option<usize>)> {
     rows
 }
 
-fn draw_diff_half(
-    ui: &Ui,
-    line: Option<&DiffLine>,
-    col_w: f32,
-    colors: &DiffColors,
-    half: Half,
-) {
+fn draw_diff_half(ui: &Ui, line: Option<&DiffLine>, col_w: f32, colors: &DiffColors, half: Half) {
     let Some(line) = line else {
         ui.new_line();
         return;
@@ -1423,14 +1400,24 @@ fn draw_diff_half(
     let (num, sign) = match half {
         Half::Left => (
             line.old_line,
-            if matches!(line.tag, ChangeTag::Delete) { '-' } else { ' ' },
+            if matches!(line.tag, ChangeTag::Delete) {
+                '-'
+            } else {
+                ' '
+            },
         ),
         Half::Right => (
             line.new_line,
-            if matches!(line.tag, ChangeTag::Insert) { '+' } else { ' ' },
+            if matches!(line.tag, ChangeTag::Insert) {
+                '+'
+            } else {
+                ' '
+            },
         ),
     };
-    let num_str = num.map(|n| format!("{n:>5}")).unwrap_or_else(|| "     ".into());
+    let num_str = num
+        .map(|n| format!("{n:>5}"))
+        .unwrap_or_else(|| "     ".into());
     let gutter = format!("{sign} {num_str} |");
 
     ui.text_colored(colors.gutter, &gutter);

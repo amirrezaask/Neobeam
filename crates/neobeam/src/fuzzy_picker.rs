@@ -96,10 +96,7 @@ pub(crate) fn picker_default_size(ui: &Ui) -> [f32; 2] {
 pub(crate) fn picker_initial_position(ui: &Ui) -> [f32; 2] {
     let display = ui.io().display_size;
     let [width, _] = picker_default_size(ui);
-    [
-        (display[0] - width) * 0.5,
-        display[1] * 0.2,
-    ]
+    [(display[0] - width) * 0.5, display[1] * 0.2]
 }
 
 pub(crate) fn visible_row_count(ui: &Ui) -> usize {
@@ -118,8 +115,8 @@ pub(crate) fn scroll_list_to_selection(
     if anchor == &Some(selected) {
         return;
     }
-    let scroll_y = (selected.saturating_sub(max_visible / 2) as f32)
-        * ui.text_line_height_with_spacing();
+    let scroll_y =
+        (selected.saturating_sub(max_visible / 2) as f32) * ui.text_line_height_with_spacing();
     ui.set_scroll_y(scroll_y);
     *anchor = Some(selected);
 }
@@ -198,7 +195,10 @@ impl<T: Clone> FuzzyPicker<T> {
 
     /// Confirm the current selection and close immediately (no fade-out).
     fn confirm_selection(&mut self) -> Option<T> {
-        let value = self.filtered.get(self.selected).map(|item| item.value.clone())?;
+        let value = self
+            .filtered
+            .get(self.selected)
+            .map(|item| item.value.clone())?;
         self.close_immediate();
         Some(value)
     }
@@ -230,10 +230,7 @@ impl<T: Clone> FuzzyPicker<T> {
         ui.window(&window_name)
             .position(pos, Condition::FirstUseEver)
             .size(size, Condition::FirstUseEver)
-            .size_constraints(
-                [PICKER_MIN_WIDTH, PICKER_MIN_HEIGHT],
-                [f32::MAX, f32::MAX],
-            )
+            .size_constraints([PICKER_MIN_WIDTH, PICKER_MIN_HEIGHT], [f32::MAX, f32::MAX])
             .flags(WindowFlags::NO_COLLAPSE)
             .title_bar(true)
             .movable(true)
@@ -311,7 +308,6 @@ impl<T: Clone> FuzzyPicker<T> {
 
         outcome
     }
-
 }
 
 impl<T: Clone> Default for FuzzyPicker<T> {

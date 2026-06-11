@@ -10,7 +10,14 @@ struct Arms {
 }
 
 fn arms_for(ch: char) -> Option<Arms> {
-    let a = |left, right, up, down| Some(Arms { left, right, up, down });
+    let a = |left, right, up, down| {
+        Some(Arms {
+            left,
+            right,
+            up,
+            down,
+        })
+    };
     match ch {
         '─' => a(true, true, false, false),
         '│' => a(false, false, true, true),
@@ -32,8 +39,17 @@ pub fn is_box_glyph(ch: char) -> bool {
 }
 
 /// Emit arm rectangles `(x, y, w, h)` for a box-drawing char within a cell.
-pub fn box_rects(ch: char, x: f32, y: f32, w: f32, h: f32, thickness: f32) -> Vec<(f32, f32, f32, f32)> {
-    let Some(arms) = arms_for(ch) else { return Vec::new() };
+pub fn box_rects(
+    ch: char,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    thickness: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    let Some(arms) = arms_for(ch) else {
+        return Vec::new();
+    };
     let t = thickness.max(1.0);
     let cx = x + w * 0.5;
     let cy = y + h * 0.5;

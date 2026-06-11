@@ -12,8 +12,7 @@ use fontdue::{Font, FontSettings};
 use crate::fonts::load_editor_font;
 use crate::nerd_glyphs::is_nerd_glyph;
 
-static SYMBOLS_NERD_FONT: &[u8] =
-    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+static SYMBOLS_NERD_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 const ATLAS_SIZE: u32 = 2048;
 const PADDING: i32 = 1;
@@ -197,7 +196,10 @@ impl GlyphAtlas {
         let atlas = ATLAS_SIZE as f32;
         let info = GlyphInfo {
             uv_min: [x as f32 / atlas, y as f32 / atlas],
-            uv_max: [(x + metrics.width as u32) as f32 / atlas, (y + metrics.height as u32) as f32 / atlas],
+            uv_max: [
+                (x + metrics.width as u32) as f32 / atlas,
+                (y + metrics.height as u32) as f32 / atlas,
+            ],
             left: metrics.xmin as f32 / self.scale,
             top: self.ascent - (metrics.ymin as f32 + metrics.height as f32) / self.scale,
             width: metrics.width as f32 / self.scale,
@@ -258,7 +260,7 @@ mod tests {
         let symbols = load_symbols_font().expect("symbols font should parse");
         assert!(font_has_glyph(&symbols, '\u{E0B0}')); // powerline separator
         assert!(font_has_glyph(&symbols, '\u{E7A8}')); // devicon
-        // VS Code codicons used in the host activity bar
+                                                       // VS Code codicons used in the host activity bar
         assert!(font_has_glyph(&symbols, '\u{EA68}')); // source-control
         assert!(font_has_glyph(&symbols, '\u{EAE9}')); // file-code
         assert!(font_has_glyph(&symbols, '\u{EB51}')); // settings-gear

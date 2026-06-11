@@ -7,5 +7,5 @@ pub mod grid;
 pub mod input;
 pub mod session;
 
-pub use grid::{TermCell, TermColor, TermGrid};
-pub use session::{RedrawCallback, TermListener, TermSession};
+pub use grid::{TermCell, TermColor, TermGrid, Underline};
+pub use session::{RedrawCallback, TermListener, TermMetadata, TermSession};

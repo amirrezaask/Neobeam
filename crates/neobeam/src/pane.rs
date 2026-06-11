@@ -449,6 +449,58 @@ impl PaneTree {
         Self::find_kind(&self.root, self.focused).unwrap_or(PaneKind::Empty)
     }
 
+    /// Swap two complete leaves, preserving each pane's ID, kind, and backing
+    /// resources while moving them to each other's layout slots.
+    pub fn swap_leaves(&mut self, first: PaneId, second: PaneId) -> bool {
+        if first == second {
+            return false;
+        }
+        let Some(first_kind) = Self::find_kind(&self.root, first) else {
+            return false;
+        };
+        let Some(second_kind) = Self::find_kind(&self.root, second) else {
+            return false;
+        };
+        Self::swap_in(
+            &mut self.root,
+            first,
+            first_kind,
+            second,
+            second_kind,
+        );
+        true
+    }
+
+    fn swap_in(
+        node: &mut PaneNode,
+        first: PaneId,
+        first_kind: PaneKind,
+        second: PaneId,
+        second_kind: PaneKind,
+    ) {
+        match node {
+            PaneNode::Leaf {
+                id: leaf_id,
+                kind: leaf_kind,
+            } if *leaf_id == first => {
+                *leaf_id = second;
+                *leaf_kind = second_kind;
+            }
+            PaneNode::Leaf {
+                id: leaf_id,
+                kind: leaf_kind,
+            } if *leaf_id == second => {
+                *leaf_id = first;
+                *leaf_kind = first_kind;
+            }
+            PaneNode::Leaf { .. } => {}
+            PaneNode::Split { a, b, .. } => {
+                Self::swap_in(a, first, first_kind, second, second_kind);
+                Self::swap_in(b, first, first_kind, second, second_kind);
+            }
+        }
+    }
+
     fn find_kind(node: &PaneNode, target: PaneId) -> Option<PaneKind> {
         match node {
             PaneNode::Leaf { id, kind } if *id == target => Some(*kind),
@@ -531,5 +583,21 @@ mod tests {
         assert_ne!(t.focused, right);
         t.focus_dir(area(), FocusDir::Right);
         assert_eq!(t.focused, right);
+    }
+
+    #[test]
+    fn swap_leaves_moves_complete_pane_identity() {
+        let mut t = PaneTree::new_with(PaneKind::Nvim);
+        let right = t.split_focused(SplitDir::Horizontal);
+        t.set_focused_kind(PaneKind::Terminal);
+        let before = t.layout(area());
+        let left = before[0].id;
+
+        assert!(t.swap_leaves(left, right));
+        let after = t.layout(area());
+        assert_eq!(after[0].id, right);
+        assert_eq!(after[0].kind, PaneKind::Terminal);
+        assert_eq!(after[1].id, left);
+        assert_eq!(after[1].kind, PaneKind::Nvim);
     }
 }

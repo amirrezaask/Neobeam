@@ -17,7 +17,16 @@ impl TerminalView {
         }
     }
 
-    pub fn draw(&self, ui: &Ui, rect: Rect, scale: f32) {
+    pub fn draw(
+        &self,
+        ui: &Ui,
+        rect: Rect,
+        scale: f32,
+        alpha: f32,
+        focused: bool,
+        title: Option<&str>,
+        exited: bool,
+    ) {
         let flags = WindowFlags::NO_TITLE_BAR
             | WindowFlags::NO_RESIZE
             | WindowFlags::NO_MOVE
@@ -40,7 +49,35 @@ impl TerminalView {
             .build(|| {
                 Image::new(self.texture_id, [rect.w, rect.h])
                     .uv1(uv1)
+                    .tint_col([1.0, 1.0, 1.0, alpha])
                     .build(ui);
             });
+
+        if focused || exited {
+            let label = if exited {
+                "process exited"
+            } else {
+                title
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or("terminal")
+            };
+            let draw = ui.get_foreground_draw_list();
+            let text_size = ui.calc_text_size(label);
+            let min = [rect.x + 8.0, rect.y + 7.0];
+            let max = [min[0] + text_size[0] + 14.0, min[1] + text_size[1] + 8.0];
+            draw.add_rect(min, max, [0.04, 0.05, 0.08, 0.82])
+                .filled(true)
+                .rounding(6.0)
+                .build();
+            draw.add_text(
+                [min[0] + 7.0, min[1] + 4.0],
+                if exited {
+                    [0.95, 0.35, 0.30, alpha]
+                } else {
+                    [0.55, 0.82, 0.80, alpha]
+                },
+                label,
+            );
+        }
     }
 }

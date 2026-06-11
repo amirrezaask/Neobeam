@@ -131,7 +131,10 @@ mod tests {
 
     #[test]
     fn spring_reaches_rest() {
-        let mut s = Spring { position: 10.0, velocity: 0.0 };
+        let mut s = Spring {
+            position: 10.0,
+            velocity: 0.0,
+        };
         for _ in 0..500 {
             s.update(0.016, 0.15);
         }

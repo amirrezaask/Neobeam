@@ -231,8 +231,7 @@ impl MenuBar {
                 .display_format("%.2fs")
                 .build(&mut settings.animation_length)
             {
-                settings.animation_length =
-                    (settings.animation_length * 100.0).round() / 100.0;
+                settings.animation_length = (settings.animation_length * 100.0).round() / 100.0;
                 changed = true;
             }
 
@@ -261,8 +260,7 @@ impl MenuBar {
                 .display_format("%.0f lines")
                 .build(&mut far_lines)
             {
-                settings.scroll_animation_far_lines =
-                    far_lines.round().clamp(0.0, 10.0) as u32;
+                settings.scroll_animation_far_lines = far_lines.round().clamp(0.0, 10.0) as u32;
                 changed = true;
             }
             if ui.is_item_hovered() {

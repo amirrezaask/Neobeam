@@ -127,7 +127,9 @@ impl NvimBoot {
             });
         }
 
-        attach_ui_async(&self.nvim, &cfg).await.context("nvim_ui_attach")?;
+        attach_ui_async(&self.nvim, &cfg)
+            .await
+            .context("nvim_ui_attach")?;
 
         Ok(NvimSession {
             nvim: self.nvim,
@@ -262,10 +264,7 @@ impl NvimSession {
         let nvim = self.nvim.clone();
         self.rt.block_on(async move {
             let result = nvim
-                .call_function(
-                    "getcompletion",
-                    vec![Value::from(""), Value::from("color")],
-                )
+                .call_function("getcompletion", vec![Value::from(""), Value::from("color")])
                 .await;
             result
                 .ok()
@@ -277,7 +276,8 @@ impl NvimSession {
     /// Read `g:colors_name` for the active colorscheme.
     pub fn current_colorscheme(&self) -> Option<String> {
         let nvim = self.nvim.clone();
-        self.rt.block_on(async move { current_colorscheme_async(&nvim).await })
+        self.rt
+            .block_on(async move { current_colorscheme_async(&nvim).await })
     }
 
     /// Non-blocking colorscheme query; runs on the session runtime.
@@ -304,10 +304,7 @@ impl NvimSession {
         let nvim = self.nvim.clone();
         self.rt.spawn(async move {
             let path_val = Value::from(path.to_string_lossy().as_ref());
-            if let Ok(escaped) = nvim
-                .call_function("fnameescape", vec![path_val])
-                .await
-            {
+            if let Ok(escaped) = nvim.call_function("fnameescape", vec![path_val]).await {
                 if let Some(s) = escaped.as_str() {
                     let _ = nvim.command(&format!("e {s}")).await;
                 }
@@ -320,10 +317,7 @@ impl NvimSession {
         let nvim = self.nvim.clone();
         self.rt.spawn(async move {
             let path_val = Value::from(path.to_string_lossy().as_ref());
-            if let Ok(escaped) = nvim
-                .call_function("fnameescape", vec![path_val])
-                .await
-            {
+            if let Ok(escaped) = nvim.call_function("fnameescape", vec![path_val]).await {
                 if let Some(s) = escaped.as_str() {
                     let _ = nvim.command(&format!("e +{line} {s}")).await;
                 }
@@ -417,10 +411,12 @@ impl Drop for NvimSession {
     }
 }
 
-async fn attach_ui_async(nvim: &Nvim, cfg: &SessionConfig) -> Result<(), Box<nvim_rs::error::CallError>> {
+async fn attach_ui_async(
+    nvim: &Nvim,
+    cfg: &SessionConfig,
+) -> Result<(), Box<nvim_rs::error::CallError>> {
     let (cols, rows) = (cfg.cols as i64, cfg.rows as i64);
-    let (cmdline, popup, msgs) =
-        (cfg.ext_cmdline, cfg.ext_popupmenu, cfg.ext_messages);
+    let (cmdline, popup, msgs) = (cfg.ext_cmdline, cfg.ext_popupmenu, cfg.ext_messages);
     let mut opts = UiAttachOptions::new();
     opts.set_rgb(true)
         .set_linegrid_external(true)

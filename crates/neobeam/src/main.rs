@@ -20,8 +20,8 @@ mod settings;
 mod shell_env;
 mod terminal_view;
 
-use std::io::IsTerminal;
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -105,6 +105,7 @@ struct App {
     pane_anims: PaneAnimStore,
     component_picker: ComponentPicker,
     pane_drag: Option<PaneDrag>,
+    pane_move_drag: Option<PaneMoveDrag>,
     current_page: AppPage,
     git_client: GitClient,
     project_picker: ProjectPicker,
@@ -129,8 +130,17 @@ struct PaneDrag {
     parent_rect: Rect,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PaneMoveDrag {
+    source: PaneId,
+    target: Option<PaneId>,
+}
+
 /// Gutter thickness in logical px — generous enough to grab without precision.
 const GUTTER_THICKNESS: f32 = 8.0;
+const PANE_HANDLE_WIDTH: f32 = 30.0;
+const PANE_HANDLE_HEIGHT: f32 = 20.0;
+const PANE_HANDLE_INSET: f32 = 6.0;
 
 fn imgui_active(state: &State) -> bool {
     state.imgui.wants_mouse() || state.imgui.wants_keyboard()
@@ -148,6 +158,41 @@ fn cursor_logical(state: &State) -> (f32, f32) {
         state.cursor_pos.0 as f32 / scale,
         state.cursor_pos.1 as f32 / scale,
     )
+}
+
+fn pane_handle_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + rect.w - PANE_HANDLE_WIDTH - PANE_HANDLE_INSET,
+        y: rect.y + PANE_HANDLE_INSET,
+        w: PANE_HANDLE_WIDTH,
+        h: PANE_HANDLE_HEIGHT,
+    }
+}
+
+fn pane_handle_at(pane_tree: &PaneTree, area: Rect, x: f32, y: f32) -> Option<PaneId> {
+    pane_tree
+        .layout(area)
+        .into_iter()
+        .find(|leaf| pane_handle_rect(leaf.rect).contains(x, y))
+        .map(|leaf| leaf.id)
+}
+
+fn terminal_cell_at(
+    state: &State,
+    settings: &Settings,
+    pane_tree: &PaneTree,
+) -> Option<(usize, usize)> {
+    let cursor = cursor_logical(state);
+    let area = editor_area(settings, &state.renderer);
+    let rect = pane_tree
+        .layout(area)
+        .into_iter()
+        .find(|leaf| leaf.id == pane_tree.focused && leaf.kind == PaneKind::Terminal)?
+        .rect;
+    let (cw, ch) = state.renderer.cell_size();
+    let col = ((cursor.0 - rect.x) / cw).floor().max(0.0) as usize;
+    let row = ((cursor.1 - rect.y) / ch).floor().max(0.0) as usize;
+    Some((row, col))
 }
 
 fn imgui_captures_input(state: &State, current_page: AppPage, project_picker_open: bool) -> bool {
@@ -237,10 +282,11 @@ impl App {
             settings,
             menu_bar,
             layout: SimpleLayout::new(),
-            pane_tree: PaneTree::new_with(PaneKind::Nvim),
+            pane_tree: PaneTree::new_with(PaneKind::Terminal),
             pane_anims: PaneAnimStore::new(),
             component_picker: ComponentPicker::new(),
             pane_drag: None,
+            pane_move_drag: None,
             current_page: AppPage::Editor,
             git_client,
             project_picker: ProjectPicker::new(),
@@ -637,6 +683,7 @@ impl State {
         git_client: &mut GitClient,
         project_picker: &mut ProjectPicker,
         term_sessions: &mut HashMap<PaneId, terminal_core::TermSession>,
+        pane_move_drag: Option<PaneMoveDrag>,
     ) -> (
         bool,
         MenuBarAction,
@@ -752,7 +799,10 @@ impl State {
         }
         if current_page == AppPage::Editor {
             let physical_size = self.window.inner_size();
-            for leaf in target_leaves.iter().filter(|leaf| leaf.kind == PaneKind::Terminal) {
+            for leaf in target_leaves
+                .iter()
+                .filter(|leaf| leaf.kind == PaneKind::Terminal)
+            {
                 let Some(session) = term_sessions.get_mut(&leaf.id) else {
                     continue;
                 };
@@ -773,10 +823,12 @@ impl State {
                 let Some(tex_view) = self.imgui.terminal_texture_view_arc(leaf.id.0) else {
                     continue;
                 };
-                if let Err(e) =
-                    self.renderer
-                        .render_term_to_view(&session.grid, &tex_view, desired.0, desired.1)
-                {
+                if let Err(e) = self.renderer.render_term_to_view(
+                    &session.grid,
+                    &tex_view,
+                    desired.0,
+                    desired.1,
+                ) {
                     tracing::error!("terminal render error: {e}");
                 }
             }
@@ -797,6 +849,22 @@ impl State {
                     ),
                 ))
             })
+            .collect();
+        let pane_alpha: HashMap<PaneId, f32> = leaves
+            .iter()
+            .map(|leaf| {
+                (
+                    leaf.id,
+                    pane_anims
+                        .get(leaf.id)
+                        .map(|anim| anim.alpha)
+                        .unwrap_or(1.0),
+                )
+            })
+            .collect();
+        let terminal_metadata: HashMap<PaneId, terminal_core::TermMetadata> = term_sessions
+            .iter()
+            .map(|(id, session)| (*id, session.metadata()))
             .collect();
         let nvim_scale = self.renderer.scale();
         let mut menu_action = MenuBarAction::None;
@@ -841,8 +909,19 @@ impl State {
                                 }
                                 PaneKind::Terminal => {
                                     if let Some((tid, (tw, th))) = terminal_textures.get(&leaf.id) {
-                                        terminal_view::TerminalView::new(*tid, *tw, *th)
-                                            .draw(ui, leaf.rect, nvim_scale);
+                                        terminal_view::TerminalView::new(*tid, *tw, *th).draw(
+                                            ui,
+                                            leaf.rect,
+                                            nvim_scale,
+                                            pane_alpha.get(&leaf.id).copied().unwrap_or(1.0),
+                                            is_focused,
+                                            terminal_metadata
+                                                .get(&leaf.id)
+                                                .and_then(|metadata| metadata.title.as_deref()),
+                                            terminal_metadata
+                                                .get(&leaf.id)
+                                                .is_some_and(|metadata| metadata.exited),
+                                        );
                                     }
                                 }
                                 PaneKind::Empty => {
@@ -853,6 +932,7 @@ impl State {
                         let gutters = pane_tree.gutters(editor_area_rect, GUTTER_THICKNESS);
                         let mouse = ui.io().mouse_pos;
                         draw_split_gutters(ui, &gutters, mouse);
+                        draw_pane_handles(ui, &leaves, pane_move_drag);
                         if let Some(r) = focused_rect {
                             draw_pane_focus_border(ui, r);
                         }
@@ -990,6 +1070,60 @@ fn draw_split_gutters(ui: &imgui::Ui, gutters: &[crate::pane::SplitGutter], mous
     }
 }
 
+fn draw_pane_handles(
+    ui: &imgui::Ui,
+    leaves: &[crate::pane::LeafLayout],
+    drag: Option<PaneMoveDrag>,
+) {
+    use crate::imgui_theme::{accent, border};
+    let draw = ui.get_foreground_draw_list();
+    let mouse = ui.io().mouse_pos;
+    for leaf in leaves {
+        let handle = pane_handle_rect(leaf.rect);
+        let hovered = handle.contains(mouse[0], mouse[1]);
+        let dragging = drag.is_some_and(|drag| drag.source == leaf.id);
+        let drop_target = drag.is_some_and(|drag| drag.target == Some(leaf.id));
+        let outline = if hovered || dragging || drop_target {
+            accent(ui)
+        } else {
+            border(ui)
+        };
+        if drop_target && !dragging {
+            draw.add_rect(
+                [leaf.rect.x + 3.0, leaf.rect.y + 3.0],
+                [leaf.rect.x + leaf.rect.w - 3.0, leaf.rect.y + leaf.rect.h - 3.0],
+                accent(ui),
+            )
+            .rounding(8.0)
+            .thickness(2.0)
+            .build();
+        }
+        draw.add_rect(
+            [handle.x, handle.y],
+            [handle.x + handle.w, handle.y + handle.h],
+            [0.04, 0.05, 0.08, if dragging { 0.96 } else { 0.78 }],
+        )
+        .filled(true)
+        .rounding(6.0)
+        .build();
+        draw.add_rect(
+            [handle.x, handle.y],
+            [handle.x + handle.w, handle.y + handle.h],
+            outline,
+        )
+        .rounding(6.0)
+        .thickness(if hovered || dragging { 1.5 } else { 1.0 })
+        .build();
+        for row in 0..2 {
+            for col in 0..3 {
+                let x = handle.x + 10.0 + col as f32 * 5.0;
+                let y = handle.y + 7.5 + row as f32 * 5.0;
+                draw.add_circle([x, y], 1.2, outline).filled(true).build();
+            }
+        }
+    }
+}
+
 fn dispatch_context_command(
     session: &NvimSession,
     grid_pos: (i64, i64),
@@ -1111,6 +1245,7 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
+                self.reconcile_terminal_sessions();
                 self.schedule_startup_metadata();
                 tracing::info!(
                     "startup: init complete (+{:.1}ms)",
@@ -1274,15 +1409,17 @@ impl ApplicationHandler<UserEvent> for App {
                 };
             }
             WindowEvent::Ime(ime) => {
-                if focused_kind != PaneKind::Terminal && self.state.as_ref().is_some_and(|s| {
-                    keyboard_to_nvim_blocked(
-                        s,
-                        self.current_page,
-                        picker_open,
-                        focused_kind,
-                        comp_open,
-                    )
-                }) {
+                if focused_kind != PaneKind::Terminal
+                    && self.state.as_ref().is_some_and(|s| {
+                        keyboard_to_nvim_blocked(
+                            s,
+                            self.current_page,
+                            picker_open,
+                            focused_kind,
+                            comp_open,
+                        )
+                    })
+                {
                     return;
                 }
                 let Some(state) = self.state.as_mut() else {
@@ -1298,8 +1435,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 session.paste(text);
                             }
                         } else {
-                        state.session.paste(text);
-                    }
+                            state.session.paste(text);
+                        }
                     }
                     Ime::Disabled => state.ime_active = false,
                 }
@@ -1408,10 +1545,19 @@ impl ApplicationHandler<UserEvent> for App {
                     let Some(state) = self.state.as_ref() else {
                         return;
                     };
-                    if is_paste_shortcut(&event.logical_key, state.mods) {
-                        if let (Some(text), Some(session)) =
-                            (read_clipboard_text(), self.term_sessions.get(&self.pane_tree.focused))
+                    if is_terminal_copy_shortcut(&event.logical_key, state.mods) {
+                        if let Some(text) = self
+                            .term_sessions
+                            .get(&self.pane_tree.focused)
+                            .and_then(|session| session.selection_text())
                         {
+                            write_clipboard_text(text);
+                        }
+                    } else if is_terminal_paste_shortcut(&event.logical_key, state.mods) {
+                        if let (Some(text), Some(session)) = (
+                            read_clipboard_text(),
+                            self.term_sessions.get(&self.pane_tree.focused),
+                        ) {
                             session.paste(text);
                         }
                     } else if state.mods.meta {
@@ -1497,6 +1643,18 @@ impl ApplicationHandler<UserEvent> for App {
                 let cursor = cursor_logical(state);
                 let area = editor_area(&self.settings, &state.renderer);
 
+                // Active pane move: highlight the pane under the pointer and
+                // keep all content mouse input suppressed until drop.
+                if let Some(drag) = self.pane_move_drag.as_mut() {
+                    drag.target = self
+                        .pane_tree
+                        .hit_test(area, cursor.0, cursor.1)
+                        .filter(|target| *target != drag.source);
+                    state.window.set_cursor(winit::window::CursorIcon::Grabbing);
+                    state.window.request_redraw();
+                    return;
+                }
+
                 // Active split drag: update ratio, skip focus change.
                 if let Some(drag) = self.pane_drag {
                     let p = drag.parent_rect;
@@ -1515,7 +1673,9 @@ impl ApplicationHandler<UserEvent> for App {
                     .iter()
                     .find(|g| g.rect.contains(cursor.0, cursor.1))
                     .copied();
-                if let Some(g) = hovered_gutter {
+                if pane_handle_at(&self.pane_tree, area, cursor.0, cursor.1).is_some() {
+                    state.window.set_cursor(winit::window::CursorIcon::Grab);
+                } else if let Some(g) = hovered_gutter {
                     let icon = match g.dir {
                         SplitDir::Horizontal => winit::window::CursorIcon::EwResize,
                         SplitDir::Vertical => winit::window::CursorIcon::NsResize,
@@ -1533,6 +1693,18 @@ impl ApplicationHandler<UserEvent> for App {
                             state.window.request_redraw();
                         }
                     }
+                }
+                if self.pane_tree.focused_kind() == PaneKind::Terminal {
+                    if matches!(state.mouse_down, Some(CoreButton::Left)) {
+                        if let (Some((row, col)), Some(session)) = (
+                            terminal_cell_at(state, &self.settings, &self.pane_tree),
+                            self.term_sessions.get(&self.pane_tree.focused),
+                        ) {
+                            session.update_selection(row, col);
+                            state.window.request_redraw();
+                        }
+                    }
+                    return;
                 }
                 if mouse_to_nvim_blocked(
                     state,
@@ -1570,6 +1742,18 @@ impl ApplicationHandler<UserEvent> for App {
                     let area = editor_area(&self.settings, &state.renderer);
                     match btn_state {
                         ElementState::Pressed => {
+                            if let Some(source) =
+                                pane_handle_at(&self.pane_tree, area, cursor.0, cursor.1)
+                            {
+                                self.pane_tree.focused = source;
+                                self.pane_move_drag = Some(PaneMoveDrag {
+                                    source,
+                                    target: None,
+                                });
+                                state.window.set_cursor(winit::window::CursorIcon::Grabbing);
+                                state.window.request_redraw();
+                                return;
+                            }
                             let gutters = self.pane_tree.gutters(area, GUTTER_THICKNESS);
                             if let Some(g) =
                                 gutters.iter().find(|g| g.rect.contains(cursor.0, cursor.1))
@@ -1584,12 +1768,42 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         ElementState::Released => {
+                            if let Some(drag) = self.pane_move_drag.take() {
+                                if let Some(target) = drag.target {
+                                    self.pane_tree.swap_leaves(drag.source, target);
+                                }
+                                state.window.set_cursor(winit::window::CursorIcon::Default);
+                                state.window.request_redraw();
+                                return;
+                            }
                             if self.pane_drag.take().is_some() {
                                 state.window.request_redraw();
                                 return;
                             }
                         }
                     }
+                }
+
+                if self.pane_tree.focused_kind() == PaneKind::Terminal {
+                    if button == MouseButton::Left {
+                        if let (Some((row, col)), Some(session)) = (
+                            terminal_cell_at(state, &self.settings, &self.pane_tree),
+                            self.term_sessions.get(&self.pane_tree.focused),
+                        ) {
+                            match btn_state {
+                                ElementState::Pressed => {
+                                    state.mouse_down = Some(CoreButton::Left);
+                                    session.start_selection(row, col, state.mods.alt);
+                                }
+                                ElementState::Released => {
+                                    state.mouse_down = None;
+                                    session.update_selection(row, col);
+                                }
+                            }
+                            state.window.request_redraw();
+                        }
+                    }
+                    return;
                 }
 
                 if mouse_to_nvim_blocked(
@@ -1642,6 +1856,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if focused_kind == PaneKind::Terminal {
+                    let Some(state) = self.state.as_mut() else {
+                        return;
+                    };
+                    let (_, ch) = state.renderer.cell_size();
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => (p.y as f32) / ch.max(1.0),
+                    };
+                    state.wheel_scroll_accum += lines * self.settings.mouse_scroll_sensitivity;
+                    let whole = state.wheel_scroll_accum.trunc() as i32;
+                    if whole != 0 {
+                        state.wheel_scroll_accum -= whole as f32;
+                        if let Some(session) = self.term_sessions.get(&self.pane_tree.focused) {
+                            session.scroll(whole);
+                        }
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 if self.state.as_ref().is_some_and(|s| {
                     mouse_to_nvim_blocked(
                         s,
@@ -1703,6 +1937,7 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.git_client,
                         &mut self.project_picker,
                         &mut self.term_sessions,
+                        self.pane_move_drag,
                     )
                 };
                 self.handle_menu_action(menu_action);
@@ -1794,6 +2029,18 @@ fn is_paste_shortcut(key: &Key, mods: Mods) -> bool {
         return false;
     }
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v")) && (mods.meta || mods.ctrl)
+}
+
+fn is_terminal_paste_shortcut(key: &Key, mods: Mods) -> bool {
+    !mods.alt
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+        && (mods.meta || (mods.ctrl && mods.shift))
+}
+
+fn is_terminal_copy_shortcut(key: &Key, mods: Mods) -> bool {
+    !mods.alt
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("c"))
+        && (mods.meta || (mods.ctrl && mods.shift))
 }
 
 fn is_project_picker_shortcut(key: &Key, mods: Mods) -> bool {
@@ -1893,6 +2140,12 @@ fn read_clipboard_text() -> Option<String> {
     clipboard.get_text().ok().filter(|text| !text.is_empty())
 }
 
+fn write_clipboard_text(text: String) {
+    if let Ok(mut clipboard) = Clipboard::new() {
+        let _ = clipboard.set_text(text);
+    }
+}
+
 /// When launched from a shell, re-exec in the background so the terminal prompt returns.
 const DETACHED_ENV: &str = "NEOBEAM_DETACHED";
 
@@ -1945,4 +2198,35 @@ fn main() -> Result<()> {
     let mut app = App::new(proxy, initial_project)?;
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_clipboard_shortcuts_do_not_consume_plain_ctrl_keys() {
+        let c = Key::Character("c".into());
+        let v = Key::Character("v".into());
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let ctrl_shift = Mods {
+            ctrl: true,
+            shift: true,
+            ..Mods::default()
+        };
+        let meta = Mods {
+            meta: true,
+            ..Mods::default()
+        };
+
+        assert!(!is_terminal_copy_shortcut(&c, ctrl));
+        assert!(!is_terminal_paste_shortcut(&v, ctrl));
+        assert!(is_terminal_copy_shortcut(&c, ctrl_shift));
+        assert!(is_terminal_paste_shortcut(&v, ctrl_shift));
+        assert!(is_terminal_copy_shortcut(&c, meta));
+        assert!(is_terminal_paste_shortcut(&v, meta));
+    }
 }

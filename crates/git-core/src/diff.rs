@@ -50,10 +50,7 @@ pub fn head_vs_worktree(repo: &Repo, file: &ChangedFile) -> Result<FileDiff, Git
             .context_lines(3);
 
         // HEAD tree (may not exist on first commit).
-        let head_tree = r
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_tree().ok());
+        let head_tree = r.head().ok().and_then(|h| h.peel_to_tree().ok());
         let diff = match head_tree {
             Some(tree) => r.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?,
             None => r.diff_tree_to_workdir_with_index(None, Some(&mut opts))?,
@@ -101,11 +98,7 @@ fn diff_to_file_diff(diff: &Diff<'_>, target_path: &str) -> Result<FileDiff, Git
         };
         let Some(patch) = patch_opt else { continue };
         let delta = patch.delta();
-        let new_path = delta
-            .new_file()
-            .path()
-            .and_then(Path::to_str)
-            .unwrap_or("");
+        let new_path = delta.new_file().path().and_then(Path::to_str).unwrap_or("");
         let old_path = delta
             .old_file()
             .path()
@@ -123,12 +116,16 @@ fn diff_to_file_diff(diff: &Diff<'_>, target_path: &str) -> Result<FileDiff, Git
 
         let n_hunks = patch.num_hunks();
         for h in 0..n_hunks {
-            let Ok((hunk, _)) = patch.hunk(h) else { continue };
+            let Ok((hunk, _)) = patch.hunk(h) else {
+                continue;
+            };
             let header = std::str::from_utf8(hunk.header()).unwrap_or("").to_string();
             let mut hunk_lines = Vec::new();
             let n_lines = patch.num_lines_in_hunk(h).unwrap_or(0);
             for li in 0..n_lines {
-                let Ok(line) = patch.line_in_hunk(h, li) else { continue };
+                let Ok(line) = patch.line_in_hunk(h, li) else {
+                    continue;
+                };
                 let kind = match line.origin_value() {
                     DiffLineType::Addition => DiffLineKind::Addition,
                     DiffLineType::Deletion => DiffLineKind::Deletion,

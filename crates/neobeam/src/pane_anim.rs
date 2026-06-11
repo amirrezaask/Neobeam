@@ -67,7 +67,12 @@ impl PaneAnim {
         let cy = self.current.y + self.current.h * 0.5;
         let w = self.current.w * self.scale;
         let h = self.current.h * self.scale;
-        Rect { x: cx - w * 0.5, y: cy - h * 0.5, w, h }
+        Rect {
+            x: cx - w * 0.5,
+            y: cy - h * 0.5,
+            w,
+            h,
+        }
     }
 }
 
@@ -87,7 +92,9 @@ pub struct PaneAnimStore {
 
 impl PaneAnimStore {
     pub fn new() -> Self {
-        Self { anims: HashMap::new() }
+        Self {
+            anims: HashMap::new(),
+        }
     }
 
     /// Update targets for the current set of leaves. New IDs spawn-animate in.
@@ -127,7 +134,12 @@ mod tests {
     fn anim_settles_at_target() {
         let mut store = PaneAnimStore::new();
         let id = PaneId(1);
-        let target = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let target = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         store.sync(&[(id, target)]);
         // Initial: scale=0.85, alpha=0 — animating.
         assert!(store.get(id).unwrap().scale < 1.0);
@@ -143,12 +155,22 @@ mod tests {
     fn target_change_animates() {
         let mut store = PaneAnimStore::new();
         let id = PaneId(1);
-        let r1 = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let r1 = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         store.sync(&[(id, r1)]);
         for _ in 0..400 {
             store.tick(0.016);
         }
-        let r2 = Rect { x: 200.0, y: 0.0, w: 100.0, h: 100.0 };
+        let r2 = Rect {
+            x: 200.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         store.sync(&[(id, r2)]);
         assert!(store.tick(0.016));
         assert!(store.get(id).unwrap().current.x > 0.0);

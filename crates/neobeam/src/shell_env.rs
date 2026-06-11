@@ -43,11 +43,8 @@ pub fn ensure_login_path() {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    crate::settings::config_path().map(|p| {
-        p.parent()
-            .unwrap_or(Path::new("."))
-            .join("shell-env.json")
-    })
+    crate::settings::config_path()
+        .map(|p| p.parent().unwrap_or(Path::new(".")).join("shell-env.json"))
 }
 
 fn load_cache(path: &Path) -> Option<ShellEnvCache> {

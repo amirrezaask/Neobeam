@@ -35,7 +35,11 @@ fn multigrid_float_and_split_windows() {
 
     let session = match NvimSession::spawn(
         rt.handle(),
-        SessionConfig { cols: 80, rows: 24, ..Default::default() },
+        SessionConfig {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        },
         redraw,
         on_close,
     ) {
@@ -79,10 +83,15 @@ fn multigrid_float_and_split_windows() {
         float_pos || !active.is_empty(),
         "expected win_float_pos or active_floats after nvim_open_win"
     );
-    assert!(!active.is_empty(), "active_floats must be populated for fade animation");
+    assert!(
+        !active.is_empty(),
+        "active_floats must be populated for fade animation"
+    );
 
     // Close the float; window entry should disappear (fade-out handled in anim layer).
-    session.input(":lua pcall(vim.api.nvim_win_close, vim.api.nvim_get_current_win(), true)<CR>".into());
+    session.input(
+        ":lua pcall(vim.api.nvim_win_close, vim.api.nvim_get_current_win(), true)<CR>".into(),
+    );
     std::thread::sleep(Duration::from_millis(400));
     drain_batches(&mut batches.lock().unwrap(), &mut store);
     // Float may still be in cache during fade; active_floats should eventually empty.

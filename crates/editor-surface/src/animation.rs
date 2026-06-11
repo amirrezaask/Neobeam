@@ -398,19 +398,12 @@ impl AnimationState {
             corner.relative = match shape {
                 CursorShape::Block => [x, y],
                 CursorShape::Vertical => [(x + 0.5) * cell_percentage - 0.5, y],
-                CursorShape::Horizontal => {
-                    [x, -((-y + 0.5) * cell_percentage - 0.5)]
-                }
+                CursorShape::Horizontal => [x, -((-y + 0.5) * cell_percentage - 0.5)],
             };
         }
     }
 
-    fn update_cursor_destination(
-        &mut self,
-        store: &GridStateStore,
-        cell_w: f32,
-        cell_h: f32,
-    ) {
+    fn update_cursor_destination(&mut self, store: &GridStateStore, cell_w: f32, cell_h: f32) {
         let c = store.cursor;
         let (win_row, win_col) = store.window_origin(c.grid);
         let mut grid_row = win_row as f32 + c.row as f32;
@@ -420,7 +413,9 @@ impl AnimationState {
             grid_row -= w.scroll_animation.position;
             let top = 0.0f32;
             let bottom = w.grid_size.1 as f32 - 1.0;
-            grid_row = grid_row.max(w.grid_current.row + top).min(w.grid_current.row + bottom);
+            grid_row = grid_row
+                .max(w.grid_current.row + top)
+                .min(w.grid_current.row + bottom);
         }
 
         self.destination = [grid_col * cell_w, grid_row * cell_h];
@@ -475,9 +470,7 @@ impl AnimationState {
         if moved {
             let drow = (cell.0 as i64 - self.last_cell.0 as i64).unsigned_abs();
             let dcol = (cell.1 as i64 - self.last_cell.1 as i64).unsigned_abs();
-            if self.last_cell.0 != u32::MAX
-                && self.cfg.enable_flashes
-                && (drow >= 3 || dcol >= 20)
+            if self.last_cell.0 != u32::MAX && self.cfg.enable_flashes && (drow >= 3 || dcol >= 20)
             {
                 self.flashes.push(Flash {
                     rect: Rect {
@@ -534,7 +527,12 @@ impl AnimationState {
                     .corners
                     .iter()
                     .enumerate()
-                    .map(|(id, c)| (id, c.direction_alignment(center, self.cursor_w, self.cursor_h)))
+                    .map(|(id, c)| {
+                        (
+                            id,
+                            c.direction_alignment(center, self.cursor_w, self.cursor_h),
+                        )
+                    })
                     .collect();
                 ranks.sort_by(|a, b| {
                     a.1.partial_cmp(&b.1)
@@ -549,7 +547,13 @@ impl AnimationState {
                     out
                 };
                 for (id, corner) in self.corners.iter_mut().enumerate() {
-                    corner.jump(&self.cfg, center, self.cursor_w, self.cursor_h, corner_ranks[id]);
+                    corner.jump(
+                        &self.cfg,
+                        center,
+                        self.cursor_w,
+                        self.cursor_h,
+                        corner_ranks[id],
+                    );
                 }
             }
 
@@ -577,8 +581,7 @@ impl AnimationState {
         for f in self.flashes.iter_mut() {
             f.age += dt;
         }
-        self.flashes
-            .retain(|f| f.age < self.cfg.flash_duration);
+        self.flashes.retain(|f| f.age < self.cfg.flash_duration);
 
         if self.shake > 0.0 {
             self.shake -= self.cfg.screen_shake_decay * dt;
@@ -626,7 +629,10 @@ impl AnimationState {
         if !self.cfg.enable_float_animation {
             return 1.0;
         }
-        self.float_states.get(&grid_id).map(|s| s.opacity).unwrap_or(1.0)
+        self.float_states
+            .get(&grid_id)
+            .map(|s| s.opacity)
+            .unwrap_or(1.0)
     }
 
     pub fn fading_out_float_ids(&self) -> Vec<i64> {
@@ -673,9 +679,10 @@ impl AnimationState {
     }
 
     pub fn is_animating(&self) -> bool {
-        let cursor_moving = self.corners.iter().any(|c| {
-            c.animation_x.position.abs() > 0.01 || c.animation_y.position.abs() > 0.01
-        });
+        let cursor_moving = self
+            .corners
+            .iter()
+            .any(|c| c.animation_x.position.abs() > 0.01 || c.animation_y.position.abs() > 0.01);
         cursor_moving
             || self.windows.is_animating(&self.cfg)
             || !self.flashes.is_empty()
@@ -729,13 +736,16 @@ impl AnimationState {
         });
         let inner: [[f32; 2]; 4] = std::array::from_fn(|i| self.corners[i].current);
         // Approximate outline as outer quad only (inner clipped visually by drawing bg first).
-        vec![QuadInstance {
-            corners: outer,
-            color,
-        }, QuadInstance {
-            corners: inner,
-            color: [0.0, 0.0, 0.0, 0.0],
-        }]
+        vec![
+            QuadInstance {
+                corners: outer,
+                color,
+            },
+            QuadInstance {
+                corners: inner,
+                color: [0.0, 0.0, 0.0, 0.0],
+            },
+        ]
     }
 
     pub fn use_outline_cursor(&self, store: &GridStateStore) -> bool {

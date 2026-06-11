@@ -3,7 +3,11 @@
 //! provides an ergonomic accessor over renderable content.
 
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as VteColor, NamedColor, Rgb};
 use std::sync::Arc;
@@ -31,11 +35,30 @@ impl TermColor {
 #[derive(Clone, Debug)]
 pub struct TermCell {
     pub ch: char,
+    pub zerowidth: Vec<char>,
     pub fg: TermColor,
     pub bg: TermColor,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub dim: bool,
+    pub hidden: bool,
+    pub inverse: bool,
+    pub strikeout: bool,
+    pub wide: bool,
+    pub spacer: bool,
+    pub underline: Underline,
+    pub underline_color: Option<TermColor>,
+    pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Underline {
+    None,
+    Single,
+    Double,
+    Curl,
+    Dotted,
+    Dashed,
 }
 
 /// Resolve a `vte::ansi::Color` to an RGB triple, consulting the color table.
@@ -194,21 +217,46 @@ impl<L: EventListener> TermGrid<L> {
         let term = self.term.lock();
         let content = term.renderable_content();
         let colors = content.colors;
+        let display_offset = content.display_offset as i32;
         for cell in content.display_iter {
-            let row = cell.point.line.0 as usize;
+            let row = (cell.point.line.0 + display_offset).max(0) as usize;
             let col = cell.point.column.0;
             let fg = resolve_color(cell.fg, colors, true);
             let bg = resolve_color(cell.bg, colors, false);
-            use alacritty_terminal::term::cell::Flags;
             let tc = TermCell {
                 ch: cell.c,
+                zerowidth: cell.zerowidth().unwrap_or_default().to_vec(),
                 fg,
                 bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell
+                dim: cell.flags.contains(Flags::DIM),
+                hidden: cell.flags.contains(Flags::HIDDEN),
+                inverse: cell.flags.contains(Flags::INVERSE),
+                strikeout: cell.flags.contains(Flags::STRIKEOUT),
+                wide: cell.flags.contains(Flags::WIDE_CHAR),
+                spacer: cell
                     .flags
-                    .intersects(Flags::UNDERLINE | Flags::DOUBLE_UNDERLINE),
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                underline: if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+                    Underline::Double
+                } else if cell.flags.contains(Flags::UNDERCURL) {
+                    Underline::Curl
+                } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
+                    Underline::Dotted
+                } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
+                    Underline::Dashed
+                } else if cell.flags.contains(Flags::UNDERLINE) {
+                    Underline::Single
+                } else {
+                    Underline::None
+                },
+                underline_color: cell
+                    .underline_color()
+                    .map(|color| resolve_color(color, colors, true)),
+                selected: content
+                    .selection
+                    .is_some_and(|selection| selection.contains(cell.point)),
             };
             f(row, col, tc);
         }
@@ -241,4 +289,37 @@ impl<L: EventListener> TermGrid<L> {
     pub fn mode_enabled(&self, mode: TermMode) -> bool {
         self.term.lock().mode().contains(mode)
     }
+
+    pub fn scroll(&self, lines: i32) {
+        self.term.lock().scroll_display(Scroll::Delta(lines));
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.lock().selection_to_string()
+    }
+
+    pub fn start_selection(&self, row: usize, col: usize, ty: SelectionType) {
+        let mut term = self.term.lock();
+        let point = viewport_point(&term, row, col);
+        term.selection = Some(Selection::new(ty, point, Side::Left));
+    }
+
+    pub fn update_selection(&self, row: usize, col: usize) {
+        let mut term = self.term.lock();
+        let point = viewport_point(&term, row, col);
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
+}
+
+fn viewport_point<L: EventListener>(term: &Term<L>, row: usize, col: usize) -> Point {
+    let max_row = term.grid().screen_lines().saturating_sub(1);
+    let line = row.min(max_row) as i32 - term.grid().display_offset() as i32;
+    let max_col = term.grid().columns().saturating_sub(1);
+    Point::new(Line(line), Column(col.min(max_col)))
 }

@@ -85,7 +85,12 @@ impl WindowRenderState {
         top..end
     }
 
-    pub fn sync_from_store(&mut self, store: &GridStateStore, win: Option<&WindowMeta>, grid: &Grid) {
+    pub fn sync_from_store(
+        &mut self,
+        store: &GridStateStore,
+        win: Option<&WindowMeta>,
+        grid: &Grid,
+    ) {
         self.grid_size = (grid.width, grid.height);
         self.is_float = win.map(|w| w.is_float).unwrap_or(false);
         self.hidden = false;
@@ -104,7 +109,8 @@ impl WindowRenderState {
         };
 
         if self.grid_destination.row != dest.row || self.grid_destination.col != dest.col {
-            if self.grid_start.row.abs() > f32::EPSILON || self.grid_start.col.abs() > f32::EPSILON {
+            if self.grid_start.row.abs() > f32::EPSILON || self.grid_start.col.abs() > f32::EPSILON
+            {
                 self.position_t = 0.0;
                 self.grid_start = self.grid_current;
             } else {
@@ -162,15 +168,10 @@ impl WindowRenderState {
 
         if scroll_delta != 0 && cfg.enable_smooth_scroll {
             let mut scroll_offset = self.scroll_animation.position;
-            let max_delta = self
-                .scrollback_lines
-                .len()
-                .saturating_sub(inner_size);
+            let max_delta = self.scrollback_lines.len().saturating_sub(inner_size);
 
             if scroll_delta.unsigned_abs() > max_delta {
-                let far_lines = cfg
-                    .scroll_animation_far_lines
-                    .min(inner_size as u32) as isize;
+                let far_lines = cfg.scroll_animation_far_lines.min(inner_size as u32) as isize;
                 scroll_offset = -(far_lines * scroll_delta.signum()) as f32;
                 let empty_lines = if scroll_delta > 0 {
                     -far_lines..0
@@ -207,7 +208,10 @@ impl WindowRenderState {
         let start = [self.grid_start.col, self.grid_start.row];
         let end = [self.grid_destination.col, self.grid_destination.row];
         let pos = ease_point(start, end, self.position_t, ease_out_expo);
-        self.grid_current = GridPos { col: pos[0], row: pos[1] };
+        self.grid_current = GridPos {
+            col: pos[0],
+            row: pos[1],
+        };
         animating |= (self.grid_current.col - prev.col).abs() > f32::EPSILON
             || (self.grid_current.row - prev.row).abs() > f32::EPSILON;
 
@@ -260,7 +264,9 @@ pub struct WindowAnimStore {
 
 impl WindowAnimStore {
     pub fn new() -> Self {
-        Self { windows: HashMap::new() }
+        Self {
+            windows: HashMap::new(),
+        }
     }
 
     pub fn sync_from_store(&mut self, store: &GridStateStore) {

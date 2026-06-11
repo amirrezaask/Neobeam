@@ -43,8 +43,7 @@ pub fn walk(repo: &Repo, limit: usize) -> Result<Vec<Commit>, GitError> {
             let author_name = author.name().unwrap_or("").to_string();
             let author_email = author.email().unwrap_or("").to_string();
             let time = c.time().seconds();
-            let parents: Vec<String> =
-                c.parent_ids().map(|p| p.to_string()).collect();
+            let parents: Vec<String> = c.parent_ids().map(|p| p.to_string()).collect();
             out.push(Commit {
                 id,
                 short_id,

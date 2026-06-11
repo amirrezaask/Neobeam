@@ -49,9 +49,21 @@ pub struct ScissorRect {
 
 #[derive(Clone, Copy, Debug)]
 pub enum DrawBatch {
-    Rects { start: u32, count: u32, scissor: Option<ScissorRect> },
-    Glyphs { start: u32, count: u32, scissor: Option<ScissorRect> },
-    Quads { start: u32, count: u32, scissor: Option<ScissorRect> },
+    Rects {
+        start: u32,
+        count: u32,
+        scissor: Option<ScissorRect>,
+    },
+    Glyphs {
+        start: u32,
+        count: u32,
+        scissor: Option<ScissorRect>,
+    },
+    Quads {
+        start: u32,
+        count: u32,
+        scissor: Option<ScissorRect>,
+    },
 }
 
 #[derive(Default)]
@@ -141,7 +153,9 @@ impl FrameBuilder {
             if grid_id != 1 && store.window(grid_id).is_none() {
                 continue;
             }
-            let Some(grid) = store.grid(grid_id) else { continue };
+            let Some(grid) = store.grid(grid_id) else {
+                continue;
+            };
             let win = store.window(grid_id);
             let is_float = win.map(|w| w.is_float).unwrap_or(false);
             let opacity = if is_float {
@@ -184,7 +198,9 @@ impl FrameBuilder {
             if store.window(grid_id).map(|w| w.is_float).unwrap_or(false) {
                 continue;
             }
-            let Some(cached) = float_cache.get(&grid_id) else { continue };
+            let Some(cached) = float_cache.get(&grid_id) else {
+                continue;
+            };
             let opacity = anim.float_opacity(grid_id);
             if opacity <= 0.01 {
                 continue;
@@ -319,18 +335,14 @@ fn draw_grid(
         });
     }
 
-    let use_scrollback = opts.scroll
-        && anim.cfg.enable_smooth_scroll
-        && win_state.is_some();
+    let use_scrollback = opts.scroll && anim.cfg.enable_smooth_scroll && win_state.is_some();
 
     let top_margin = win_state.map(|w| w.top_margin).unwrap_or(0);
     let bottom_margin = win_state.map(|w| w.bottom_margin).unwrap_or(0);
     let has_margins = top_margin + bottom_margin > 0;
     let top_inset = top_margin as f32 * cell_h;
     let bottom_inset = bottom_margin as f32 * cell_h;
-    let inner_h = grid
-        .height
-        .saturating_sub(top_margin + bottom_margin) as isize;
+    let inner_h = grid.height.saturating_sub(top_margin + bottom_margin) as isize;
 
     let inner_scissor = if opts.clip && has_margins {
         Some(ScissorRect {
@@ -399,7 +411,9 @@ fn draw_grid(
             if use_scrollback {
                 let scroll_offset_lines = w.scroll_animation.position.floor() as u32;
                 for inner_row in 0..inner_h + 1 {
-                    let Some(line) = w.line_at(inner_row) else { continue };
+                    let Some(line) = w.line_at(inner_row) else {
+                        continue;
+                    };
                     let y = grid_y + top_inset + scroll_off + inner_row as f32 * cell_h;
                     let inner_y0 = grid_y + top_inset;
                     let inner_y1 = grid_y + grid_h - bottom_inset;
@@ -466,7 +480,9 @@ fn draw_grid(
     } else if use_scrollback {
         if let Some(w) = win_state {
             for inner_row in 0..grid.height as isize + 1 {
-                let Some(line) = w.line_at(inner_row) else { continue };
+                let Some(line) = w.line_at(inner_row) else {
+                    continue;
+                };
                 let y = grid_y + scroll_off + inner_row as f32 * cell_h;
                 if opts.clip && (y + cell_h <= grid_y || y >= grid_y + grid_h) {
                     continue;

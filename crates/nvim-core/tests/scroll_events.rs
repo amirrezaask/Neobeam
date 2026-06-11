@@ -22,7 +22,11 @@ fn scroll_delta_reaches_global_grid() {
 
     let session = match NvimSession::spawn(
         rt.handle(),
-        SessionConfig { cols: 80, rows: 24, ..Default::default() },
+        SessionConfig {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        },
         redraw,
         on_close,
     ) {
@@ -39,8 +43,7 @@ fn scroll_delta_reaches_global_grid() {
     std::thread::sleep(Duration::from_millis(400));
 
     let drain = |label: &str| -> i64 {
-        let pending: Vec<Vec<nvim_core::Value>> =
-            std::mem::take(&mut *batches.lock().unwrap());
+        let pending: Vec<Vec<nvim_core::Value>> = std::mem::take(&mut *batches.lock().unwrap());
         let mut store = GridStateStore::new();
         let mut total: i64 = 0;
         // Replay each notification batch exactly like the app event loop.

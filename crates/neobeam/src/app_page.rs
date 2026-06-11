@@ -7,4 +7,3 @@ pub enum AppPage {
     GitClient,
     Settings,
 }
-

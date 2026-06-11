@@ -34,8 +34,7 @@ pub fn resolve_cell(store: &GridStateStore, hl_id: u32) -> CellColors {
         std::mem::swap(&mut fg, &mut bg);
     }
 
-    let bg_is_default = !reverse
-        && attr.and_then(|a| a.background).is_none();
+    let bg_is_default = !reverse && attr.and_then(|a| a.background).is_none();
 
     CellColors {
         fg: rgb_to_rgba(fg),
@@ -55,10 +54,7 @@ pub fn resolve_cursor(store: &GridStateStore) -> (Rgba, Rgba) {
     let default_fill = rgb_to_rgba(def.fg);
     let default_glyph = rgb_to_rgba(def.bg);
 
-    let attr_id = store
-        .current_mode()
-        .map(|m| m.attr_id)
-        .unwrap_or(0);
+    let attr_id = store.current_mode().map(|m| m.attr_id).unwrap_or(0);
 
     if attr_id == 0 {
         return (default_fill, default_glyph);

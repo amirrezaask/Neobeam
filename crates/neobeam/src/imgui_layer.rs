@@ -1,8 +1,8 @@
 //! Dear ImGui integration: winit input + wgpu rendering into the editor surface.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::HashMap;
 
 use anyhow::Result;
 use arboard::Clipboard;
@@ -242,15 +242,21 @@ impl ImguiLayer {
     }
 
     pub fn terminal_texture_id(&self, pane_id: u32) -> Option<imgui::TextureId> {
-        self.terminal_textures.get(&pane_id).map(|texture| texture.id)
+        self.terminal_textures
+            .get(&pane_id)
+            .map(|texture| texture.id)
     }
 
     pub fn terminal_texture_view_arc(&self, pane_id: u32) -> Option<Arc<wgpu::TextureView>> {
-        self.terminal_textures.get(&pane_id).map(|texture| texture.view.clone())
+        self.terminal_textures
+            .get(&pane_id)
+            .map(|texture| texture.view.clone())
     }
 
     pub fn terminal_texture_size(&self, pane_id: u32) -> Option<(u32, u32)> {
-        self.terminal_textures.get(&pane_id).map(|texture| texture.size)
+        self.terminal_textures
+            .get(&pane_id)
+            .map(|texture| texture.size)
     }
 
     pub fn remove_terminal_texture(&mut self, pane_id: u32) {
