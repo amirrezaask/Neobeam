@@ -444,7 +444,7 @@ impl GitClient {
                 self.draw_tab_bar(ui);
                 ui.separator();
                 if let Some(err) = &self.error {
-                    ui.text_colored([1.0, 0.45, 0.45, 1.0], err);
+                    ui.text_colored(crate::imgui_theme::error_text(ui), err);
                 }
                 match self.active_tab {
                     GitTab::LocalChanges => {
@@ -463,6 +463,7 @@ impl GitClient {
     }
 
     fn draw_tab_bar(&mut self, ui: &Ui) {
+        let mut underline: Option<([f32; 2], [f32; 2])> = None;
         for (i, tab) in GitTab::ALL.iter().enumerate() {
             if i > 0 {
                 ui.same_line();
@@ -479,6 +480,17 @@ impl GitClient {
             if ui.button(tab.label()) {
                 self.active_tab = *tab;
             }
+            if selected {
+                let min = ui.item_rect_min();
+                let max = ui.item_rect_max();
+                underline = Some(([min[0], max[1] + 2.0], [max[0], max[1] + 2.0]));
+            }
+        }
+        if let Some((a, b)) = underline {
+            ui.get_window_draw_list()
+                .add_line(a, b, crate::imgui_theme::accent(ui))
+                .thickness(2.0)
+                .build();
         }
     }
 
@@ -563,7 +575,8 @@ impl GitClient {
         let row_y = |row: u32| origin[1] + (row as f32 + 0.5) * ROW_H;
 
         // Draw edges first so dots sit on top.
-        let palette = lane_palette();
+        let palette: [[f32; 4]; 8] = std::array::from_fn(|i| crate::imgui_theme::git_lane_color(ui, i));
+        let dot_shadow = crate::imgui_theme::git_lane_dot_shadow(ui);
         for e in &self.log_graph.edges {
             let p0 = [lane_x(e.from_lane), row_y(e.from_row)];
             let p3 = [lane_x(e.to_lane), row_y(e.to_row)];
@@ -616,7 +629,7 @@ impl GitClient {
                 .filled(true)
                 .num_segments(16)
                 .build();
-            draw.add_circle([cx, cy], DOT_R + 1.0, [0.0, 0.0, 0.0, 0.6])
+            draw.add_circle([cx, cy], DOT_R + 1.0, dot_shadow)
                 .thickness(1.0)
                 .num_segments(16)
                 .build();
@@ -797,9 +810,26 @@ impl GitClient {
                 if files.is_empty() {
                     ui.text_disabled("No changes.");
                 } else {
-                    for file in &files {
+                    let alt = ui.style_color(StyleColor::TableRowBgAlt);
+                    let pad = ui.push_style_var(imgui::StyleVar::FramePadding([
+                        crate::imgui_theme::METRICS.frame_padding[0],
+                        crate::imgui_theme::METRICS.frame_padding[1] + 2.0,
+                    ]));
+                    for (i, file) in files.iter().enumerate() {
+                        if i % 2 == 1 {
+                            let min = ui.cursor_screen_pos();
+                            let line_h = ui.text_line_height_with_spacing()
+                                + crate::imgui_theme::METRICS.frame_padding[1] * 2.0
+                                + 4.0;
+                            let w = ui.content_region_avail()[0];
+                            ui.get_window_draw_list()
+                                .add_rect(min, [min[0] + w, min[1] + line_h], alt)
+                                .filled(true)
+                                .build();
+                        }
                         self.draw_file_entry(ui, file);
                     }
+                    drop(pad);
                 }
             });
 
@@ -1213,6 +1243,7 @@ struct DiffColors {
 }
 
 fn diff_colors(ui: &Ui) -> DiffColors {
+    use crate::imgui_theme as theme;
     let style = unsafe { ui.style() };
     let text = style.colors[StyleColor::Text as usize];
     let disabled = style.colors[StyleColor::TextDisabled as usize];
@@ -1220,12 +1251,12 @@ fn diff_colors(ui: &Ui) -> DiffColors {
     DiffColors {
         gutter: disabled,
         equal_text: text,
-        delete_bg: [0.35, 0.15, 0.15, 0.55],
-        delete_text: [0.95, 0.55, 0.55, 1.0],
-        delete_emphasis: [1.0, 0.35, 0.35, 1.0],
-        insert_bg: [0.12, 0.28, 0.15, 0.55],
-        insert_text: [0.55, 0.9, 0.65, 1.0],
-        insert_emphasis: [0.35, 1.0, 0.5, 1.0],
+        delete_bg: theme::diff_delete_bg(ui),
+        delete_text: theme::diff_delete_text(ui),
+        delete_emphasis: theme::diff_delete_emphasis(ui),
+        insert_bg: theme::diff_insert_bg(ui),
+        insert_text: theme::diff_insert_text(ui),
+        insert_emphasis: theme::diff_insert_emphasis(ui),
     }
 }
 
@@ -1418,19 +1449,6 @@ fn draw_diff_half(
     if line.segments.is_empty() {
         ui.new_line();
     }
-}
-
-fn lane_palette() -> [[f32; 4]; 8] {
-    [
-        [0.45, 0.68, 1.00, 1.0], // blue
-        [0.55, 0.85, 0.55, 1.0], // green
-        [0.95, 0.65, 0.35, 1.0], // orange
-        [0.85, 0.55, 0.90, 1.0], // purple
-        [0.95, 0.55, 0.55, 1.0], // red
-        [0.55, 0.85, 0.85, 1.0], // teal
-        [0.95, 0.85, 0.40, 1.0], // yellow
-        [0.70, 0.70, 0.85, 1.0], // lilac
-    ]
 }
 
 fn measure_text_w(s: &str) -> f32 {

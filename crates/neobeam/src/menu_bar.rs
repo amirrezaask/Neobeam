@@ -4,18 +4,19 @@ use editor_surface::list_monospace_fonts;
 use imgui::{Condition, StyleColor, Ui, WindowFlags};
 use nvim_core::session::{NvimSession, WinbarInfo};
 
+use crate::imgui_theme::{section_label_color, METRICS};
 use crate::layout::Rect;
 use crate::settings::Settings;
 
-fn blend_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    let t = t.clamp(0.0, 1.0);
-    let u = 1.0 - t;
-    [
-        a[0] * u + b[0] * t,
-        a[1] * u + b[1] * t,
-        a[2] * u + b[2] * t,
-        a[3] * u + b[3] * t,
-    ]
+fn section_header(ui: &Ui, label: &str) {
+    let color = ui.push_style_color(StyleColor::Text, section_label_color(ui));
+    ui.text(label);
+    color.pop();
+    ui.separator();
+}
+
+fn section_break(ui: &Ui) {
+    ui.dummy([0.0, METRICS.item_spacing[1] * 2.0]);
 }
 
 pub struct MenuBar {
@@ -91,52 +92,20 @@ impl MenuBar {
             .movable(false)
             .resizable(false)
             .build(|| {
-                let section_color = ui.push_style_color(
-                    StyleColor::Text,
-                    blend_rgba(
-                        ui.style_color(StyleColor::Text),
-                        ui.style_color(StyleColor::WindowBg),
-                        0.3,
-                    ),
-                );
-                ui.text("FONT");
-                section_color.pop();
-                ui.separator();
+                section_header(ui, "FONT");
                 settings_changed |= self.draw_font_section(ui, settings);
 
-                ui.spacing();
-                ui.spacing();
+                section_break(ui);
 
-                let section_color = ui.push_style_color(
-                    StyleColor::Text,
-                    blend_rgba(
-                        ui.style_color(StyleColor::Text),
-                        ui.style_color(StyleColor::WindowBg),
-                        0.3,
-                    ),
-                );
-                ui.text("THEME");
-                section_color.pop();
-                ui.separator();
+                section_header(ui, "THEME");
                 if let Some(name) = self.draw_theme_section(ui, session) {
                     self.selected_theme = Some(name.clone());
                     theme_changed = Some(name);
                 }
 
-                ui.spacing();
-                ui.spacing();
+                section_break(ui);
 
-                let section_color = ui.push_style_color(
-                    StyleColor::Text,
-                    blend_rgba(
-                        ui.style_color(StyleColor::Text),
-                        ui.style_color(StyleColor::WindowBg),
-                        0.3,
-                    ),
-                );
-                ui.text("ANIMATIONS");
-                section_color.pop();
-                ui.separator();
+                section_header(ui, "ANIMATIONS");
                 settings_changed |= self.draw_animations_menu(ui, settings);
             });
 
@@ -180,7 +149,11 @@ impl MenuBar {
         }
 
         let mut font_size = settings.font_size;
-        if ui.slider("Size (px)", 10.0, 32.0, &mut font_size) {
+        if ui
+            .slider_config("Size", 10.0, 32.0)
+            .display_format("%.0f px")
+            .build(&mut font_size)
+        {
             settings.font_size = font_size.round();
             changed = true;
         }
@@ -285,14 +258,16 @@ impl MenuBar {
             let mut far_lines = settings.scroll_animation_far_lines as f32;
             if ui
                 .slider_config("Far scroll lines", 0.0, 10.0)
-                .display_format("%.0f")
+                .display_format("%.0f lines")
                 .build(&mut far_lines)
             {
                 settings.scroll_animation_far_lines =
                     far_lines.round().clamp(0.0, 10.0) as u32;
                 changed = true;
             }
-            ui.text_disabled("0 = snap large jumps");
+            if ui.is_item_hovered() {
+                ui.tooltip_text("0 = snap immediately on large jumps");
+            }
 
             if ui.checkbox("Float fade + slide", &mut settings.enable_float_animation) {
                 changed = true;
@@ -306,9 +281,7 @@ impl MenuBar {
                 }
             }
         } else {
-            let color = ui.push_style_color(StyleColor::Text, [0.55, 0.57, 0.62, 1.0]);
-            ui.text_wrapped("Enable animations to configure motion effects.");
-            color.pop();
+            ui.text_disabled("Enable animations to configure motion effects.");
         }
 
         changed

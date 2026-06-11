@@ -2,6 +2,7 @@
 
 use imgui::{Condition, Key, StyleVar, Ui, WindowFlags};
 
+use crate::imgui_theme::METRICS;
 use crate::pane::PaneKind;
 
 const ITEMS: &[(PaneKind, &str, &str)] = &[
@@ -72,8 +73,8 @@ impl ComponentPicker {
             | WindowFlags::NO_COLLAPSE
             | WindowFlags::NO_SCROLLBAR;
 
-        let rounding = ui.push_style_var(StyleVar::WindowRounding(8.0));
-        let pad = ui.push_style_var(StyleVar::WindowPadding([16.0, 14.0]));
+        let rounding = ui.push_style_var(StyleVar::WindowRounding(METRICS.window_rounding));
+        let pad = ui.push_style_var(StyleVar::WindowPadding(METRICS.window_padding));
         let mut clicked: Option<usize> = None;
         ui.window("##component_picker")
             .position(pos, Condition::Always)

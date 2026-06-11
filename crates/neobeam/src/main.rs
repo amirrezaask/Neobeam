@@ -695,8 +695,12 @@ impl State {
             self.imgui
                 .prepare_ui(&window, store, settings.font_size, device, queue, |ui| {
                     if current_page == AppPage::Editor {
+                        let mut focused_rect: Option<Rect> = None;
                         for leaf in &leaves {
                             let is_focused = leaf.id == focused_id;
+                            if is_focused && leaves.len() > 1 {
+                                focused_rect = Some(leaf.rect);
+                            }
                             match leaf.kind {
                                 PaneKind::Nvim => {
                                     if let Some(tid) = nvim_texture_id {
@@ -721,6 +725,12 @@ impl State {
                                     draw_empty_pane(ui, leaf.rect, is_focused);
                                 }
                             }
+                        }
+                        let gutters = pane_tree.gutters(editor_area_rect, GUTTER_THICKNESS);
+                        let mouse = ui.io().mouse_pos;
+                        draw_split_gutters(ui, &gutters, mouse);
+                        if let Some(r) = focused_rect {
+                            draw_pane_focus_border(ui, r);
                         }
                         context_action = context_menu.draw(ui);
                     }
@@ -785,11 +795,7 @@ fn draw_empty_pane(ui: &imgui::Ui, rect: Rect, focused: bool) {
         | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
         | WindowFlags::NO_DECORATION
         | WindowFlags::NO_INPUTS;
-    let bg = if focused {
-        [0.10, 0.11, 0.14, 1.0]
-    } else {
-        [0.07, 0.08, 0.10, 1.0]
-    };
+    let bg = crate::imgui_theme::pane_bg(ui, focused);
     let _bg = ui.push_style_color(imgui::StyleColor::WindowBg, bg);
     let id = format!("##empty_pane_{}_{}", rect.x as i32, rect.y as i32);
     ui.window(&id)
@@ -797,13 +803,69 @@ fn draw_empty_pane(ui: &imgui::Ui, rect: Rect, focused: bool) {
         .size([rect.w, rect.h], Condition::Always)
         .flags(flags)
         .build(|| {
-            let label = "Empty pane — pick a component (Cmd+T)";
-            let ts = ui.calc_text_size(label);
-            let cx = rect.w * 0.5 - ts[0] * 0.5;
-            let cy = rect.h * 0.5 - ts[1] * 0.5;
-            ui.set_cursor_pos([cx, cy]);
-            ui.text_disabled(label);
+            let title = "Empty pane";
+            let hint = "Press ⌘T to pick a component";
+            let ts_title = ui.calc_text_size(title);
+            let ts_hint = ui.calc_text_size(hint);
+            let total_h = ts_title[1] + ts_hint[1] + 6.0;
+            let mut cy = rect.h * 0.5 - total_h * 0.5;
+            ui.set_cursor_pos([rect.w * 0.5 - ts_title[0] * 0.5, cy]);
+            ui.text_disabled(title);
+            cy += ts_title[1] + 6.0;
+            ui.set_cursor_pos([rect.w * 0.5 - ts_hint[0] * 0.5, cy]);
+            ui.text_disabled(hint);
         });
+}
+
+/// Overlay a 1-px accent-tinted border around the focused pane on the
+/// foreground draw list. Quiet enough to coexist with nvim's own coloring.
+fn draw_pane_focus_border(ui: &imgui::Ui, rect: Rect) {
+    use crate::imgui_theme::{pane_focus_border_color, METRICS};
+    let color = pane_focus_border_color(ui);
+    let draw = ui.get_foreground_draw_list();
+    draw.add_rect(
+        [rect.x + 0.5, rect.y + 0.5],
+        [rect.x + rect.w - 0.5, rect.y + rect.h - 0.5],
+        color,
+    )
+    .rounding(METRICS.frame_rounding)
+    .thickness(METRICS.pane_focus_border)
+    .build();
+}
+
+/// Draw a thin line at the center of each split gutter. Lights up to the
+/// accent color when the user is hovering it for resize.
+fn draw_split_gutters(ui: &imgui::Ui, gutters: &[crate::pane::SplitGutter], mouse: [f32; 2]) {
+    use crate::imgui_theme::{accent, border, METRICS};
+    use crate::pane::SplitDir;
+    if gutters.is_empty() {
+        return;
+    }
+    let draw = ui.get_background_draw_list();
+    let normal = border(ui);
+    let hot = accent(ui);
+    for g in gutters {
+        let r = g.rect;
+        let inside = mouse[0] >= r.x
+            && mouse[0] <= r.x + r.w
+            && mouse[1] >= r.y
+            && mouse[1] <= r.y + r.h;
+        let color = if inside { hot } else { normal };
+        match g.dir {
+            SplitDir::Horizontal => {
+                let x = r.x + r.w * 0.5;
+                draw.add_line([x, r.y], [x, r.y + r.h], color)
+                    .thickness(METRICS.gutter_line)
+                    .build();
+            }
+            SplitDir::Vertical => {
+                let y = r.y + r.h * 0.5;
+                draw.add_line([r.x, y], [r.x + r.w, y], color)
+                    .thickness(METRICS.gutter_line)
+                    .build();
+            }
+        }
+    }
 }
 
 fn dispatch_context_command(
