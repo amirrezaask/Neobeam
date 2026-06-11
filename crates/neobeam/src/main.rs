@@ -44,7 +44,7 @@ use nvim_core::input::{
 use nvim_core::protocol::parse_redraw;
 use nvim_core::session::{NvimBoot, NvimSession, SessionConfig, WinbarInfo};
 use nvim_core::Value;
-use pane::{FocusDir, PaneId, PaneKind, PaneTree, SplitDir, SplitId};
+use pane::{FocusDir, PaneId, PaneKind, PaneSide, PaneTree, SplitDir, SplitId};
 use pane_anim::PaneAnimStore;
 use project::Project;
 use project_picker::ProjectPicker;
@@ -133,7 +133,19 @@ struct PaneDrag {
 #[derive(Clone, Copy, Debug)]
 struct PaneMoveDrag {
     source: PaneId,
-    target: Option<PaneId>,
+    target: Option<PaneDropTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneDropTarget {
+    pane: PaneId,
+    zone: PaneDropZone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneDropZone {
+    Swap,
+    Side(PaneSide),
 }
 
 /// Gutter thickness in logical px — generous enough to grab without precision.
@@ -175,6 +187,69 @@ fn pane_handle_at(pane_tree: &PaneTree, area: Rect, x: f32, y: f32) -> Option<Pa
         .into_iter()
         .find(|leaf| pane_handle_rect(leaf.rect).contains(x, y))
         .map(|leaf| leaf.id)
+}
+
+fn pane_drop_target(
+    pane_tree: &PaneTree,
+    area: Rect,
+    source: PaneId,
+    x: f32,
+    y: f32,
+) -> Option<PaneDropTarget> {
+    let leaf = pane_tree
+        .layout(area)
+        .into_iter()
+        .find(|leaf| leaf.id != source && leaf.rect.contains(x, y))?;
+    let rx = ((x - leaf.rect.x) / leaf.rect.w.max(1.0)).clamp(0.0, 1.0);
+    let ry = ((y - leaf.rect.y) / leaf.rect.h.max(1.0)).clamp(0.0, 1.0);
+    let edges = [
+        (rx, PaneSide::Left),
+        (1.0 - rx, PaneSide::Right),
+        (ry, PaneSide::Top),
+        (1.0 - ry, PaneSide::Bottom),
+    ];
+    let (distance, side) = edges
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .expect("drop target has edges");
+    let zone = if distance < 0.25 {
+        PaneDropZone::Side(side)
+    } else {
+        PaneDropZone::Swap
+    };
+    Some(PaneDropTarget {
+        pane: leaf.id,
+        zone,
+    })
+}
+
+fn pane_drop_preview(rect: Rect, zone: PaneDropZone) -> Rect {
+    match zone {
+        PaneDropZone::Swap => Rect {
+            x: rect.x + 3.0,
+            y: rect.y + 3.0,
+            w: rect.w - 6.0,
+            h: rect.h - 6.0,
+        },
+        PaneDropZone::Side(PaneSide::Left) => Rect {
+            w: rect.w * 0.5,
+            ..rect
+        },
+        PaneDropZone::Side(PaneSide::Right) => Rect {
+            x: rect.x + rect.w * 0.5,
+            w: rect.w * 0.5,
+            ..rect
+        },
+        PaneDropZone::Side(PaneSide::Top) => Rect {
+            h: rect.h * 0.5,
+            ..rect
+        },
+        PaneDropZone::Side(PaneSide::Bottom) => Rect {
+            y: rect.y + rect.h * 0.5,
+            h: rect.h * 0.5,
+            ..rect
+        },
+    }
 }
 
 fn terminal_cell_at(
@@ -1082,16 +1157,29 @@ fn draw_pane_handles(
         let handle = pane_handle_rect(leaf.rect);
         let hovered = handle.contains(mouse[0], mouse[1]);
         let dragging = drag.is_some_and(|drag| drag.source == leaf.id);
-        let drop_target = drag.is_some_and(|drag| drag.target == Some(leaf.id));
-        let outline = if hovered || dragging || drop_target {
+        let drop_target = drag
+            .and_then(|drag| drag.target)
+            .filter(|target| target.pane == leaf.id);
+        let outline = if hovered || dragging || drop_target.is_some() {
             accent(ui)
         } else {
             border(ui)
         };
-        if drop_target && !dragging {
+        if let Some(target) = drop_target.filter(|_| !dragging) {
+            let preview = pane_drop_preview(leaf.rect, target.zone);
+            let mut fill = accent(ui);
+            fill[3] = 0.16;
             draw.add_rect(
-                [leaf.rect.x + 3.0, leaf.rect.y + 3.0],
-                [leaf.rect.x + leaf.rect.w - 3.0, leaf.rect.y + leaf.rect.h - 3.0],
+                [preview.x, preview.y],
+                [preview.x + preview.w, preview.y + preview.h],
+                fill,
+            )
+            .filled(true)
+            .rounding(8.0)
+            .build();
+            draw.add_rect(
+                [preview.x, preview.y],
+                [preview.x + preview.w, preview.y + preview.h],
                 accent(ui),
             )
             .rounding(8.0)
@@ -1646,10 +1734,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // Active pane move: highlight the pane under the pointer and
                 // keep all content mouse input suppressed until drop.
                 if let Some(drag) = self.pane_move_drag.as_mut() {
-                    drag.target = self
-                        .pane_tree
-                        .hit_test(area, cursor.0, cursor.1)
-                        .filter(|target| *target != drag.source);
+                    drag.target =
+                        pane_drop_target(&self.pane_tree, area, drag.source, cursor.0, cursor.1);
                     state.window.set_cursor(winit::window::CursorIcon::Grabbing);
                     state.window.request_redraw();
                     return;
@@ -1770,7 +1856,18 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Released => {
                             if let Some(drag) = self.pane_move_drag.take() {
                                 if let Some(target) = drag.target {
-                                    self.pane_tree.swap_leaves(drag.source, target);
+                                    match target.zone {
+                                        PaneDropZone::Swap => {
+                                            self.pane_tree.swap_leaves(drag.source, target.pane);
+                                        }
+                                        PaneDropZone::Side(side) => {
+                                            self.pane_tree.move_leaf(
+                                                drag.source,
+                                                target.pane,
+                                                side,
+                                            );
+                                        }
+                                    }
                                 }
                                 state.window.set_cursor(winit::window::CursorIcon::Default);
                                 state.window.request_redraw();
@@ -2228,5 +2325,40 @@ mod tests {
         assert!(is_terminal_paste_shortcut(&v, ctrl_shift));
         assert!(is_terminal_copy_shortcut(&c, meta));
         assert!(is_terminal_paste_shortcut(&v, meta));
+    }
+
+    #[test]
+    fn pane_drop_target_uses_top_bottom_edges_and_center_swap() {
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 800.0,
+        };
+        let mut tree = PaneTree::new_with(PaneKind::Nvim);
+        let target = tree.split_focused(SplitDir::Horizontal);
+        let source = tree.layout(area)[0].id;
+
+        assert_eq!(
+            pane_drop_target(&tree, area, source, 750.0, 10.0),
+            Some(PaneDropTarget {
+                pane: target,
+                zone: PaneDropZone::Side(PaneSide::Top),
+            })
+        );
+        assert_eq!(
+            pane_drop_target(&tree, area, source, 750.0, 790.0),
+            Some(PaneDropTarget {
+                pane: target,
+                zone: PaneDropZone::Side(PaneSide::Bottom),
+            })
+        );
+        assert_eq!(
+            pane_drop_target(&tree, area, source, 750.0, 400.0),
+            Some(PaneDropTarget {
+                pane: target,
+                zone: PaneDropZone::Swap,
+            })
+        );
     }
 }

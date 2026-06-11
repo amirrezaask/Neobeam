@@ -18,6 +18,14 @@ pub enum SplitDir {
     Vertical,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// Kind of content a leaf hosts. `Empty` is the placeholder shown right after
 /// a split — the component picker fills it in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +457,95 @@ impl PaneTree {
         Self::find_kind(&self.root, self.focused).unwrap_or(PaneKind::Empty)
     }
 
+    /// Move a complete leaf beside another leaf, collapsing its old parent and
+    /// creating a new split at the destination.
+    pub fn move_leaf(&mut self, source: PaneId, target: PaneId, side: PaneSide) -> bool {
+        if source == target
+            || Self::find_kind(&self.root, source).is_none()
+            || Self::find_kind(&self.root, target).is_none()
+        {
+            return false;
+        }
+
+        let Some(moving) = Self::take_leaf(&mut self.root, source) else {
+            return false;
+        };
+        let split_id = self.alloc_split_id();
+        Self::insert_beside(&mut self.root, target, moving, split_id, side)
+    }
+
+    fn take_leaf(node: &mut PaneNode, target: PaneId) -> Option<PaneNode> {
+        let PaneNode::Split { a, b, .. } = node else {
+            return None;
+        };
+        let a_hit = matches!(a.as_ref(), PaneNode::Leaf { id, .. } if *id == target);
+        let b_hit = matches!(b.as_ref(), PaneNode::Leaf { id, .. } if *id == target);
+
+        if a_hit || b_hit {
+            let PaneNode::Split { a, b, .. } = std::mem::replace(
+                node,
+                PaneNode::Leaf {
+                    id: PaneId(0),
+                    kind: PaneKind::Empty,
+                },
+            ) else {
+                unreachable!();
+            };
+            let (moving, keep) = if a_hit { (*a, *b) } else { (*b, *a) };
+            *node = keep;
+            return Some(moving);
+        }
+
+        Self::take_leaf(a, target).or_else(|| Self::take_leaf(b, target))
+    }
+
+    fn insert_beside(
+        node: &mut PaneNode,
+        target: PaneId,
+        moving: PaneNode,
+        split_id: SplitId,
+        side: PaneSide,
+    ) -> bool {
+        match node {
+            PaneNode::Leaf { id, .. } if *id == target => {
+                let existing = std::mem::replace(
+                    node,
+                    PaneNode::Leaf {
+                        id: PaneId(0),
+                        kind: PaneKind::Empty,
+                    },
+                );
+                let (dir, moving_first) = match side {
+                    PaneSide::Left => (SplitDir::Horizontal, true),
+                    PaneSide::Right => (SplitDir::Horizontal, false),
+                    PaneSide::Top => (SplitDir::Vertical, true),
+                    PaneSide::Bottom => (SplitDir::Vertical, false),
+                };
+                let (a, b) = if moving_first {
+                    (moving, existing)
+                } else {
+                    (existing, moving)
+                };
+                *node = PaneNode::Split {
+                    id: split_id,
+                    dir,
+                    ratio: 0.5,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                };
+                true
+            }
+            PaneNode::Leaf { .. } => false,
+            PaneNode::Split { a, b, .. } => {
+                if Self::find_kind(a, target).is_some() {
+                    Self::insert_beside(a, target, moving, split_id, side)
+                } else {
+                    Self::insert_beside(b, target, moving, split_id, side)
+                }
+            }
+        }
+    }
+
     /// Swap two complete leaves, preserving each pane's ID, kind, and backing
     /// resources while moving them to each other's layout slots.
     pub fn swap_leaves(&mut self, first: PaneId, second: PaneId) -> bool {
@@ -461,13 +558,7 @@ impl PaneTree {
         let Some(second_kind) = Self::find_kind(&self.root, second) else {
             return false;
         };
-        Self::swap_in(
-            &mut self.root,
-            first,
-            first_kind,
-            second,
-            second_kind,
-        );
+        Self::swap_in(&mut self.root, first, first_kind, second, second_kind);
         true
     }
 
@@ -599,5 +690,40 @@ mod tests {
         assert_eq!(after[0].kind, PaneKind::Terminal);
         assert_eq!(after[1].id, left);
         assert_eq!(after[1].kind, PaneKind::Nvim);
+    }
+
+    #[test]
+    fn move_leaf_to_bottom_changes_split_direction() {
+        let mut t = PaneTree::new_with(PaneKind::Nvim);
+        let right = t.split_focused(SplitDir::Horizontal);
+        t.set_focused_kind(PaneKind::Terminal);
+        let left = t.layout(area())[0].id;
+
+        assert!(t.move_leaf(left, right, PaneSide::Bottom));
+        let after = t.layout(area());
+        assert_eq!(after[0].id, right);
+        assert_eq!(after[1].id, left);
+        assert!((after[0].rect.h - 400.0).abs() < 0.1);
+        assert_eq!(after[0].rect.y, 0.0);
+        assert_eq!(after[1].rect.y, 400.0);
+    }
+
+    #[test]
+    fn move_leaf_to_top_collapses_old_parent_in_nested_tree() {
+        let mut t = PaneTree::new_with(PaneKind::Nvim);
+        let middle = t.split_focused(SplitDir::Horizontal);
+        t.set_focused_kind(PaneKind::Terminal);
+        let bottom = t.split_focused(SplitDir::Vertical);
+        t.set_focused_kind(PaneKind::GitDiff);
+        let left = t.layout(area())[0].id;
+
+        assert!(t.move_leaf(bottom, left, PaneSide::Top));
+        let after = t.layout(area());
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].id, bottom);
+        assert_eq!(after[1].id, left);
+        assert_eq!(after[2].id, middle);
+        assert!(after[0].rect.y < after[1].rect.y);
+        assert!(after[1].rect.x < after[2].rect.x);
     }
 }
